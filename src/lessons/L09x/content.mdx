@@ -1,0 +1,555 @@
+L09 的语料是代码库：结构是显式语法，行号天然存在，删掉的文件下一次索引就没了。这一节把语料换成一家公司的制度库。检索链路还是那一套，多出来的问题几乎全在入库那一侧。
+
+先看一个现象。lab 的语料是虚构公司「青禾科技」的七份文档。研发部的 bob 问：「一线城市出差，住宿每晚能报多少？」下面五种实现都跑得通：
+
+- 只按相似度取 top-k：可能答 300 元。2023 版办法 2025-07-01 已经废止，chunk 还在索引里
+- 按文件修改时间取最新版：600 元。2026 版九月发布，2027-01-01 才生效
+- 按生效日取最新：500 元。它不知道研发部还有一份特别规定
+- 特别规定一律优先：450 元。可公司 2025 版办法比这份 2024 年的补充规定更新
+- 库是一百个租户共用的 pgvector 索引，`tenant = 'acme'` 写成向量查询后面的 `WHERE`：「检索到的内容里没有相关信息」。按第三节的实测，1% 选择率下默认配置平均只返回 0.5 条
+
+lab 的答案是第六种：**冲突**。研发部补充规定（450）和公司 2025 版办法（500）同级，新的一般规定晚于旧的特别规定，两段都给出、标注冲突、交人裁决。HR 的 alice 看不到那份补充规定，她拿到的是 2025 版。
+
+五种结局，没有一个抛异常，安全审计一项都不红。
+
+<Key>
+
+这一节的中心论点：**企业知识库比代码库多出来的问题，几乎全是不报错的失败**。解析器丢了脚注，表格切断后数字没了列名，ACL 写成 WHERE 后召回塌到 0 条，rerank 在过滤之前把越权全文发给了第三方，框架默认不删源系统已删的文档，按修改时间取到了还没生效的新办法——都没有异常，也没有告警。
+
+所以主线不是「怎么搭」，是「怎么把每一种静默失败变成一个能断言的输出」。五个问题：
+
+1. 解析器交给你的东西少了什么，页码从几开始——**解析与坐标**
+2. 表头、编号、标题路径怎么跟着每一个 chunk 走——**结构**
+3. 权限过滤放在 ANN 里面还是外面——**过滤的层**
+4. 除了索引，你的权限还有几份副本——**副本**
+5. 删除和版本靠什么传播——**没有 commit 的语料**
+
+lab 的 `shared/kb.ts` 把这些做成纯函数：八个观察实验，七个 TODO，56 条零模型、零向量库的断言。难点在入库，不在向量库。
+
+</Key>
+
+---
+
+## 一、解析是静默失效，坐标是契约
+
+代码库 RAG 没有「解析」这一步。企业文档的第一步是把 PDF、扫描件、Excel 变成带结构、带坐标的文本，而这一步的错误不抛异常：你拿到一份看起来完整的 Markdown，只是少了一段脚注、多了五行页眉、表格错了一列。
+
+### 1.1 默认值决定你丢了什么
+
+| 解析器 | 默认行为（官方文档原文） | 丢的是什么 |
+|---|---|---|
+| PP-StructureV3 | `markdown_ignore_labels` 默认含 `number`、`footnote`、`header`、`footer`、`aside_text` 等；`use_seal_recognition` 默认 `False` | 脚注、页码、印章文字 |
+| Marker | 页眉页脚 "they are removed by default"；跨页表格合并要开 `--use_llm` | 印刷页码；跨页表格的后半张没有表头 |
+| MinerU | "`page_idx` is zero-based, unlike one-based CLI PDF ranges" | 不丢东西，但同一个系统里有了两套页码 |
+
+调研的推断：企业文档的脚注常是限定条件（「以上数据未经审计」「不适用于外包人员」），丢了它，检索到的正文是对的，答案却过度泛化；印章文字（发文机关）是判断正式发文还是征求意见稿的证据，和第五节的版本判定直接相关。
+
+### 1.2 选解析器：每个榜单都有主场
+
+| 基准（维护方） | Marker | MinerU pipeline |
+|---|---|---|
+| OmniDocBench v1.6（OpenDataLab，也是 MinerU 的开发方） | 78.44 | 86.47 |
+| olmocr-bench（Marker README 自报） | 76.0 | 72.7 |
+
+两组都是一手数字，名次相反。这不说明谁作弊，说明**每个榜单都有主场**。v1.6 上通用大模型也不是上限：GPT-5.2 是 86.59、Gemini 3 Pro 是 92.91，都低于 0.9B 的专用模型 PaddleOCR-VL-1.6（96.34）。v1.0 是唯一中英分报的版本：当时的 Docling 2.14 中文 TextEdit 是 0.987（越低越好，几乎全错），Unstructured 0.17.2 中文表格 TEDS 是 0.064；PP-StructureV3 反而中文表格（83.9）高于英文（77.2）。之后的版本有没有改善，没有一手数字。
+
+更要紧的是解析分数和 RAG 分数不单调。OHRBench 原话："standard OCR metrics like edit distance do not always align with RAG performance"；语义噪声从轻到重，"nearly a 50% performance decline for most retrievers and LLMs"，**BM25 和 BGE-M3 一起掉**。L09 第三节说向量「确实理解一部分，但远没有大多数人以为的那么多」，这是同一个结论在解析噪声上的版本。VLM 和端到端 OCR 合并段落的 F1 只有 8.8，规则管线反而接近真值：多栏、跨页断段，换个更强的模型不一定解决。
+
+结论（调研的推断）：**拿你自己的 50 到 100 页代表性文档，在检索层量**。许可证和精度同级：Marker 代码是 Apache 2.0，权重用修改过的 AI Pubs Open Rail-M（研究、个人和融资或营收低于 500 万美元的初创免费）；MinerU 是基于 Apache 2.0、带附加条件的自有许可。
+
+ColPali 这类直接检索页面图像的方案，适合做图表密集页的第二路召回，不适合替代解析：每页 257.5 KB，"an order of magnitude larger than BM25 and two orders of magnitude larger than BGE-M3"；训练集 "fully English by design"，中文效果没有数据；粒度是页，chunk 级 ACL 表达不了，BM25 那一路也没了（后两条是推断）。
+
+### 1.3 坐标契约：「第 3 页」是哪一页
+
+`pnpm kb` 实验一，travel-2023 的分块（节选）：
+
+```text
+travel-2023  5 页，印刷页码 i ii 1 2 3
+  删掉页眉页脚 ×5：青禾科技 内部资料
+  删掉页码行 ×5：— i — · — ii — · — 1 — · — 2 — · — 3 —
+  chunk           定位        正文                                                标题路径
+  travel-2023#03  p. 1        第二章 住宿标准 | 第十二条 出差住宿按城市等…        第二章 住宿标准 › 第十二条
+  travel-2023#05  pp. 2–3     第三章 报销流程 | 第二十条 报销应在返回后三…        第三章 报销流程 › 第二十条
+```
+
+同一个系统里至少有四套页码：解析器从 0 起，CLI 从 1 起，阅读器从 1 起，页面上印的另有一套（目录用罗马数字，正文从 1 重来）。travel-2023 的物理第 3 页印着「1」。而删页眉页脚时，**印刷页码也跟着删了**。lab 钉成三条：
+
+- chunk 分开存 `pages`（物理页序，从 0 起）和 `pageLabels`（印刷页码，可能没有）
+- 只有 `citeLocator` 负责换算：有印刷页码显示「p. ii」，没有显示「第 1 页」；跨页显示范围「pp. 2–3」「第 3–4 页」（CITE-1、CITE-2）
+- 解析器标了 `continuesPrev` 的段落接在上一段后面，页码范围跨页（PARSE-5）
+
+L09 说「编出来的引用比编出来的内容更有害」，这里的对应是：错的页码比没有页码更有害。RAGFlow 拒绝把整表坐标复制到每一行，PDF 表格的行 chunk 于是 "get no positions at all"。值得记住的判断：**没有坐标比错的坐标好**。
+
+### 1.4 页眉是跨页统计出来的
+
+「页面顶部 10% 就是页眉」会删掉第一页的标题。RAGFlow 的判定是在多页同一区域重复出现：`headerZoneRatio = 0.10`、`minHeaderFooterPages = 3`，奇偶页分别统计，注释说真书的页眉 "often covers only 40%-48% of the even or odd pages"。lab 的 `detectRunningLines` 照这个形状写，PARSE-2 钉住反例：只在两页顶部出现的「第二章 住宿标准」不算页眉。页码行每页都不同，要靠模式单独删。
+
+升级解析器等于重新解析。MinerU："Old caches are not rewritten; reparse"；RAGFlow："must be re-parsed rather than re-chunked"。解析器版本是索引的一个「代」，第五节接着讲。
+
+<Lab title="实验一">
+
+看三件事：travel-2023 删掉的 5 行页眉和 5 行页码；budget-2025 最后一个 chunk「三、执行要求」定位是「第 3–4 页」；预算表每一行都带着脚注「① 不含外包人员费用。」
+
+</Lab>
+
+---
+
+## 二、结构要跟着每个 chunk 走
+
+L09 第二节的结论是按结构切，代码的结构来自显式语法。企业文档的结构是半显式的：有时是解析器猜出来的 `#`，有时只是正文里的「一、」「（一）」，有时只是黑体，而解析之后字体就丢了。表格是另一种结构：行的语义依赖表头，而表头只出现一次。
+
+### 2.1 表格：每个含数据的 chunk 都要能回答「这一格是哪一列」
+
+| 实现 | 怎么切 | 表头 |
+|---|---|---|
+| Unstructured | 超长表格 "is divided into two or more `TableChunk` elements using text-splitting"，`max_characters` 默认 500 | 文档没提重复表头，后续块应当不带（推断） |
+| Docling `HybridChunker` | 按 token 预算 | `repeat_table_header` 默认 `True` |
+| RAGFlow `TableChunker` | "Every row in table will be treated as a chunk." | 列名取 `rows[0]`，多级表头只留第一级 |
+
+Unstructured 的 500 是字符：按 L09 `defaultEstimate` 的口径，中文约 500 token、英文约 125 token，差 4 倍（推断）。
+
+「表格不能被切断」的真正意思不是整表进一个 chunk，而是**任何含数据行的 chunk 都带着完整的列名**。实验二把 budget-2025 的预算表（两级表头，跨第 2–3 页，带「合计」行）切四种，查「研发部 2025年 金额」：
+
+```text
+切法                      chunk数  top1      含研发部  1200 的列名
+定长 40 字、表头只出现一次      6  fixed#0   否        —
+按行、只取第一级表头            7  rows0#1   是        2025年
+按行、不带列名                  7  bare#1    是        —
+按行、多级表头按列拼            7  row#1     是        2025年/金额
+```
+
+定长切分的第一名是**表头所在的那一块**：查询里的「2025年」「金额」都在表头里，它却既没有「研发部」也没有「1200」。只取 `rows[0]`，「金额」「占比」两列都叫「2025年」，模型分不清 1200 和 25.9% 哪个是钱。不带列名的行能召回，但没人知道 1200 属于哪一列。
+
+lab 的 `renderTableRows`（TODO 2）把每行渲染成「表3 各部门预算（万元）① 部门: 研发部; 2025年/金额: 1200; …」：多级表头按列拼，跨列沿用左边；caption 每行都带；合计行照常带列名。`chunkDocument` 再把跨页后半段并进前一张表、继承表头（PARSE-5），把脚注「①」附到每个含同一序号的 chunk（PARSE-4）。代价（推断）：合计、同比这类行间关系只能靠列名和 caption 撑着。
+
+### 2.2 中文编号：层级藏在正文里
+
+| 体系 | 编号 | 来源 |
+|---|---|---|
+| 公文 GB/T 9704-2012 | 「一、」「（一）」「1.」「（1）」四级 | 官方只有扫描件，依据高校办公室的转载 |
+| 《立法法》第六十五条 | 编、章、节、条用中文数字；"款不编序号"；项是「（一）」 | 一手 |
+| 《科学技术部规章制定程序的规定》 | "目冠以１、２、３等数字"，原文就是全角 | 一手 |
+
+推论有三：解析后黑体常常丢了，所以要有一个**编号识别器**补在 `#` 旁边，否则就是 L09 第二节「降级必须可见」说的静默退回固定窗口；同一个「（一）」在公文里是第 2 层、在法规里是「项」，层级表要以文档类型为参数；「款不编号」意味着「第三条第二款」只能数段落，段落被合并，引用就无法校验。
+
+### 2.3 L09 的 tokenizer 在公文上丢数字
+
+L09 第三节的 Pitfall「中文分词：最经典的一种静默失效」修法是单字加二元组。可那个字符类是 `[a-z0-9]` 加汉字和假名，**不含全角数字**。实验三：
+
+```text
+第３条        L09 [第,条]  NFKC 后 [第,3,条]
+（２）        L09 []  NFKC 后 [2]
+２０２５年    L09 [年]  NFKC 后 [2025,年]
+第3条 差旅    L09     第５条:1888  第３条:1760  第十三条:1527
+第3条 差旅    NFKC    第３条:2938  第５条:1877  第十三条:1550
+```
+
+「第３条」只剩「第、条」，更短的第５条排到了前面；「（２）」切出空列表。和 L09 那条是同一种失败：不报错，只是搜不准。修法是切词前先 `normalizeText`：去 BOM，再 NFKC。
+
+顺带看你用的引擎默认怎么切中文：Elasticsearch `standard` 按 UAX#29 切，汉字成单字（推断）；`cjk_bigram` 的 `output_unigrams` "Defaults to `false`"，单字查询匹配不到；Qdrant 全文索引默认 `word`。**换分词器等于重建索引**。
+
+### 2.4 NFKC 只用来比较，不用来存
+
+NFKC 还会把「（」变「(」、把「①」变「1」。两条规矩：
+
+- **匹配编号在 NFKC 之后用半角**。`headingLevel` 先规范化，再用 `[0-9]`、中文数字、`\(` 这些显式字符类。于是「（一）总则」和「(一)总则」同级（NUM-2），「１、总则」和「1、总则」同级（NUM-3）
+- **chunk 正文保留原样**。正文做了 NFKC，caption 里的「①」变成「1」，脚注就找不到该附在哪一行；PDF 上是「（２）」，chunk 里是「(2)」，引用对不上原文
+
+<PyMirror>
+
+Python 通道 `labs/l09x/kb.py` 与 TS 同名，观察实验输出逐字节相同。NFKC 两边一样，不一样的是它前后的操作：
+
+| 操作 | TS | Python | lab 的规定 |
+|---|---|---|---|
+| `\d` 匹配全角「１」 | 不匹配 | 匹配（`str` 模式下是 Unicode 数字） | NFKC 之后只写 `[0-9]` |
+| `\w` 匹配「中」 | 不匹配 | 匹配 | 写显式字符类 |
+| 去首尾空白 | `trim()` 去掉 BOM | `strip()` 不去 BOM | 只去 ASCII 空格；BOM 在 `normalizeText` 里删 |
+| `$` 遇到末尾换行 | 不匹配 `"— 3 —\n"` | `re.search` 认为匹配 | Python 用 `\Z` 或 `re.fullmatch` |
+| 字符串比较 | UTF-16 码元序，`'𠮷' < '｀'` 为真 | 码点序，为假 | 夹具避开 BMP 之外的字符 |
+| 长度 | `.length` 数码元 | `len()` 数码点 | 一律按码点 |
+
+BOM 那行最容易出事：Word 导出的「\uFEFF第一章 总则」，TS `trim()` 之后能匹配 `^第`，Python `strip()` 之后不能（PARSE-6）。仓库里的 `cmpCodePoint` 其实就是 `a < b`，是码元序。大小写不是差异：「İ」两边 lower 之后都是两个码点；`principalKey` 只做 ASCII 小写，是为了让身份不依赖 Unicode 大小写表。
+
+</PyMirror>
+
+<Lab title="实验二、三和 TODO 1、2">
+
+TODO 1 `myHeadingLevel` 被 NUM 组抓，TODO 2 `myRenderTableRows` 被 TABLE 组抓。`chunkDocument` 调用这两个函数，所以 PARSE-3 到 PARSE-5 和 CITE 组要等它们写完才绿。
+
+</Lab>
+
+---
+
+## 三、过滤放在哪一层
+
+L09 的 `bm25Index`、`vectorIndex`、`rerankHeuristic` 都没有「谁在问」这个参数。企业 RAG 要回答代码库从来不用回答的问题：同一个 query，不同的人该看到不同的 top-k。这一节只讲正确性，安全的那一半在第四节。
+
+### 3.1 ACL 写成 WHERE：安全，而且召回塌到 0 条
+
+```sql
+SELECT id FROM chunks
+WHERE acl && '{7,142}'            -- 用户所在的组
+ORDER BY emb <-> $1 LIMIT 10;
+```
+
+pgvector 的 README 写得很清楚：
+
+> "With approximate indexes, filtering is applied *after* the index is scanned. If a condition matches 10% of rows, with HNSW and the default `hnsw.ef_search` of 40, only 4 rows will match on average."
+
+调研在本机真跑了一遍：PostgreSQL 18.3、pgvector 0.8.1，5 万行 32 维，默认参数，20 个查询，召回以精确结果为真值，过滤列都建了 B-tree 或 GIN（不建时前三组数字完全相同）。节选：
+
+```text
+过滤              选择率   模式            平均返回 最少返回 召回@10  计划
+grp10 = 3         约 10%  off(默认)          3.8      1   0.375  Index Scan using chunks_emb_idx
+acl && '{7,142}'  约 2%   off(默认)          0.6      0   0.055  Index Scan using chunks_emb_idx
+grp100 = 7        约 1%   off(默认)          0.5      0   0.045  Index Scan using chunks_emb_idx
+grp1000 = 13      约 0.1% off(默认)         10.0     10   1.000  Seq Scan on chunks
+acl && '{7,142}'  约 2%   strict_order      10.0     10   0.920  Index Scan using chunks_emb_idx
+acl && '{7,142}'  约 2%   relaxed_order     10.0     10   0.985  Index Scan using chunks_emb_idx
+```
+
+10% 选择率平均 3.8 条，和 README 的 "only 4 rows" 吻合。另外四条读法：
+
+1. **危险区在中间，不在两端**。0.1% 时规划器改走顺序扫描，全对；1% 到 2% 平均 0.5–0.6 条、最少 0 条
+2. **给 ACL 列加索引不解决**。规划器对 `acl && '{7,142}'` 估计 1,010 行（真实 1,000），估得很准，仍选了 HNSW。只测过 5 万行、32 维
+3. **0.8.x 默认不开迭代扫描**：`SHOW` 出来 `hnsw.iterative_scan = off`、`hnsw.max_scan_tuples = 20000`。打开后 `strict_order` 召回 0.80–0.965，`relaxed_order` 是 0.915–1.000
+4. **零安全事故**。所有模式都没有返回越权行
+
+<Key>
+
+**安全审计全绿，召回塌缩没有异常**。而 L09 第五节教过：「检索不到相关内容」是一个合法的、而且经常正确的结论。两条放在一起，这个失败就看不见了：模型老实说没找到，审计说没越权，用户以为公司没有这份制度。
+
+能发现它的只有**按身份分层的检索评测**（第五节）。空结果可能是「没有」，可能是「无权」，也可能是**过滤放错了层**。
+
+</Key>
+
+lab 的实验四用「精确排序的前 ef 个」代替 HNSW 候选，这只会让后过滤显得更好，所以坏结果是保守的。4000 个 8 维向量、`ef=40`、`k=10`、`maxScan=400`：
+
+```text
+选择率  策略              平均返回  最少  recall@10  越权外发
+10%     post                   4.3     1      43.5%         0
+2%      post                   0.6     0       6.0%         0
+2%      pre                     10    10     100.0%         0
+2%      iterative              7.2     3      72.0%         0
+0.5%    iterative              1.5     0      15.0%         0
+```
+
+和真机同一量级。迭代扫描在 0.5% 时只拿回 1.5 条：**上限是必须的，但它决定了低选择率用户的召回**。
+
+<Drill title="TODO 3：迭代扫描的三条不变量">
+
+`mySearchFiltered` 有三种模式。`post` 取前 `min(ef, n)` 个候选再过滤；`pre` 按顺序过滤到够 k 个；`iterative` 从 ef 开始，不够就再加一份 ef，直到够了或碰到 `min(maxScan, n)`。`scanned` 是返回值，因为代价和召回一样要能被断言。
+
+1. **必须有上限**：`scanned ≤ maxScan`，否则一个低选择率用户能让一次查询扫全库；50% 选择率时 `scanned` 恰好是 40，不无故扩张（ACL-7）
+2. **不够 k 条宁可少给**，不拿越权的凑数（ACL-8）。「返回条数固定为 k」常常是上游的接口约定
+3. **后过滤必须真的少**：2% 时 post 在 20 个查询上一共返回 12 条、最少 0 条（ACL-5）。它防的是把 post 偷偷写成 pre，让观察实验变成摆设
+
+</Drill>
+
+### 3.2 五家向量库：差的是一个参数的位置
+
+| 系统 | 默认的过滤时机 | 官方修法 |
+|---|---|---|
+| pgvector 0.8 HNSW | 扫完 `ef_search=40` 个候选后再 WHERE | `hnsw.iterative_scan`；partial index；按租户分区 |
+| Elasticsearch | `knn.filter` 内是前过滤，**外层 bool 的 filter 是后过滤** | ACL 写进 `knn.filter`，或带 filter 的 alias |
+| OpenSearch | knn 子句内是 efficient filtering；外层 bool、`post_filter` 是后过滤 | efficient filtering；剩得很少时 scoring script 精确搜 |
+| Qdrant | 图遍历中过滤 | payload 索引在入库前建；v1.16 起有 ACORN |
+| Milvus | 先过滤再 ANN | 表达式复杂时用 `iterative_filter` |
+
+最反直觉的是 Elasticsearch，`bool: { must: { knn }, filter: { term } }` 是后过滤：
+
+> "All other filters found in the Query DSL tree are applied as post-filters. For example, `knn` query finds the top 3 documents with the nearest vectors (k=3), which are combined with `term` filter, that is post-filtered. The final set of documents will contain only a single document that passes the post-filter."
+
+Onyx 把 ACL 放进 `knn` 子句内部：
+
+```python
+if search_filters is not None:
+    knn_field_query["filter"] = {"bool": {"filter": search_filters}}
+
+return {"knn": {CONTENT_VECTOR_FIELD_NAME: knn_field_query}}
+```
+
+principal 超过 `MAX_NUM_TERMS_ALLOWED_IN_TERMS_QUERY = 65_536` 时 `raise ValueError`：截断会静默丢权限，抛错看得见。**同一个 ACL 条件，JSON 里差一层花括号，安全性不变，召回从 k 掉到 1**。lab 的 `buildSearchRequest` 把 ACL 放在 `knn.filter`，ACL-12 断言请求外层只有 `query`、`k`、`knn`。
+
+Qdrant 有两个坑：payload 索引 "should be created before ingesting data"；ACORN 的额外边按单个 payload 索引加，"a combination of two or more strict filters might still lead to disconnected graph components"，大量软删除点也一样。「租户、部门、密级」叠在一起正是这种组合（推断）。
+
+### 3.3 加了 tenant_id 过滤，不等于租户隔离
+
+过滤挡住的是文档，挡不住统计量。实验五：acme 搜「报销 发票」，globex 往共享索引里加 n 篇含「报销」的短文：
+
+```text
+globex 文档数  统计口径    acme 的排序（id:score×1000 取整）
+0              shared      A1:6553  A2:3208
+10             shared      A2:6944  A1:3633
+10             per-tenant  A1:6553  A2:3208
+50             shared      A2:10829  A1:4170
+```
+
+globex 多写 10 篇，acme 的第一名就换了，而结果里一篇 globex 的文档都没有。L09 的 `bm25Index` 把 `df` 存在全局 `Map` 里，直接拿来做多租户就是这样。pgvector 原文："sharing an approximate index between tenants means vectors from one tenant can affect recall (and speed) for other tenants. For tenant isolation, use list partitioning or separate tables."；Qdrant 原文："payload-based partitioning alone doesn't isolate IDF statistics"。调研再推一步：这是一条统计侧信道。TENANT 组测的是参考实现，TENANT-3 要求 per-tenant 分数和单独建索引逐位相等。
+
+<Pitfall title="空结果就放宽阈值重试">
+
+RAGFlow 检索为空时 "retry with relaxed conditions"：有 doc_id 过滤时退到只按过滤取，否则 `min_match` 从 0.3 降到 0.1、向量相似度阈值降到 0.17。
+
+在企业 RAG 里，**空可能就是无权**，也可能是过滤放错了层。放宽之后拿到的是过滤后剩下的无关 chunk，模型据此作答，就是 L09 第八节说的「完全讲得通、有材料支撑、而且错的答案」。空结果原样报出，拒答率按身份分层看。
+
+</Pitfall>
+
+---
+
+## 四、权限有几份副本
+
+一段 HR 的薪酬文本，除了索引，还在哪？每一处都是一份要单独执行 ACL 的副本，而它们的默认行为几乎都是「不分人」。
+
+### 4.1 外部 rerank：结果一样，安全不一样
+
+L09 第五节说重排「可以慢，所以能看细特征（query 和文档拼一起过一遍模型）」。细特征的意思就是**把全文发给重排模型**。实验四还有一种策略：先把 40 个候选全部发给外部 reranker，回来再过滤：
+
+```text
+选择率  策略              平均返回  最少  recall@10  越权外发
+10%     rerank-first           4.3     1      43.5%       713
+2%      rerank-first           0.6     0       6.0%       788
+```
+
+结果和后过滤一模一样（ACL-10 断言 hits 相同），可 2% 时 20 个查询一共把 **788 段越权全文**发了出去。Cohere Rerank v2 的 `documents` 就是 "A list of texts"；`max_tokens_per_doc` 默认 4096，超长的整表 chunk 表尾被静默截断。这类服务会不会留存输入，调研没读到数据政策。
+
+<Key>
+
+**安全边界是数据流向，不是最终答案**。两种顺序测结果的测试全过，区别只在 `exposed`：发给第三方的候选里有没有越权的。
+
+这是 L14 第七节在检索链上的版本：每一个"过滤"都被绕过了。每一个"移除"都守住了。在 rerank 之后过滤，是给已经出去的数据补一道过滤；之前过滤，是把越权数据从这条通道上移除。外部 embedding、LLM 当 reranker、agentic search 的中间结果同理：**ACL 过滤在任何「把 chunk 文本交给第三方或模型」的步骤之前**。
+
+</Key>
+
+### 4.2 七份副本
+
+| 副本 | 默认行为（一手） | 不变量 | lab |
+|---|---|---|---|
+| 外部 rerank、embedding | API 收的就是全文 | 过滤在发送之前 | ACL-9、ACL-10 |
+| 答案缓存、语义缓存 | RedisVL 的 `filter_expression` "Defaults to None and the full cache will be searched" | 键含排序去重的 principals 和语料版本 | CACHE-1–3 |
+| trace | OTel `gen_ai.retrieval.documents` 是 Opt-In，每个文档建议只记 `id` 和 `score` | 只记 id、分数、ACL 指纹 | — |
+| 多人会话 | 通常按提问者检索 | 按所有在场者的交集 | ACL-13 |
+| 字段级 | Azure：`retrievable` 设 false "isn't a content-obfuscation or field-level security mechanism" | 索引时就分视图 | ACL-14 |
+| 工具参数 | Onyx 按 id 取文档："No need for ACL here because the doc ids were validated beforehand" | 权限只来自会话；按 id 取也查 ACL | ACL-11 |
+| 同步延迟 | Onyx 默认 5 分钟，Confluence、Jira 30 分钟 | 说得出撤权延迟的上界 | — |
+
+**缓存**。键里没有 principals，HR 问过的问题，答案会原样返回给实习生。lab 的 `cacheKey`（TODO 7）是三段：规范化后的 query（「（2025）住宿 上限」和「 (2025)住宿 上限 」同键）、去重排序的 principals、`corpusVersion`（撤权或删文档后旧键自然失效）。用有效 principal 集合而不是 `user_id`：同权限共享，权限一变键就变。L15 第八节那句「做缓存分区的那个键，绝不能跨越你自己的租户边界」讲的是厂商前缀缓存，在答案缓存上原样成立，只是边界细到权限集合。
+
+**trace**。L13 第九节说内容属性默认不发，一份 trace 在你主动打开内容采集之前对重放毫无用处，所以很多团队打开了它。查询文本 `gen_ai.retrieval.query.text` 也是 Opt-In，规范警告 "This attribute may contain sensitive information."。推断：**打开了内容捕获的 trace 后端，是一份没有 ACL 的知识库副本**。只记 chunk id、分数和 ACL 指纹，标题也别记；L13 第六节的「内容外部化」在这里多一个理由：那份存储要按原文档的 ACL 读。
+
+**多人会话**。arXiv 2509.14608："only those documents for which every active participant has access will be retrieved and added to the supplementary context." ACL-13：hr-salary 的 chunk，alice 单独看得见，和新人 dave 一起就看不见。
+
+**字段级**。hr-salary 的「月薪」一列只给 `group:hr`，文档 ACL 还含 `group:managers`。只在返回时抹掉这一列，值还在 BM25 里：bob 搜「23000」能命中，**命中本身就是泄露**（推断）。值也在向量里：vec2text "recover 92% of 32-token text inputs exactly"，作者说 "embeddings should be treated with the same precautions as raw data"，但只测了英文和 GTR、ada-002。lab 在索引时分两份：普通行不含受限列、用文档 ACL；完整行另存、ACL 取受限列可见者。ACL-14 断言 bob 看不到「月薪」和「23000」，用 23000 查也命中不了。
+
+**工具参数**。检索做成工具时，`filter`、`user_groups`、`doc_ids` 都是 L14 第六节说的 `destination` 类参数，被注入的文档可以让模型填 `user_groups: ["group:hr"]`。L14 的规则原样用：**契约里没写的参数一律拒绝**。`buildSearchRequest` 只接受 `query` 和 `k`，其它一律抛错，不忽略——忽略会掩盖注入尝试（ACL-11）。一旦 doc id 能从模型参数流到 Onyx 那条「上游已校验」的路径，前提就不成立了（推断）。
+
+**同步延迟**。「尊重源系统权限」的准确说法是**尊重最近一次同步时的权限**：按 Onyx 默认值，Confluence 撤权后最长约 30 分钟内仍能检索到，排队另算（没有实测）。改名用户的注释："Indexed ACLs keep naming the old one until the source system re-syncs"。无法预同步的源（Salesforce）用查询后审查，那就是后过滤。
+
+### 4.3 两条看起来更省事的路
+
+**让模型判断能不能说**：OrgAccess 里 "even GPT-4.1 only achieves an F1-Score of 0.27 on our hardest benchmark"；ARBITER 里最好的 Qwen2.5-14B 比静态过滤低 5 个百分点；arXiv 2509.14608 把现有防御概括为 "fundamentally probabilistic"。权限是检索层的确定性代码。
+
+**尊重源系统权限就安全**：M365 Copilot "only surfaces organizational data to which individual users have at least view permissions"。推断：源系统里没人发现的过度共享，会变成一句话就能检索到的东西。入库前统计「全员可见又命中敏感词」的文档，是门禁的一项。
+
+<Pitfall title="缺 acl 当公开，组名撞上用户名">
+
+- **fail-open**。RAGFlow 的 `PruneDeletedChunks` 有一支 `// Keep chunks without doc_id`。在删除语义下是保守，在权限语义下就是越权。lab 的 `aclVisible` 对缺 `acl` 的 chunk 返回 false，legacy-notice 谁都看不见（ACL-1）
+- **没有命名空间**。Onyx 的 `prefix_user_email`："Prefixes a user email to eliminate collision with group names"。没有前缀，一个恰好叫 `alice@qinghe.com` 的组就拿到了 alice 的权限。`principalKey` 输出「类型:名字」，外部组带来源（`ext_group:confluence/eng`）（ACL-2、ACL-3）
+
+</Pitfall>
+
+<Lab title="TODO 4、7">
+
+TODO 4 `myRerankPipeline` 最典型的错法是先 rerank 再过滤：ids 一模一样，只有 ACL-9、ACL-10 去看 `exposed`。TODO 7 `myCacheKey` 被 CACHE 组抓。
+
+</Lab>
+
+---
+
+## 五、没有 commit 的语料
+
+代码的版本由 git 管，一个 commit 就是一致的快照。企业知识库没有 commit：《差旅报销办法》的三版加一份补充规定同时躺在共享盘里，源系统删掉的文档，向量库不会自动知道。
+
+### 5.1 删除不会自己传播
+
+LangChain `index()` 的 `cleanup` 默认 `None`，文档原文 "Do not delete any documents."；LlamaIndex "Defaults to DocstoreStrategy.UPSERTS"，删要显式选 `UPSERTS_AND_DELETE`。另外两种模式各有一个洞：incremental 只清理 "source IDs that were seen during indexing"，整篇被删的文档这一轮根本没被见到；full 要求 "the loader should be returning the entire dataset … Otherwise, the auto_cleanup will remove documents that it is not supposed to."
+
+实验七：第 2 轮 A 被编辑、C 在源系统删除（附墓碑）；第 3 轮 loader 只拿回 A，因为 B 的读权限过期了：
+
+```text
+模式         第 2 轮后             第 3 轮后             问题
+none         A:a1,A:a2,B:b1,C:c1   A:a1,A:a2,B:b1,C:c1   A 旧版残留、已删的 C 残留
+incremental  A:a2,B:b1,C:c1        A:a2,B:b1,C:c1        已删的 C 残留
+full         A:a2,B:b1             A:a2                  B 被误删
+tombstone    A:a2,B:b1             A:a2,B:b1             无
+```
+
+**这次没看到，不等于被删了**。删除要靠显式事件，也就是墓碑：lab 的 `tombstone`（TODO 6）是 incremental 加一条「src 在墓碑里就删整篇」。RAGFlow 在每次检索时用 `PruneDeletedChunks` 查文档还在不在，这本身说明删除没有可靠地传到检索引擎，而查询时兜底又是一次后过滤。
+
+### 5.2 删了，统计量还记得
+
+ES："those deleted documents are taken into account for index statistics"，直到段被合并；pgvector 的死元组和 ACL 过滤抢同一批 `ef_search` 名额；Qdrant 大量软删除点可能让图断开。实验七：删了 30 篇作废报销单、统计量没重算，acme 是 `A2:9472 A1:3856`，重建之后回到 `A1:6553 A2:3208`。排序翻了，机制和实验五相同，只是这次是幽灵。
+
+### 5.3 索引的「代」
+
+一个 chunk 有三个代际维度：解析器、分块策略、embedding 模型，也就是 lab 的 `Gen`。LangChain 的文档 hash 是内容加 `json.dumps(metadata, sort_keys=True)`：ACL 写在 metadata 里，**改一次权限就重 embedding 一次**，一次组织调整就是全量重做。同一个 hash 不含模型名，换了模型要 `force_update`。Dify："Changing the embedding model will re-embed all documents … original embeddings will be deleted"，重建期间检索怎么办，文档没写。
+
+| 什么变了 | 重解析 | 重分块 | 重 embedding | 只改 payload |
+|---|---|---|---|---|
+| 正文 | ✔ | ✔ | ✔ | — |
+| 只有 ACL 或版本元数据 | — | — | — | ✔ |
+| 解析器升级 | ✔ | ✔ | ✔ | — |
+| 分块策略升级 | — | ✔ | ✔ | — |
+| embedding 模型升级 | — | — | ✔，新一代 | — |
+
+lab 的 `planReindex` 返回这张表的一行（SYNC-5、SYNC-6，测参考实现）。ACL 不进内容 hash，走 Qdrant `set_payload`、ES `_update` 这类通道。一次结果里混了两代向量，`assertSingleEmbedder` 直接抛错（VER-8）。
+
+### 5.4 「最新版」至少有三个维度
+
+《立法法》：
+
+> "第一百零三条 同一机关制定的法律、行政法规、地方性法规、自治条例和单行条例、规章，特别规定与一般规定不一致的，适用特别规定；新的规定与旧的规定不一致的，适用新的规定。"
+>
+> "第一百零五条 法律之间对同一事项的新的一般规定与旧的特别规定不一致，不能确定如何适用时，由全国人民代表大会常务委员会裁决。"
+
+加上第九十九条的效力层级，是三个维度：上位与下位、特别与一般、新与旧。第一百零五条承认有一种冲突规则自己裁决不了。lab 照这套优先序写；企业内部制度是不是普遍这么排，调研没有一手来源，你的公司要自己确认。时间本身也有三种：发布日、生效日、修改时间。实验六，asOf 是 2026-10-12：
+
+```text
+场景                  按 mtime      按生效日      三维规则
+S2 新版未生效         办法2026      办法2025      办法2025
+S3 旧版被重新编辑     办法2023      办法2025      办法2025
+S4 上位 vs 下位       子公司细则    子公司细则    集团制度（取生效日最新的；上位优先，1 份下位规定冲突需标注）
+S5 同级特别 vs 一般   公司差旅办法  公司差旅办法  CONFLICT（新的一般规定 公司差旅办法 晚于旧的特别规定 研发差旅补充，不能自动裁决）
+真实语料 · alice      travel-2023 travel-2025 travel-2026  → travel-2025
+真实语料 · bob        rd-travel-supp travel-2023 travel-2025 travel-2026  → CONFLICT
+```
+
+最后两行就是开头那个现象的答案。**版本消解在权限过滤之后、对每个用户分别做**。
+
+交给模型挑行不行？ClashEval："LLMs are susceptible to adopting incorrect retrieved content, overriding their own correct prior knowledge over 60% of the time. However, the more unrealistic the retrieved content is … the less likely the model is to adopt it." 调研推断：只差一个数字（300 对 500）的新旧版本，正是最像真的那一类冲突。
+
+<Drill title="TODO 5：resolveVersions 的五步">
+
+1. 缺 `effectiveFrom` 的不参与自动消解，写进 `reason`（VER-7）。当成「永远有效」是最省事的错法
+2. 只留 asOf 当天已生效、未废止的。日期是 `YYYY-MM-DD`，按字符串比，两种语言一致
+3. 上位优先，只看 `level` 最小的；下位版本在场要标注冲突（VER-4）
+4. 同级里既有特别又有一般，且一般的生效日更晚：`chosen = null`、`conflict = true`（VER-5）；否则特别的优先
+5. 否则取生效日最新的，同日比发布日，再比 docId
+
+第 4 步是这个函数存在的理由：返回值类型里必须能表达「我不选」。下游拿到 null，把两段都给出、标注冲突，而不是挑一个。
+
+</Drill>
+
+### 5.5 评测按身份和时点分层，入库要有门禁
+
+L12 第八节的标题是「随机抽样会给你一个 90 分的废评测集」。企业语料里全员可见的文档最多，随机抽样几乎全抽到它们，权限相关的失败模式就不在评测集里，而 L12 说过："某个失败模式在评测集里一条都没有"这件事，不会以任何形式表现出来。第三节的召回塌缩就是这样上线的。在 L12 的分层上多两个维度（推断）：样本带 `asPrincipal`，按身份和可见范围分层报 recall；样本带 `asOf`，统计「引用了已废止版本」的比率。解析器升级要跑检索层回归，不只看编辑距离。
+
+**越权率是计数，不是比例**。500 条 0 次越权，按 rule of three 只能说 95% 置信上界约 0.6%。这和 L14 第十二节「报数：两个轴，缺一个就不算数」是同一种纪律：报 0 之前先报分母。
+
+解析器不抛异常，入库前就要自己查。实验八拿 travel-2025、legacy-notice 和四份各坏一处的文档跑 `qualityGate`：
+
+```text
+文档            缺 acl  缺 effectiveFrom  空白页  脚注丢失  表格无表头  替换字符
+travel-2025     ·       ·                 ·       ·         ·           ·
+legacy-notice   ✗       ✗                 ·       ·         ·           ·
+bad-empty-page  ·       ·                 ✗       ·         ·           ·
+bad-footnote    ·       ·                 ·       ✗         ·           ·
+bad-table       ·       ·                 ·       ·         ✗           ·
+bad-encoding    ·       ·                 ·       ·         ·           ✗
+```
+
+每份坏文档恰好被一项抓住，好文档一项不中（GATE-2）。更多检查（页覆盖率、乱码率、编号断档、过度共享）的**阈值都没有一手数字**，要在你自己的语料上校准。
+
+<Lab title="实验六、七、八和 TODO 5、6">
+
+TODO 5 `myResolveVersions` 被 VER-1 到 VER-7 抓，其中 VER-5 用你的分块结果重算 bob 和 alice；TODO 6 `myApplySync` 被 SYNC-1 到 SYNC-4 抓。
+
+</Lab>
+
+---
+
+## 六、动手
+
+<Note title="作为应用层工程师你实际会怎么做">
+
+你大概不会自己写解析器和向量库，但要能在选型会上问对问题。证据等级照调研：`[P]` 一手原文，`[P2]` 由一手原文推断，`[O]` 调研本机实测。
+
+| 要查的 | 怎么查 | 证据 |
+|---|---|---|
+| 选哪个解析器 | 50 到 100 页自己的文档，在检索层跑回归；MinerU、PP-StructureV3、Marker、Docling 可进候选，先看许可证 | 方法 `[P2]`，榜单互相矛盾 `[P]` |
+| 解析器默认丢什么 | PP-StructureV3 的 `markdown_ignore_labels`、印章识别；Marker 的 `--keep_pageheader_in_output`；MinerU 的 `page_idx` 从 0 起 | `[P]` |
+| 表格怎么分块 | Docling `repeat_table_header` 默认开；Unstructured 按文本切；RAGFlow 只取 `rows[0]` | `[P]`，Unstructured 不带表头 `[P2]` |
+| pgvector | `SHOW hnsw.iterative_scan`；按选择率分档测召回；多租户用 list 分区 | 默认值 `[P]`，召回塌缩 `[O]` |
+| Elasticsearch、OpenSearch | ACL 在不在 `knn` 子句里；外层 bool、`post_filter` 是后过滤 | `[P]` |
+| Qdrant | payload 索引是否入库前建；租户间 IDF 默认按整个 shard 算 | `[P]` |
+| 索引框架 | LangChain `cleanup` 默认 `None`，LlamaIndex 默认 `UPSERTS`；有没有墓碑通道 | `[P]` |
+| 开源整套 | Onyx 文档级 ACL、放在 knn 子句内；Dify 只有知识库级三档权限、没有只读档；RAGFlow CE 权限资源只到知识库 | `[P]`；Dify 拆库后的 confused deputy `[P2]` |
+
+LlamaParse、Onyx 和 Dify 的 PDF 解析路径，调研没读到一手材料，不做判断。
+
+</Note>
+
+<Lab title="l09x/kb：七个 TODO，每一个对应一种不报错的失败">
+
+```bash
+cd labs
+pnpm kb                                  # 八个观察实验，先跑，什么都不写
+KB_IMPL=shared pnpm verify:l09x          # 先确认测试本身是对的：56 条全绿
+pnpm verify:l09x                         # 实现七个 TODO 之后
+
+uv run python -m l09x.kb
+KB_IMPL=shared uv run python -m l09x.verify
+uv run python -m l09x.verify
+```
+
+七个 TODO 全空时是「40 失败 / 16 通过」。两种语言的观察实验输出逐字节相同。
+
+| TODO | 要点 | 主要被哪组抓 |
+|---|---|---|
+| 1 ★ `myHeadingLevel` | 先 NFKC，再用显式字符类；GB/T 9704 四级序；多级小节是点数加 3；数字开头的正文不是标题 | NUM-1–6 |
+| 2 ★★ `myRenderTableRows` | 多级表头按列拼；caption 每行带；合计行带列名；空单元格跳过；`hiddenColumns` 不出现 | TABLE-1–6 |
+| 3 ★★ `mySearchFiltered` | post、pre、iterative；迭代有上限；不够 k 条宁可少给；`scanned` 如实返回 | ACL-4–8、ACL-14 |
+| 4 ★ `myRerankPipeline` | 先过滤再发；`exposed` 按发送顺序；分数降序、同分按 id | ACL-9、ACL-10 |
+| 5 ★★ `myResolveVersions` | 缺生效日不参与；asOf 生效、未废止；上位、特别、新；一般晚于特别就交人 | VER-1–7 |
+| 6 ★ `myApplySync` | 按 `src:hash` 去重，先写后删；tombstone 是 incremental 加墓碑 | SYNC-1–4 |
+| 7 ★ `myCacheKey` | 规范化 query、去重排序的 principals、语料版本，用 `\u001f` 连 | CACHE-1–3 |
+
+56 条断言：PARSE 6 · NUM 6 · TABLE 6 · ACL 14 · TENANT 3 · VER 8 · SYNC 6 · CACHE 3 · GATE 与 CITE 4。
+
+有 16 条测的是参考实现，不是你：PARSE-1、2、6，ACL-1、2、3、11、12，TENANT 组，VER-8，SYNC-5、6，GATE 组。TODO 全空时绿的就是这 16 条。PARSE-3 到 PARSE-5 和 CITE 组测参考实现的 `chunkDocument` 和 `citeLocator`，但 `chunkDocument` 调的是你的 TODO 1、2；TABLE-5、ACL-13、ACL-14、VER-5 同样用你的实现重新分块。
+
+写完做一个反向实验：把 iterative 改成「不够就补越权的」，或把 post 偷偷写成 pre，看 ACL-8 和 ACL-5 分别报什么。
+
+</Lab>
+
+---
+
+## 七、收尾
+
+五句该记住的话：
+
+1. **解析器不抛异常**。默认值决定你丢了什么；页码分开存两套，只在一个函数里换算；升级解析器要重新解析
+2. **结构要跟着每个 chunk 走**。表格每行带完整列名；编号先 NFKC 再用显式字符类；NFKC 只用来比较
+3. **ACL 写成 WHERE 是安全的，但召回会静默塌缩**。过滤放进 ANN；「检索不到」可能是过滤放错了层
+4. **结果一样不等于安全一样**。rerank、缓存、trace、多人会话、字段、工具参数、同步窗口，每份副本单独执行权限
+5. **没有 commit，就要显式事件**。删除靠墓碑；「最新版」有三个维度，有一种冲突要交给人；评测按身份和时点分层
+
+<Drill title="面试里会被追问的五个问题">
+
+1. **ACL 过滤放在哪一层？** ANN 里面：ES、OpenSearch 写进 knn 子句的 filter，pgvector 开迭代扫描或分区，Qdrant 入库前建 payload 索引。写成 ANN 之后的 WHERE 是安全的，可 pgvector 默认配置在 1%–2% 选择率下平均只返回 0.5–0.6 条，没有告警。靠按身份分层的检索评测发现，不靠安全审计
+2. **rerank 放在 ACL 前后有区别吗？** 结果没区别，数据流有。lab 里 2% 选择率、20 个查询，先 rerank 的 top-k 和反过来一模一样，但 788 段越权全文已经发给了外部 reranker
+3. **撤销一个人的权限，多久生效？** 先说准确的话：尊重的是最近一次同步时的权限，Onyx 默认 5 到 30 分钟，排队另算。然后数副本：缓存键有没有 principals 和语料版本，trace 有没有正文，群聊是不是按交集
+4. **源系统删了文档，索引怎么知道？** 不靠「这次没看到」。两大框架默认都不删；incremental 删不掉整篇删除；full 在 loader 部分失败时误删。要显式墓碑，删完还要处理统计量里的幽灵
+5. **新旧两版制度都检索到了怎么办？** 不交给模型挑。先按 asOf 过滤，再看上位、特别、新；新的一般晚于旧的特别就返回冲突、交人裁决。消解在权限过滤之后按人做，bob 和 alice 的答案不同
+
+</Drill>
+
+回头看前置课。L09 的「检索不到相关内容」是一个合法的、而且经常正确的结论，在企业里也可能是过滤放错了层；它的 tokenizer 不认全角数字；重排看的「细特征」就是全文，过滤要在它之前。L12 的分层多了身份和时点。L13 的内容采集一打开，trace 就是一份没有 ACL 的副本。L14 的「契约里没写的参数一律拒绝」落到了检索工具上，「通道」落到了外部 reranker 上。L15 的缓存分区键，在答案缓存里要细到权限集合。
+
+往前看：下一节 L10 讲 MCP。检索做成远程 MCP server 时，「权限只来自会话」具体就是来自验过受众的 token，而不是工具参数；L10 那句「收到的 token 不许转给下游」也意味着，检索服务不能拿用户的 token 去替你翻源系统。
+
+<Note title="这一节刻意没有当事实讲的说法">
+
+调研没有一手来源或只有推断的：入库门禁的所有阈值；GB/T 9704 的原文（只读到转载）；Docling 和 Unstructured 在 OmniDocBench v1.5 之后的分数；Dify 换 embedding 模型期间的检索行为；RAGFlow 文档级权限是否在检索时执行；Onyx 和 Dify 的 PDF 解析路径；LlamaParse；vec2text 对中文和 BGE 类模型的效果；外部 rerank 服务的数据留存；pgvector 在更大规模下的规划器选择；企业制度是否普遍仿照立法法的优先序；撤权延迟里的排队时间；ColPali 类方案的中文效果；Qdrant 按租户分片；几种解析器的系统能力对比。讲义里引到这些地方，都写了「推断」或「没有数据」。
+
+</Note>

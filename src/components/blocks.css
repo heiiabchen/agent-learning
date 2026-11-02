@@ -1,0 +1,126 @@
+/* 讲义内嵌区块。同一套细边卡片，强调色只有暗蓝；警告单独用暗红。 */
+
+.block {
+  --block: var(--accent);
+  margin-block: 1.8em;
+  border: 1px solid var(--line);
+  border-inline-start: 3px solid var(--block);
+  border-radius: 12px;
+  background: var(--surface);
+  overflow: hidden;
+}
+
+.blockHead {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  width: 100%;
+  padding: 0.7rem 1rem;
+  background: transparent;
+  border: 0;
+  border-block-end: 1px solid transparent;
+  text-align: start;
+  font-family: var(--font-ui);
+  font-size: 0.8rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: var(--block);
+}
+
+.block[data-open='true'] .blockHead,
+.block:not(:has(.chev)) .blockHead {
+  border-block-end-color: var(--line);
+}
+
+.blockGlyph {
+  flex: none;
+  font-size: 0.85rem;
+  line-height: 1;
+}
+
+.blockLabel {
+  flex: 1;
+  min-width: 0;
+}
+
+.blockNote {
+  font-weight: 400;
+  color: var(--faint);
+  font-size: 0.75rem;
+}
+
+.blockBody {
+  padding: 0.95rem 1.1rem 1.15rem;
+  font-size: 0.98rem;
+}
+
+.blockBody > *:first-child {
+  margin-block-start: 0;
+}
+.blockBody > *:last-child {
+  margin-block-end: 0;
+}
+.blockBody > * + * {
+  margin-block-start: 0.9em;
+}
+
+.blockBody pre {
+  margin-block: 1em;
+  font-size: 12.8px;
+}
+
+.chev {
+  flex: none;
+  font-size: 0.62rem;
+  color: var(--faint);
+  transition: rotate 0.22s ease;
+}
+.block[data-open='true'] .chev {
+  rotate: 90deg;
+}
+.blockHead:hover .blockNote,
+.blockHead:hover .chev {
+  color: var(--muted);
+}
+
+.block[data-tone='warn'] {
+  --block: var(--bad);
+}
+
+.keyIdea {
+  margin-block: 2.1em;
+  padding: 0.15rem 0 0.15rem 1.15rem;
+  border-inline-start: 2px solid var(--accent);
+  font-family: var(--font-reading);
+  font-size: 1.22rem;
+  font-weight: 500;
+  line-height: 1.65;
+  color: var(--ink);
+  letter-spacing: 0.004em;
+}
+
+.labSteps {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  counter-reset: step;
+}
+
+.labSteps li {
+  counter-increment: step;
+  position: relative;
+  padding-inline-start: 2rem;
+  margin-block-start: 0.7em;
+}
+
+.labSteps li::before {
+  content: counter(step, decimal-leading-zero);
+  position: absolute;
+  inset-inline-start: 0;
+  inset-block-start: 0.18em;
+  font-family: var(--font-ui);
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0;
+  color: var(--accent);
+}

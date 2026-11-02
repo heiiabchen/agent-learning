@@ -1,0 +1,560 @@
+前十九节是零件和一条能上线的主线。这一节只做一件事：**把它们讲成别人三分钟后还记得的故事，并接住三层追问。**
+
+没有 lab。练习场是口述和白板——对着这一节的结构，用自己的 capstone 填空。每个技术点都标了出处；**说不顺的那一处，就是该回去重读的那一节。**
+
+<Key>
+面试官记住的不是技术名词列表，是**你在哪里选过反直觉的一侧，以及你怎么知道自己没骗自己**。
+
+L12 / L17 / L18 / L19 的共同母题——**失败看起来像成功**——就是最好的叙事脊柱：静默错改、假绿、海报成功率、双份副作用，四种都不报错。
+</Key>
+
+先立一条纪律：**这一节不讲某家公司怎么面试、问什么、给多少钱**——课程里没有这类一手来源，编出来的面经比没有更有害。只讲怎么把你确实做过、测过的东西讲清楚。
+
+---
+
+## 一、三分钟项目叙事
+
+### 1.1 骨架：四段，不按课程目录
+
+| 段 | 时长 | 要回答的问题 |
+|---|---|---|
+| 谁痛 | 30 秒 | 什么失败、为什么它不报错 |
+| 你钉住的不变量 | 60 秒 | 你在哪几处选了反直觉的一侧 |
+| 你怎么证明 | 60 秒 | 哪些是零模型断言、哪些是真模型、门怎么设 |
+| 你故意没做的 | 30 秒 | 边界在哪、为什么 |
+
+第四段最常被省掉，也最能区分人。**「我没做 X，因为 X 会让失败静默」，比再多讲一个功能更能证明你想过边界。**
+
+### 1.2 示范稿
+
+下面是用 L17–L19 capstone 写满的一版。数字是课程参考实现的 verify 项数——**讲的时候必须换成你自己跑出来的数**。
+
+<Note title="示范稿（约三分钟）">
+
+**【0:00 谁痛】** 我做了一个 mini coding agent，能读仓库、改文件、跑测试。我发现它最危险的失败全都不报错：`str_replace` 命中了三处里的第一处；pytest 输出被截断时解析器判成绿；agent 改了测试文件把 CI 骗绿。exit code 都是 0，agent 还汇报「已完成」。所以整个项目只追一个目标：让失败不能再看起来像成功。
+
+**【0:30 不变量】** 我钉了四层。编辑层：多处匹配返回 `NOT_UNIQUE`、零写入，不改第一处——这点业界并不统一，aider 同一个仓库里两种编辑格式语义相反，所以我显式选了一边并用测试钉住。终止层：模型说 finish 不算数，`canStop` 要求最后一次 verify 晚于最后一次 edit、collected 不少于 baseline、测试文件哈希不变。评测层：主指标是 resolve 不是 apply，改了测试的判 hacked。上线层：每次 claim 递增 epoch，僵尸 worker 的写入被拒；幂等键按租户隔离；没有 key 的 unsafe 写禁止自动重试。
+
+**【1:30 证明】** 检测器、门禁、状态机这些确定性的部分一次模型都不调，全用假输入测——编辑层 TS 85 项、Python 84 项，评测层 56 项，上线层 51 项，全进 CI。真模型那层放 nightly，过两扇门：`regress` 只问有没有变差，`claim` 才问能不能说更好；先看成对的 onlyA / onlyB，不看净值——净值为 0 也可能是拿三个 easy 换了几个改测试过的 hard。
+
+**【2:30 没做的】** 没拿 SWE-bench 全量分数当 PR 门：不可复现、要花钱，PR 只信零模型 verify。没做前缀匹配的审批记忆：`/repo` 的前缀会放行 `/repo-evil`，我用路径段边界加 deny 优先。
+
+</Note>
+
+**每一句技术陈述都是一个钩子**：「aider 两种格式相反」会被追问出处（L17 1.1），「净值为 0 也可能换 bug」会被追问怎么判（L18），「epoch」会被追问为什么租约不够（L19）。你不是在背稿，是在**选择面试官接下来问什么**——那些问题第二节都备好了。
+
+### 1.3 弱版本，以及它为什么失败
+
+> 我系统学了 agent 开发，从 API 调用开始，做了流式输出、工具调用、agent loop，然后用了 RAG 和 MCP，做了多 agent，后来做了评测、可观测性和安全，最后做了一个 coding agent，成功率挺高的。用过 Claude 和 DeepSeek，也了解 LangGraph。
+
+| 句子 | 问题 | 第一个追问会把它带到哪 |
+|---|---|---|
+| 从 API 调用开始…… | 时间线，听不到选择 | 面试官在第三个名词处走神 |
+| 用了 RAG 和 MCP | 名词清单，每个都是入口 | 「语料塞不下吗？」（L09） |
+| 成功率挺高 | 没有口径、N、区间 | 「apply 还是 resolve？多少题？」（L18） |
+| 了解 LangGraph | 框架名不是能力 | 「中断恢复时副作用会重放吗？」（L11x） |
+
+**弱版本的根本问题不是信息少，是没有一处可以被证伪的陈述**——而能被证伪、你又已经证过的陈述，才是硬通货。
+
+### 1.4 三个长度，提前备好
+
+- **30 秒版**：「coding agent 最危险的失败都不报错。我钉了编辑唯一性、终止时序、resolve 口径、epoch 围栏四个不变量，每个都有零模型断言。」
+- **3 分钟版**：上面的示范稿。
+- **10 分钟深挖版**：被要求「挑一块细讲」时，挑你**改过最多次**的那一块——踩过的坑最多，最能讲到第三层。
+
+---
+
+## 二、高频概念：两句话，然后三层追问
+
+### 2.1 第一层：定义一句，反转一句
+
+每个话题准备**两句**：一句定义，一句和直觉相反、而你测过的事实。只有定义谁都能背；反转那一句才说明你真的撞过。下面七棵树的第 0 层就是这种两句话；树里没展开的，至少备好这几条：
+
+| 话题 | 反转一句 | 出处 |
+|---|---|---|
+| 记忆 | 主要风险不是记不住，是记错——记错是永久的 | L08 |
+| 观测 | 失控循环靠 loop 长度直方图报警，不需要 trace | L13 |
+| 流式 UI | 能展示 ≠ 能执行；审批卡在 `canExecute` | L16 |
+| 编辑 | 唯一匹配不是行业共识；要显式选择并测住 | L17 |
+| 成功率 | apply ≠ resolve；改测试是 hacked | L18 |
+
+### 2.2 追问树怎么读
+
+追问通常沿一条线走：**定义 → 边界情况 → 你怎么验证**。弱回答停在第 0 层；走到第 2 层并说出断言或实验，才是这门课训练的东西。
+
+### 2.3 树一：agent loop 怎么停（L05 → L17）
+
+**第 0 层 ·「agent loop 什么时候停？」** 弱答：「模型不再调工具就停。」senior：五个终止条件——最终答案、步数、累计成本、挂钟时间、外部取消；四个是保护性的，检查点在循环顶部，**成本在花钱之前估算**。
+
+**第 1 层 ·「撞了步数上限，最后那句话能用吗？」** 不能。那句话**看起来像答案**，所以返回值带 `reason`；多 agent 里被掐断的子结果进 gaps 不进结论（L11）。step_limit 占比一高，成功率本身就是假的（L05）。
+
+**第 2 层 ·「模型说做完了，你信吗？」** 不信。`canStop` 是硬条件：verify 解析为 exact、`lastVerifySeq > lastEditSeq`、collected / skipped 不差于 baseline、测试文件哈希不变。再给一个 `give_up` 出口——只有成功和失败两种结局会逼向作弊（L17）。
+
+**第 3 层 ·「不调模型，怎么知道 canStop 有效？」** 测检测器，不测模型。`STOP-3` 喂「verify 不在最后 edit 之后」，断言不许停；`HACK-11` 喂一段正常 diff，断言**不许报警**——零假阳性和抓得住同等重要。
+
+### 2.4 树二：上下文满了（L06 → L15）
+
+**第 0 层 ·「上下文快满了怎么办？」** 弱答：「做摘要压缩。」senior：先看分区占比，不看总量；手段按代价排——源头裁剪 → 挪出去 → 压缩。多数时候工具结果占大头，压缩是用错药。
+
+**第 1 层 ·「必须压缩的时候呢？」** 结构化摘要：原始任务一字不改、已完成、关键事实、**失败过的方法**、下一步。漏掉失败那一节，agent 会把试过的路再走一遍。
+
+**第 2 层 ·「压缩有什么你没提的成本？」** 改写历史会打掉缓存前缀，下一次全额 prefill；剩余步数少时不压更便宜（L06）。L15 的前缀分歧检测把 `messages` 变短判成截断而不是追加——**截断正是压缩每次都在做的事**。
+
+**第 3 层 ·「怎么证明缓存真的命中了？」** 读 usage 字段，不看延迟：延迟噪声大，而且靠响应时间推断命中本身就是一条要防的侧信道。字段还要归一化——Anthropic 的 `input_tokens` 不含缓存部分，OpenAI 的含（L15）。
+
+### 2.5 树三：持久化、幂等与双份（L08 → L19）
+
+**第 0 层 ·「会话持久化怎么做？」** 弱答：「把 messages 存下来。」senior：transcript 是历史不是状态。存 append-only 事件日志、reduce 出状态；**intent 和 outcome 是两条事件**，「打算做但不知道做没做」才能被表达。
+
+**第 1 层 ·「进程死在两者之间呢？」** 工具作者声明可重放性：pure / idempotent / once。once 那条代码里没有正确答案，诚实的出口是交给人；真正的解法在上一层——**让副作用本身幂等**（L08 第二节）。
+
+**第 2 层 ·「幂等键怎么设计？」** 规范化序列化后哈希，拌进会话 id（L08）。上线后作用域升到租户：别人用同一个 key 不能 replay 你的作业（`START-4`）；同 key 不同 payload 是 conflict，不是静默覆盖（L19）。
+
+**第 3 层 ·「两个 worker 都以为自己持有任务？」** 租约过期、旧 worker 又醒来，是经典僵尸写。每次 claim 递增 epoch，心跳 / checkpoint / succeed 必须带当前 epoch，旧 epoch 的写入被拒（`JOB-11`）。续跑从 checkpoint 开始，**不是重新 enqueue 一个 job**。
+
+### 2.6 树四：你怎么知道这版更好（L12 → L18）
+
+**第 0 层 ·「怎么衡量 agent 的效果？」** 弱答：「成功率。」senior：事前声明唯一主指标——coding agent 上是 resolve（补丁落下、fail-to-pass 绿、pass-to-pass 绿、未改测试、未被检测器拦）；apply 只当诊断。没有 fail-to-pass，就没有 resolve。
+
+**第 1 层 ·「judge 和人工一致率 85%，够吗？」** 原始一致率可能是零信息：标注里 80% 是「通过」时，`return "pass"` 的 judge 一致率就是 80%，kappa 是 0。kappa 1.0、重测 1.0 的 judge 也可以是「永远选前面那个」——位置偏见要 AB / BA 实测。何况七成判据根本不需要 judge（L12）。
+
+**第 2 层 ·「净值 +2%，合并吗？」** 先看 fixed / broken 明细。门拆两扇：`regress` 测非劣，弄坏 ≥3 或显著变差就拦；`claim` 测优效，升了但不显著就不许宣称。**把「升了但不显著」放进 regress，会在 A/A 噪声里随机拦 PR**（L18 第六节）。
+
+**第 3 层 ·「才几十道题，区间呢？」** 先报区间再报百分点。N=10 时 8/10 → 9/10，Wilson 区间严重重叠（L18）；150 条、80% 成功率，95% 区间宽 13 个百分点（L12）。区间跨过对方就是「看不出」，不是「赢了」。
+
+### 2.7 树五：注入与审批（L14 → L16 → L19）
+
+**第 0 层 ·「怎么防 prompt injection？」** 弱答：「分隔符加注入分类器。」senior：能读懂攻击的防御，记录上全被绕过了；**做授权判断的代码，绝不能读不可信的数据**。判参数的来源和角色：`post_comment.body` 来自不可信内容是正常的，`repo` 被它决定就是事故（L14 第六节）。
+
+**第 1 层 ·「落到 coding agent 上怎么做？」** 用 Rule of Two 而不是字面三要素：Meta 把第三条放宽成「能改状态或对外通信」，`rm -rf` 零外流也触发——那正是 coding agent 每天在做的事。三条里**必须真的拿掉一条**。路径检查不是 `startsWith(root)`，它会放行同名加 `-evil` 的兄弟目录（`SBX-4`）。
+
+**第 2 层 ·「用户嫌每次都问太烦，全点同意？」** 一，审批卡在 `canExecute`，参数没收完按钮不可点（L16）。二，记忆分 once / session / ttl，scope 按路径段边界：`/repo` 覆盖 `/repo/a.ts`，不覆盖 `/repo-evil`（`MEM-2`），deny 优先（`MEM-7`）。三，deny 把作业拉回 running 让 agent 换路，不整单取消（`JOB-12`）。
+
+### 2.8 树六：你为什么没用 X（L07 / L09 / L10 / L11）
+
+这棵树形状不同：面试官提一个热门技术，看你会不会**拒绝**它。
+
+**第 0 层 ·「为什么不上多 agent？」** 自主性是为「不知道该怎么做」付的钱（L07）。多 agent 是花钱策略不是架构：L11 实验里多 agent 对单 agent 是 3.67 倍，扇出宽度是 3，协调开销只占 6%——**贵在做了三倍的活**。
+
+**第 1 层 ·「八个模块重构，并行八个 agent 不正好？」** 能拆 ≠ 能并行。要写文件就是 single：并行 sub-agent 必须只读，否则后写的覆盖先写的，**两份报告都说完成**（L11 第五节）。
+
+**第 2 层 ·「代码检索上向量库吗？工具做成 MCP 吗？」** 先问该不该检索：塞得下就全塞；有函数名、错误码就用 grep，它失败得响亮；代码上 BM25 常打败向量（L09）。MCP 只在跨进程或跨供应商复用时值得；真上了，排障先看错误走没走对通道、响应是否按 id 匹配、stdout 有没有混进日志（L10）。
+
+### 2.9 树七：harness engineering 这个词
+
+这棵树问的是一个术语。它已经进了中文面试的语汇：一篇 2026-09 的秋招面经复盘里出现了「Agent Harness 是模型之外负责执行的运行时」这类表述。和开头那条纪律一样，这只用来确认「会被问」。
+
+**第 0 层 · 讲讲你对 harness engineering 的理解**。弱答：「就是给模型搭脚手架，类似 LangChain。」senior：一句定义，带出处。出处是一份覆盖 11 个生产级 coding harness 的源码研究（arXiv 2609.00006）§2.1：
+
+> "An agent is a model plus a harness. The harness is everything except the model: the runtime that couples an LLM to the world—its loop, its tools, its context, its safety controls, its orchestration, and its extension surfaces. Harness engineering is the discipline of designing and evolving that runtime."
+
+再一句反转：**让这个词流行起来的那两篇厂商文章，都没有定义它**。
+
+**第 1 层 · 这个词不是 OpenAI 提出的吗**？按时间排：
+
+- 据上面那篇论文转述，Mitchell Hashimoto 在 2026-02 "first used in passing"，顺口一用，没有定义。这门课没有核对 Hashimoto 的原文
+- 2026-02-11，OpenAI 的 "Harness engineering: leveraging Codex in an agent-first world"。标题里有这个词，正文里 "harness" 只再出现一次，是列表项 "Evaluation harnesses"——还是评测意义上的旧用法。正文最接近定义的一句是 "a software engineering team's primary job is no longer to write code, but to design environments, specify intent, and build feedback loops that allow Codex agents to do reliable work."
+- 2026-03-24，Anthropic 的 "Harness design for long-running application development"。给的是一条设计原则，不是定义："every component in a harness encodes an assumption about what the model can't do on its own, and those assumptions are worth stress testing"
+- 「Agent = Model + Harness」这个一行式，据论文转述是 LangChain 的 Trivedy 推广开的，这门课同样没有核对原文
+- 形式定义：上面那篇 arXiv 2609.00006，它的术语谱系里没有引用 OpenAI 那篇
+
+这就是 6.1 那张证据排序表的一次实际使用：两篇厂商文章当案例讲，定义只引论文。**把案例文当定义出处，被追问「原文怎么说的」就答不上来**。
+
+**第 2 层 · 它和 LangChain、和 SWE-bench 的 harness 是一回事吗**？论文 §2.2 "What a Harness Is Not" 划了四条边界：
+
+| harness 不是 | 原文 | 一句话 |
+|---|---|---|
+| agent 框架 | "A harness is not an agentic framework. A framework ... is a library the developer imports to build an agent; a harness is a runtime the developer works inside of." | 框架是你 import 的库，harness 是你在里面干活的运行时 |
+| 评测 harness | "The SWE-bench "harness" wraps an agent to run it against tasks; an agent harness wraps a model to make it act. Same word, opposite direction of wrapping." | 同一个词，包裹方向相反 |
+| 编排器 | "An orchestrator ... coordinates one or more harnesses from above and implements no editing loop of its own" | 编排器在 harness 上面 |
+| 不完全等于 scaffold | "scaffold names the structural code ... harness names the shipped runtime artifact" | 一个是结构代码，一个是交付的运行时 |
+
+第一行还有实证：论文看的 11 个生产 harness 里，"no agent runtime imports a general-purpose agentic framework"。这和第八节的「框架名堆砌」是同一个坑的另一面。
+
+**第 3 层 · 你做过哪一块**？论文把 harness 拆成七个子系统，外加两个横切面："the interface layer (TUI, CLI flags, IDE protocol, HTTP server, SDK)" 和 "the session substrate (transcripts, persistence, resume/fork)"。对到这门课是这样，面试时挑一行，说出那一行的断言：
+
+| 子系统 | 课程里 | 你能拿出来的断言 |
+|---|---|---|
+| Agent loop | L05 / L17 | 五个终止条件；`canStop` 要求 verify 晚于最后一次 edit |
+| LLM integration | L15 | usage 归一化：Anthropic 的 `input_tokens` 不含缓存部分，OpenAI 的含 |
+| Tools & actions | L17 | 多处匹配 `NOT_UNIQUE` 零写入；批量全有或全无 |
+| Memory & context | L06 | 分区计量，源头裁剪优先 |
+| Safety & permissions | L14 / L16 / L19 | 授权判断不读不可信数据；审批 scope 按路径段边界 |
+| Orchestration | L07 / L11 | 并行 sub-agent 只读；交接带 `maxHops` 和 `loop` |
+| Extensibility | L10 / L10x | 错误走对通道；远程 server 只验 token，不转发 token |
+| 交互层（横切） | L16 / L16x | 审批卡在 `canExecute`；第三方 View 发来的请求过宿主的方法、server、可见性三道闸 |
+| 会话底座（横切） | L08 / L19 | intent 和 outcome 是两条事件；claim 递增 epoch |
+
+<Key>
+
+**怎么说才不像在对暗号：术语放在最后，不放在最前**。先讲你做的那一块和它的断言，再补一句「按论文的划分，这属于 harness 的 safety & permissions」。开口就是「我做的是 harness engineering」，面试官的下一问一定落在第 1 层或第 2 层，而你还什么都没证明。
+
+更好的用法借 Anthropic 那篇的原则：每个组件都编码了一个「模型自己做不到什么」的假设。`canStop` 编码的假设是「模型说做完了，不可信」；模型升级时，这个假设该重测，而不是默认保留。原文："the space of interesting harness combinations doesn't shrink as models improve. Instead, it moves." **能说出你的某个组件在赌模型哪一点做不到，比说出这个词更像做过**。
+
+</Key>
+
+---
+
+## 三、系统设计：「设计一个内部 coding agent」
+
+### 3.1 开场两分钟：先问，不先画
+
+建议先问四个问题，把「设计一切」收窄成「设计这一个」：
+
+1. **在哪跑**：本机 IDE 还是后台队列？后者才需要运行时层。
+2. **能动什么**：只读、写工作树、还是能开 PR？决定 Rule of Two 拿掉哪条。
+3. **成功怎么判**：有没有可跑的测试？没有 fail-to-pass 就先补任务集。
+4. **预算和规模**：决定配额和公平调度要不要上桌。
+
+然后一句话亮出立场：**「workflow 里嵌一个 agent 节点——建分支、跑 CI、开 PR 是确定性流程，只有改代码这一步交给模型。」**（L07）
+
+### 3.2 逐层：一个不变量，一个明确不做
+
+从威胁模型开始画。没有它，后面的工具和记忆都会变成攻击面清单。
+
+| 层 | 我会实现的一个不变量 | 我明确不做的 | 出处 |
+|---|---|---|---|
+| 威胁模型 | 授权判断不读不可信数据；按参数来源判 | 不把注入分类器当边界 | L14 |
+| 编辑 | 多处匹配 → `NOT_UNIQUE` 零写入；批量全有或全无 | 不做基于相似度的模糊匹配 | L17 |
+| 循环与计划 | 五个终止条件同时生效；plan 阶段没有 `edit_file` | 不靠 prompt 写「先计划」 | L05 / L17 |
+| 验证 | verify 晚于最后一次 edit；解析 fail-closed | 不让模型自评「已验证」 | L17 |
+| 上下文 | 分区计量，源头裁剪优先 | 不默认做摘要压缩 | L06 |
+| 沙箱 | 规范化后判 deny；高危文件要确认 | 不把沙箱当安全边界 | L14 / L17 |
+| 评测 | 任务集带 fail-to-pass；主指标 resolve | PR 门不跑全量真模型 | L18 |
+| 运行时 | claim 递增 epoch；租户作用域幂等键 | 断线不重新 enqueue；不对 `429_SPEND` 退避 | L19 |
+| 审批 | 段边界 scope，deny 优先；卡在 `canExecute` | 不做前缀匹配的记忆 | L16 / L19 |
+| 观测与成本 | usage 归一化；loop 长度直方图；日额度 | 不用延迟判缓存；不报证明不了的比例 | L13 / L15 |
+
+**每层只说一个不变量就停，等追问。** 一口气讲完十层，等于没给面试官留追问入口。
+
+### 3.3 走一遍失败路径
+
+画完层之后，主动挑一个故障从头走到尾，证明各层是咬合的：
+
+> worker 租约过期 → `requeue_stale` 放回队列，保留 checkpoint → 新 worker claim，epoch 从 3 变 4 → 旧 worker 醒来带着 epoch 3 写 checkpoint，被拒 → 新 worker 从 checkpoint 续跑，客户端只重放 `seq > lastSeen` 的事件 → 写文件的工具带幂等键，replay 拿旧结果而不是再写一次。
+
+每个箭头背后都是 L19 的一条断言。**说得出断言编号的故障走查，是「做过」和「读过」之间最清楚的分界线。**
+
+### 3.4 时间不够时砍什么
+
+| 时长 | 必讲 | 一句带过 | 不讲 |
+|---|---|---|---|
+| 20 分钟 | 澄清、威胁模型、编辑与终止、评测 | 运行时、审批、成本，各一句「做 X，因为 Y」 | 上下文细节、RAG、多 agent、UI |
+| 45 分钟 | 上面全部，加运行时状态机、审批记忆、一次故障走查 | 观测细节 | 你自己没测过的部分 |
+
+理由：编辑和终止是 **coding agent 独有**的；评测回答「你怎么知道它好」；运行时和成本在任何后端系统里都有类似物。
+
+<Pitfall title="一开始就选向量库和 agent 框架">
+在不知道威胁模型和成功判据时先定技术栈，面试官听到的是「我会用这些工具」，而这道题问的是「你会怎么判断」。
+</Pitfall>
+
+---
+
+## 四、非 coding 的系统设计：同一个模板，四道题
+
+第三节的模板不是 coding agent 专用的。换一个领域，动作不变：先问，分层说不变量，走一条失败路径，说清钱和时间花在哪。这一节用它走四道题。
+
+题型从哪来，按开头那条纪律办：企业知识库问答、全渠道智能客服、数据分析 agent 这几类题，在 2026 年中文技术社区的面经和备考文里反复出现。这只用来确认「会被问」，**不支撑任何技术结论**。答案里的每一条技术结论，只来自一手来源或这门课自己的断言；第四道题找不到一手基准，就明说找不到。
+
+### 4.1 五拍：每道题都按这个顺序讲
+
+| 拍 | 回答什么 | 第三节里对应的地方 |
+|---|---|---|
+| 需求 | 四个澄清问题，把「设计一切」收窄成「设计这一个」 | 3.1 |
+| 架构 | 分层，每层一个不变量、一个明确不做 | 3.2 |
+| 评测与指标 | 成功由什么判定，报什么数 | 3.1 第三问；2.6 树四 |
+| 失败路径 | 挑一个故障，从头走到尾 | 3.3 |
+| 成本 | 钱和时间花在哪，先砍什么 | 3.4；第五节 |
+
+下面每一拍只给最关键的一两句，分层表只列三四行。3.2 那句「每层只说一个不变量就停，等追问」在这里同样适用。
+
+### 4.2 企业知识库问答（带权限）
+
+**需求**：ACL 粒度是文档、chunk 还是字段？身份从哪来（OIDC claims、LDAP、SCIM 同步）？权限撤销后多久必须生效？答案要不要可回放的引用？
+
+**架构**：
+
+| 层 | 不变量 | 明确不做 |
+|---|---|---|
+| 检索 | ACL 过滤下推进向量查询（前过滤） | 不在取回 TopK 之后再过滤 |
+| 生成 | 模型只见过滤后的 chunk | 不让模型自己判断「这段能不能说」 |
+| 工具 schema | ACL 参数由服务端从身份注入 | 不把 `department`、`tenant_id` 做成模型可填的参数 |
+| 观测 | trace 按同一套 ACL 脱敏 | 不把完整检索结果写进共享日志 |
+
+第二行是树五那句「做授权判断的代码，绝不能读不可信的数据」的同一个方向：判断权限的不能是模型。第三行是 L14 第六节的标题——参数才是攻击面。
+
+**评测与指标**：跨租户金丝雀。每次发版，用 A 的身份去查一篇只属于 B 的金丝雀文档，**命中必须是 0**。这是一条零模型断言，不需要 judge。答案质量另算，不和越权混进同一个分数。
+
+**失败路径**：
+
+> 员工调岗 → 权限缓存还没过期，仍能检索到旧部门的文档 → 面试官追问「撤销要多久生效、谁负责让缓存失效」 → 权限变更事件驱动失效，再加上面那条金丝雀回归
+
+**成本与追问**：这道题的成本问题，通常以这个追问出现——「过滤之后召回不够 k 条怎么办？」这正是后过滤的症状，Elasticsearch 文档的描述是 "post-filtering ... results in fewer than k results"。加大 k 是多付检索和上下文的钱，去修一个过滤位置的错。**答案是前过滤，不是加大 k**。
+
+这道题的完整版本在 L09x：过滤下推到 ANN 里面而不是之后，权限在缓存键、rerank 和 trace 里各有一份副本，删除和新版本要传到每一份。
+
+### 4.3 客服 agent：τ-bench 和 τ²-bench
+
+**需求**：有哪些**写操作**（退款、改地址、取消订单）？业务规则写在政策文档里还是代码里？什么时候必须转人工？用户要不要**自己动手**（重启设备、上传凭证）？
+
+最后一问是这道题的分水岭，讲评测时会回到它。
+
+**架构**：
+
+| 层 | 不变量 | 明确不做 |
+|---|---|---|
+| 写操作 | 金额和次数上限写在工具代码里；写操作带幂等键；高风险写走审批 | 不靠 prompt 写「退款不超过 500」 |
+| 路由 | 交接带 `maxHops` 和环检测 | 不让两个 agent 无限互转 |
+| 评测 | 主指标是对话结束时的数据库终态，报 pass^k | 终态可查时，不用 LLM judge 判「解决了没有」 |
+| 指导用户 | 「agent 自己做」和「指导用户做」分开测 | 不只测用户被动的模式 |
+
+第一行的上限来自 L11 第六节那句「没有上限的东西迟早会遇到一个把它变成 50 的输入」；第二行是 L11 第十节的踢皮球。
+
+**评测与指标**：这道题有现成的一手基准，值得讲细。
+
+τ-bench（Sierra，arXiv 2406.12045，2024-06）用语言模型扮演用户，和带领域 API、政策文档的 agent 多轮对话。判定是确定性的："compares the database state at the end of a conversation with the annotated goal state"。**LLM 只用来模拟用户，不当裁判**。这就是客服领域的 fail-to-pass：树四那句「没有 fail-to-pass，就没有 resolve」，在这里变成「终态不对，就没有解决」。
+
+它同时提出了 pass^k，原文定义是 "the chance that all k i.i.d. task trials are successful, averaged across tasks"。和 pass@k 方向相反：
+
+| | pass@k | pass^k |
+|---|---|---|
+| 含义 | k 次里至少一次成功 | k 次全部成功 |
+| 回答的问题 | 多试几次能不能碰上 | 每次都能不能做对 |
+| 适合 | 有验证器、可以多开几枪的场景 | 每个用户只有一次机会的场景，比如客服 |
+| k = 1 时 | 两者相等 | 两者相等 |
+
+最后一行是关键：只报 pass^1 的海报，看不出可靠性。原文的数字是 "Even for the best-performing gpt-4o function calling agent which has a >60% average task success, pass^8 drops to &lt;25%."——平均成功率过六成的 agent，连续八次全对的不到四分之一。L18 2.3 说「`pass^k`（k 次全过）少见于海报，正因如此才适合当你自己的稳定性指标」，出处就在这里：这个指标本来就是为客服这类场景提出的。
+
+τ²-bench（Sierra 与多伦多大学，arXiv 2506.07982，2025-06）回答第四个澄清问题。之前的基准是 single-control：只有 agent 能动工具，用户只提供信息。τ² 加了一个电信领域，agent 和用户都要动手，共享同一个环境（dual-control）。结论原文："a substantial performance decrease (around 20% pass^1) when agents must shift from autonomous operation to guiding a user."
+
+这给了客服题一个 senior 级别的回答：**评测按模式分开跑**。没有用户参与时也做错的，是推理问题；只在要指导用户时才做错的，是沟通和协调问题。不分开，你不知道该改 prompt 里的推理部分，还是对话策略。
+
+<Note title="引用这些数字时说清两件事">
+
+**版本**：τ² 论文对 retail 和 airline 用的是 "verified" 版本的域，引用 τ-bench 的数字要说清是哪一版。
+
+**时效**：以上是论文发表时的模型（gpt-4o、gpt-4.1、o4-mini），这门课没有核对 2026 年的排行榜。面试里只讲指标定义和「平均高不等于每次对」这个结构性结论，它不随模型更新失效。
+
+</Note>
+
+**失败路径**：
+
+> 用户说「我刚才没收到退款，再退一次」 → 模型重发退款 → 幂等键按 `(租户, 订单, 动作)` 命中 → 返回上次的结果，不再退一次
+
+这条走的是 L19 4.3 那句「真正的修法是主键为租户加 key」。
+
+**成本**：pass^k 要求每道题跑 k 次，按模式分开又乘一次，评测账单是任务数 × k × 模式数。所以它放 nightly，不放 PR 门——和第三节表里「PR 门不跑全量真模型」是同一条。
+
+**最可能的追问**：「你的客服 agent 解决率 92%，能上线吗？」92% 是 pass^1，是平均值。上线前看 pass^k，并说出 τ-bench 那组数：平均过六成，pass^8 不到四分之一。
+
+### 4.4 数据分析 agent（NL2SQL）
+
+**需求**：用户是分析师还是业务人员（决定要不要给他看 SQL）？哪种数仓、哪种方言？有没有行级、列级权限？指标口径有没有统一定义（「GMV 含不含退款」）？
+
+**先校准预期**。Spider 1.0 和 BIRD 上的高分会让人以为 NL2SQL 已经解决。Spider 2.0（arXiv 2411.07763，2024-11）换成了 632 道源自企业级场景的工作流题，库里 "often containing over 1,000 columns"，跑在 BigQuery、Snowflake 这类系统上：
+
+> "based on o1-preview, our code agent framework successfully solves only 21.3% of the tasks, compared with 91.2% on Spider 1.0 and 73.0% on Bird"
+
+21.3%、91.2%、73.0% 出自同一句话。差距来自 schema 规模、方言和元数据检索，不是 SQL 语法——原文说解题 "frequently requires understanding and searching through database metadata, dialect documentation, and even project-level codebases"。**所以工程重心是 schema linking 和语义层，不是 prompt**。这里同样没有核对 2026 年的排行榜。
+
+**架构**：
+
+| 层 | 不变量 | 明确不做 |
+|---|---|---|
+| 语义层 | 指标口径由人维护的定义给出，模型只负责选指标 | 不让模型自己写「GMV」的计算逻辑 |
+| SQL 校验 | 解析 AST：单条语句、只读、表在白名单里；超时和行数上限 | 不靠 prompt 写「只生成 SELECT」 |
+| 执行身份 | 每个请求用终端用户的数据库角色执行，RLS 对该角色生效 | 不用应用 owner 的连接执行模型生成的 SQL |
+| 结果回灌 | 查询结果按不可信数据处理 | 不把结果原样塞回一个有写工具的上下文 |
+
+第二行为什么不能靠 prompt：P2SQL 论文（arXiv 2308.01990）在未修改的 LangChain 0.0.189 上实测，"an adversary with access to a chatbot interface can effortlessly inject arbitrary SQL queries"，而 "Attempting to manually patch Langchain by hardening the prompts given to the LLM proved to be exceedingly fragile."
+
+第四行是树五那句话在非 coding 场景里最干净的例子。P2SQL 的间接攻击把恶意内容藏在数据库记录里："when other benign users interact with the application, the chatbot generates the malicious SQL code suggested in the database record."
+
+**评测与指标**：BIRD 报的是 execution accuracy，按执行结果判对错。安全另立一条硬指标：换一个租户的身份查金丝雀行，必须 0 行——和知识库那条是同一个形状。
+
+**失败路径**：这道题最值得走的，是 RLS 的两种静默失效叠在一起。
+
+<Pitfall title="开了 RLS，测试全绿，而 agent 用的是 owner 连接">
+
+PostgreSQL 文档："Table owners normally bypass row security as well, though a table owner can choose to be subject to row security with ALTER TABLE ... FORCE ROW LEVEL SECURITY." 超级用户和带 `BYPASSRLS` 属性的角色也总是绕过。而 agent 的连接常常就是应用的 owner 角色，迁移脚本也用它——**测试永远是绿的**。
+
+第二种更隐蔽。每个请求开头执行 `SET LOCAL app.tenant_id = ...`，但没包在 `BEGIN` 里。`SET` 的文档："Issuing this outside of a transaction block emits a warning and otherwise has no effect."
+
+> 连接池复用连接 → 本次请求的 `SET LOCAL` 在事务外，没有生效 → RLS 策略读到的是残留值或空值 → 要么 0 行（静默），要么读到别的租户
+
+修法：`BEGIN; SET LOCAL ...; 查询; COMMIT;` 绑在同一个事务里；执行角色不是表的 owner，或者对表 `FORCE ROW LEVEL SECURITY`；再加一条「换租户查金丝雀行必须 0」的回归测试。两条机制都是 PostgreSQL 文档原文，把它们组合成这条故障路径是推断，不是某次事故复盘。
+
+还有第三种：RLS 的过滤本身就是静默的。文档示例里的注释是 "RLS silently prevents updating other rows"——`UPDATE` 改到 0 行不报错，agent 会以为「改成功了，只是没有匹配的行」。
+
+</Pitfall>
+
+**成本**：Spider 2.0 那句话本身就是成本判断，钱和工程时间该花在 schema linking 和语义层上。超时和行数上限既是安全闸，也是成本闸：一条模型写出来的全表扫描，两个问题会一起发生。
+
+**最可能的追问**：「只读账号不就够了？」只读挡住的是完整性，挡不住越权读。P2SQL 原文："While the technique presented above can protect the database integrity, it may fall short at preventing data confidentiality violations." 它评估的四种防御（权限加固、查询改写、LLM 辅助校验、在 prompt 里预加载用户数据），在原文 Table 3 里**没有一种能挡住全部攻击**；对 LLM 校验，它自己的评价是 "it remains vulnerable to injection attacks, bringing back the prompt injection problem"。这是纵深防御在 NL2SQL 上的一手证据。
+
+### 4.5 电商运营 agent（批量改价、上下架、发券）
+
+先说清一件事：**这道题没有找到一手基准**。最接近的是 τ-bench 的 retail 域，但那是客服视角（订单、退换货），不涉及批量运营操作。所以这一题只用课程自己的断言，不报任何「行业数字」。面试时也这样说，比编一个数体面。
+
+**需求**：单次操作的**爆炸半径**多大（多少 SKU、多少钱）？能不能回滚？谁审批？平台 API 的权限粒度如何，有没有只读、只改价的 scope？
+
+**架构**：
+
+| 层 | 不变量 | 明确不做 |
+|---|---|---|
+| 计划 | 先产出 diff 预览（改哪些 SKU、从多少改到多少），审批的是 diff | 不让模型直接调写接口 |
+| 护栏 | 价格变动幅度、券面额、SKU 数的上限写在代码里 | 不靠 prompt 写「不要低于成本价」 |
+| 执行 | 分批、带幂等键、断点续跑 | 不做「要么全成功，要么不知道哪些成功了」 |
+| 凭据 | 平台 token 按最小 scope 申请，高风险动作 step-up | 不用一个管理员 token 做所有事 |
+
+第一行是第三节那句立场换了个领域：workflow 里嵌一个 agent 节点，模型只负责产出计划。第四行是 L10 第十节的 step-up。
+
+**评测与指标**：没有基准，就测护栏本身。喂一个构造的越界 diff，断言它被拦下——零模型断言，和第三节表里那些一样进 CI。
+
+**失败路径**：
+
+> 运营说「全场打 8 折」 → 模型把 0.8 写成了价格 → 幅度护栏（变动超过阈值就拒绝）在代码层拦下 → 就算没拦住，diff 预览里人也看得见
+
+**成本**：这道题要算的账主要是爆炸半径，不是 token。分批执行让一次失败的代价是一批，不是全部。
+
+### 4.6 四道题共用的三条
+
+<Key>
+
+**权限在代码层，不在 prompt 层**：ACL 下推进检索、上限写进工具、执行身份是用户自己的角色。
+
+**写操作有上限、有幂等键**：退款、改价、发券，都是 L11 第六节的上限和 L19 第四节的幂等键。
+
+**成功由确定性终态判定**：数据库终态、金丝雀 0 命中、护栏断言。能不用 judge 的地方不用。
+
+</Key>
+
+面试官换了领域，你换的只是名词。三条不变量和那张五拍表，是同一套你在 coding agent 上已经练过的动作。
+
+---
+
+## 五、成本与取舍的答法
+
+### 5.1 「怎么省钱」的四段式
+
+不要背「缓存能省 90%」。按这个顺序答：
+
+1. **信号在哪**：每步 usage 归一化入账；效率看 resolve 每美元，不看均价——均价下降可能来自更早放弃（L18）。
+2. **什么情况失效**：前缀太短不报错；兼容层静默丢掉 `cache_control`；断点放在每次都变的内容上，连续 `WRITE_ONLY` 比不开还贵 25%；路由每切一次模型就重写整段前缀（L15）。
+3. **你的闸**：`admitJob` 在 enqueue 前按日额度喊停；`429_SPEND` 不重试；账单尖刺时 kill（L19）。
+4. **你拒绝的承诺**：没有可复现数据的百分比不报；不可判定端点的那部分，审计拒绝给比例（L15）。
+
+### 5.2 取舍句模板
+
+> 我选了 A 而不是 B，因为 B 会让失败静默；代价是 C；我用 D 断言守住。
+
+用 capstone 的真实选择填满它：
+
+- `NOT_UNIQUE` 零写入而非首命中：首命中会静默错改；代价是模型多一轮扩大上下文；`EDIT-2` 守住。
+- 全有或全无而非逐条生效：半成品让人和模型都不知道世界处于什么状态；代价是一条错整批重来；`BATCH-2` 守住。
+- deny 回 running 而非整单取消：拒绝一次工具不等于放弃任务；代价是 agent 可能换个说法再要，所以 deny 记忆优先；`JOB-12`、`MEM-7` 守住。
+
+**代价那一格不许空。** 没有代价的选择，面试官会认为你没看清另一侧。
+
+---
+
+## 六、「你从哪看来的」「数字哪来的」
+
+### 6.1 证据的排序
+
+被问出处时，拿出你手上最硬的那一种：
+
+1. **你自己的 verify 断言和观察实验表**：「我的 `SBX-4` 就测这个：和工作区同名、加 `-evil` 后缀的兄弟目录，`startsWith(root)` 会放行，我的实现必须拒绝；L17 实验三把六种检查函数并排打出来过。」
+2. **讲义引过的一手原文，说清是谁的**：「单 agent 约 4 倍、多 agent 约 15 倍，是 Anthropic 在多 agent 研究系统复盘里公布的，不是我测的。」
+3. 博客和帖子——最多当线索。
+
+这和 L21 的信息源权重是同一张表：own_verify 抬升，厂商博客封顶，社交媒体再自信也封顶。
+
+### 6.2 拒绝报不能证明的数
+
+L15 的审计在有步骤走了兼容端点时**拒绝报出省钱比例**：那条端点的缓存字段恒为空，当成 MISS 是偏悲观地编，当成 HIT 是偏乐观地编。面试里同理：
+
+| 数字的来历 | 说法 |
+|---|---|
+| 你测过的 | 带 N、口径、区间：「我 30 题的迷你集上 resolve 从 a 到 b，区间重叠，只能说没看到变差」 |
+| 别人测的 | 说出处：「L12 引的 21 个 judge 的普查里，原始一致率比 kappa 高估 33.8 到 41.3 个百分点」 |
+| 没人测过，或你没测过 | 说怎么测：「我没有可复现的数字，我会成对跑 A/B，先看 onlyA / onlyB」 |
+
+<Pitfall title="把观察实验的数字当成你的生产数据">
+L15 实验二「挪一下 `cache_control`，账从 111.5% 变成 72.0%」是在构造输入上演示**机制**，不是你线上省下的钱。说「在课程的构造实验里」，不说「我们省了」——后者一问就塌。
+</Pitfall>
+
+---
+
+## 七、简历改写
+
+### 7.1 公式
+
+少写「熟悉 / 了解 / 参与」。每条写成：**动词 + 可核查的产物 + 你钉住的不变量 + 证据（测试数或口径）**。
+
+| 改写前 | 改写后 |
+|---|---|
+| 熟悉 Agent 开发与 Prompt Engineering | 实现 coding agent 编辑层：多处匹配返回 `NOT_UNIQUE` 零写入，批量全有或全无；TS / Python 双实现，85 / 84 项零模型断言 |
+| 搭建评测体系，成功率显著提升 | coding agent 回归门：主指标 resolve 而非 apply，`regress` / `claim` 两道门，成对明细先于净值；56 项断言 |
+| 负责 AI 任务调度后端 | 后台任务状态机：checkpoint 续跑、epoch 围栏拒僵尸写、租户作用域幂等键、429 按 RATE / SPEND 分流；51 项断言 |
+| 优化 LLM 调用成本 | 成本审计：usage 归一化与五态缓存判定，不可判定端点拒绝报省钱比例；96 / 95 项断言 |
+
+### 7.2 三条规矩
+
+- **数字来自你自己的 verify。** 上表是课程参考实现的项数；你改过或加过测试，数字就该不一样，而且必须能现场复现。
+- **如实标注项目性质。** capstone 就写个人项目，不写「线上服务若干用户」。过度宣称一问就露馅，还会连累其他条目。
+- **只写你能讲到第三层的。** 每一条都是追问入口，讲不到第 2 层的就删掉。
+
+---
+
+## 八、agent 面试里的四种失分
+
+<Pitfall title="一：框架名堆砌">
+「用过 LangChain、LangGraph、CrewAI」。框架包装的是那十行 loop 和一圈生产化设施（L05），追问就落在设施上：「LangGraph 中断恢复时，`interrupt` 之前的副作用会怎样？」——节点从头重跑，之前的代码必须幂等（L11x）。答不上，名单越长越减分。
+</Pitfall>
+
+<Pitfall title="二：时间线叙事（从 L00 讲到 L19）">
+时间线是你的复盘方式，不是面试官的收听方式：前两分钟全是「大家都做过」的部分，反直觉的选择被挤到最后十秒。重排成「什么失败 → 我钉了什么 → 怎么证明」，内容不变，听感完全不同。
+</Pitfall>
+
+<Pitfall title="三：过度宣称">
+「成功率 90%」「省了 70%」「线上稳定运行」，每个都缺口径、N、区间或出处。没写口径的成功率按最宽松的那一行理解（L18）——面试官也会这么理解你。**把承诺改小，比被追问到改口体面得多。**
+</Pitfall>
+
+<Pitfall title="四：没有取舍">
+「用了最佳实践」。senior 的标志不是知道正确答案，是知道每个答案的代价，并能说出守住它的断言。
+</Pitfall>
+
+---
+
+## 九、面试前一周
+
+<Steps>
+<li>**第一天 · 重跑 verify。** L12 到 L19、L21，把你自己的通过项数填进简历。不全绿的先修——不能引用一条红的断言。</li>
+<li>**第二天 · 写稿。** 三分钟叙事逐字写、录音、掐到 3:00 以内，再压一个 30 秒版。删掉每一句「谁都会说」的话。</li>
+<li>**第三天 · 追问树。** 七棵树各说到第 2 层。卡住的那层，重读对应讲义的 Key 框，第二天再说一遍。</li>
+<li>**第四天 · 白板。** 计时做 20 分钟版和 45 分钟版，最后走一次故障路径。再从第四节的四道题里抽一道，按五拍讲一遍。</li>
+<li>**第五天 · 取舍与数字。** 写满五句取舍模板，每句带断言编号；给每个要引用的数字标上来历。</li>
+<li>**第六天 · 模拟。** 找人从下面的清单随机抽题并中途打断你，专门练「我不知道，我会这样测」。</li>
+<li>**第七天 · 收。** 只重读 L17–L19 的 Key 框和你的稿子，不加新东西。</li>
+</Steps>
+
+追问清单（每题 60–90 秒，括号里是该重读的那一节）：
+
+1. 为什么 PR 门不用 SWE-bench 分数？（L18）
+2. 断线重连后工具执行了两次，从哪一层查起？（L08 / L19）
+3. 上下文快满了，先压缩吗？（L06）
+4. 用户切了个 tab，任务就停了，为什么？（L16）
+5. 僵尸 worker 醒来写了一次 checkpoint，会怎样？（L19）
+6. 撞了步数上限，最后那句话能用吗？（L05）
+7. 客服 agent 解决率 92%，能上线吗？（本节 4.3；L18）
+8. 给 NL2SQL agent 一个只读账号，就安全了吗？（本节 4.4）
+9. harness engineering 是谁定义的、指什么？（本节 2.9）
+
+---
+
+## 十、收尾
+
+面试不是复述大纲，是证明两件事：**你能在静默失败的系统里钉住不变量，并且能证明自己没被数字骗到。** 叙事、追问树、白板、简历，都是这一句的不同长度。
+
+下一节是最后一课：L21 把知识地图交给你自己维护。这一节准备的每个断言编号，在那张图里都是权重最高的证据——own_verify。模型名和排行榜半年就过期，**钉不变量、找静默失败、用零模型断言自证的方法不会。**

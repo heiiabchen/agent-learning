@@ -1,0 +1,577 @@
+L16 的结论是：agent 前端的难点不在渲染，在渲染的可撤销性。这一节把屏幕拿掉，只剩一条音频通道。用户和 agent 轮流用它，谁也不能同时占着，而且说出去的话收不回来。
+
+先看一个数字。Salesforce 的论文 [arXiv 2603.05413](https://arxiv.org/abs/2603.05413) 用级联管线实测出 **Measured TTFA 755ms**，标题里写的是 sub-1-second。拆开看：
+
+- 755 = LLM 首 token 296 + 分句 143 + TTS 合成 316，一毫秒不差
+- 里面没有 STT。同一张 Table 4 里 Deepgram STT 的 P50 是 402ms
+- 里面也没有话轮等待。论文第 5 节写明它的 VAD 状态机是 `LISTENING —silence 700ms→ PROCESSING`
+
+按它自己的数字，从用户闭嘴到听见第一个音至少是 700 + 约 400 + 755，**1.8 秒以上**。论文没有隐瞒任何一个数，只是「TTFA」的起点放在了「LLM 请求发出」那一刻。
+
+而人-人对话的研究里，600–700ms 以上的停顿**会被听者读成对方不情愿**（第一节）。这条规律在人-机对话里是否成立，没有一手证据；但你的用户不会等这个证据出来。
+
+<Key>
+
+这一节的中心论点：**语音 agent 的每一个难题都是一笔时间账**，而账上的每一项都有好几种记法。
+
+- 首音延迟从哪一刻算起，决定了同一个话轮是 540ms 还是 2.9 秒
+- 话轮什么时候算结束，静音阈值给不出答案
+- 历史里该记的是用户听到的，不是模型生成的，也不是服务端发出的
+- 打断停的是话语，不是后台任务
+- 英文上验证过的分句规则搬到中文，首音就等于整段生成完
+
+lab 的 `shared/voice.ts` 把这五件事做成纯函数：时间是注入的整数毫秒，输入全是合成的（20ms 一帧的 VAD 概率、带时间戳的 token、TTS 块的文本和时长），没有音频，不调模型。八个观察实验，六个 TODO，56 条零模型断言。
+
+</Key>
+
+---
+
+## 开场：架构不再是二选一
+
+「级联还是端到端」在 2026 年只说对了一半。OpenAI 的 [Voice agents](https://developers.openai.com/api/docs/guides/voice-agents.md) 文档现在列三种架构：
+
+| 架构 | 说话的模型和做事的模型 | 官方的定位 |
+|---|---|---|
+| Realtime API | 同一个 | "Use one model to interpret audio, decide what to do, and respond in speech." |
+| Chained voice pipeline | 不同，串行 | "Inspect or transform intermediate text and replace each component independently." |
+| GPT-Live | 不同，**并行** | "Full-duplex conversations with a separate backend" |
+
+[GPT-Live](https://developers.openai.com/api/docs/guides/live.md) 的说法是 "The live model handles the spoken interaction and delegates reasoning and tool use to a separate backend. Users can keep talking while backend work runs." 所以真正的设计轴是：说话的模型和做事的模型是不是同一个，是不是并行。并行带来一个前两种都没有的问题：嘴上说的和后台做成的可能不一致，这是第四节的主角。
+
+端到端模型的延迟数字要会读。[Moshi](https://arxiv.org/abs/2410.00037) 自报 "a theoretical latency of 160ms, 200ms in practice"；[Qwen3-Omni](https://arxiv.org/abs/2509.17765) 自报 "a theoretical end-to-end first-packet latency of 234 ms"，限定在 cold-start。Salesforce 那篇在托管的 DashScope Realtime API 上量到约 702ms，本地 Transformers 跑全流水线约 146 秒。**theoretical 是模型结构决定的算法延迟**，不含网络、排队和硬件；全双工模型也没有「话轮结束」这个事件，160ms 是「输入一帧到能影响输出」，不是「用户说完到 agent 开口」，和级联的 1.8 秒不是同一个量。
+
+<Note title="哪种架构是生产主流：没有数据">
+
+Salesforce 论文写 "This is the architecture used by all production voice agents"，这是作者的概括，不是调查数据，语境还是自托管。OpenAI 文档没说哪种更常见，LiveKit、Pipecat 同时支持级联和 realtime 模型。调研没有找到一手的市场份额数据，所以这一节不说「2026 年主流是 X」。
+
+下面五个主题对三种架构都成立：级联五个全要自己写；用 Realtime 或 GPT-Live 时有一部分由厂商代劳，但代劳的语义要逐家读（第三节）。
+
+</Note>
+
+---
+
+## 一、首音延迟从哪一刻算起
+
+### 1.1 「人类 200ms」是一个很窄的数
+
+「人类话轮间隙约 200ms」的原文是 [Stivers et al. 2009](https://pmc.ncbi.nlm.nih.gov/articles/PMC2705608/)：十种语言，总体众数 0ms，中位数 +100ms，均值 +208ms。适用范围几乎没人引："we restricted the comparison to polar questions"，样本是**面对面视频**，且 "When visible responses occurred in response to a question, they were faster than speech in every language"。它是「面对面、是非问句、含点头」的统计量，不是人能容忍的上限。Moshi 转引时写成了 "230 ms average"，只引原文。
+
+更承重的是 [Levinson & Torreira 2015](https://www.frontiersin.org/journals/psychology/articles/10.3389/fpsyg.2015.00731/full)：
+
+> "the gaps between turns are short (of the order of 200 ms), but the latencies involved in language production are much longer (over 600 ms). This seems to imply that participants in conversation must predict … the end of the current speaker's turn"
+
+静音要约 200ms 才能被识别，再加至少 200ms 反应，而 70–82% 的回应落在 500ms 以内，所以 "reaction to silence … would not seem to play a major role"。**一个「静音 N 毫秒后开始处理」的 agent，结构上就是人类基本不用的那种模型**。语义话轮模型、投机生成、Deepgram 的 `EagerEndOfTurn` 存在的理由都在这里：它们是预测，不是反应。
+
+同一篇还有两条：
+
+- **沉默本身有含义**："gaps of 700 ms or more are associated with dispreferred actions"；"gaps of 600 ms or longer generate inferences of this unwelcome kind"。人-人研究，人-机是否适用没有一手证据
+- **电话上更快，不是更慢**："transition speeds are higher on the phone than face-to-face"，重叠比例从 44% 升到 52%（转述 ten Bosch 2005）。「电话里用户更能等」没有证据支持
+
+另一个常被误用的数是 [ITU-T G.114](https://www.itu.int/rec/T-REC-G.114-200305-I/en) 的 150ms："end-to-end (i.e., "mouth-to-ear" in the case of speech) delays"。它是**单向传输**，不含对方思考。对 agent 来说管道延迟出现两次：上行晚 100ms，话轮判定晚 100ms；下行晚 100ms，首音晚 100ms。
+
+### 1.2 四个起点，四个终点
+
+L15 第 7.1 节把一步拆成 `排队 + TTFT + 输出token数 / OTPS`；L16 第 6.4 节给 TTFT 定的测量方法是「第一个 `text-delta` 到达时间减去请求发出时间」：指标名可以标准，数字取决于起止点。语音里这件事放大了好几倍。
+
+起点从早到晚：用户**实际**说完（只有离线标注知道）、VAD 最后一个有声帧、话轮提交、STT 的 final 转写到达。终点从早到晚：TTS 产出第一个字节、服务端把第一帧推进传输层、客户端收到第一个包、扬声器放出第一个**非静音**样本。
+
+| 来源 | 起点 | 终点 | 漏掉了什么 |
+|---|---|---|---|
+| arXiv 2603.05413 的 TTFA | LLM 请求发出 | TTS 首块 | 话轮等待（论文自己用 700ms）、STT、上下行、客户端缓冲 |
+| LiveKit `e2e_latency` | VAD `stopped_speaking_at` | 服务端第一帧 | 下行与客户端缓冲；**包含**话轮等待 |
+| LiveKit `end_of_utterance_delay` | VAD 最后语音 | 话轮判定 | 这是一个分段 |
+| OpenAI 评测指南 | 未规定 | 可听见的那一刻（"audible response latency"） | 不漏，但要求把 "I'm checking" 和真答案分开测 |
+
+LiveKit 源码里就一行：`e2e_latency = started_speaking_at - user_metrics["stopped_speaking_at"]`。
+
+### 1.3 实验三：同一个话轮，四个数
+
+`pnpm voice` 的第三张表。手造的时间线：实际说完 0，VAD 最后有声帧 40，话轮提交 540，LLM 请求 560，第一句攒够 900，TTS 首块 1080，服务端第一帧 1100，扬声器第一个音 1180，第一个有用的音 2900（前面是一句「我查一下」）。
+
+```text
+论文 TTFA       540ms  话轮提交 → TTS 首块
+LiveKit e2e    1060ms  VAD 最后语音帧 → 服务端第一帧
+死寂           1180ms  实际说完 → 第一个可听见的音
+有用延迟       2900ms  实际说完 → 第一个有用的音
+其中话轮等待 500ms：唯一一段什么都不做、纯在等的时间。
+```
+
+**同一个系统，四个数，差五倍多**。540 到 1060 主要是 500ms 话轮等待；1060 到 1180 是 VAD 的 40ms 滞后加上服务端第一帧之后 80ms 的下行和播放；1180 到 2900 是填充语。lab 的论文口径从话轮提交算起，严格按论文从 LLM 请求算是 520ms。H1 钉 540、1060、1180 三个值；H2 断言有填充语时有用延迟严格大于死寂。
+
+OpenAI 的评测指南把后两件事写成了要求："compare the median and 95th percentile"；"Measure acknowledgments such as "I'm checking" separately from the answer the caller needs."。**只报首个可听见的音是自欺**。
+
+<Pitfall title="事件时间戳也有起点">
+
+- OpenAI Realtime 的 `speech_started` 事件里 `audio_start_ms` "includes the `prefix_padding_ms` configured in the Session"。默认 padding 300ms，拿它算打断响应时间会凭空多出 300ms
+- `idle_timeout_ms` 从 "the `response.done` time plus audio playback duration" 起算：从**播完**算，不是从生成完算
+
+拿厂商事件做指标之前，先查清这个时间戳是哪一刻的。
+
+</Pitfall>
+
+实验三后半段：九个话轮，每轮三段（话轮等待、LLM 首句、TTS 首块）。
+
+```text
+9 个话轮 p50：各段 p50 相加 1050ms，总耗时的 p50 1590ms
+9 个话轮 p95：各段 p95 相加 4540ms，总耗时的 p95 4100ms
+```
+
+p50 相加偏低，p95 相加偏高。H3 钉这四个数，H4 钉 nearest-rank 的定义（`[100..900]` 的 p95 是 900、p50 是 500）。
+
+<Drill title="分段百分位为什么既不是中位数，也不保证是上界">
+
+p50 相加偏低：每一段单看，慢的都不到一半（话轮等待 3 轮是 3000，LLM 4 轮在 860 以上，TTS 3 轮在 600 以上），各段中位数都落在快的那一侧；但九轮里有八轮至少有一段是慢的，总耗时的中位数把它们都算了进去。
+
+p95 相加偏高是反过来的：它把每段最慢的那一次加在一起（3000 + 900 + 640），而这三次从没出现在同一轮。所以它常被当作保守预算。但**分位数没有可加性**，原理上不保证是上界。反例：625 个话轮，两段各自独立地有 4% 的概率出现 100ms 尖峰，否则为 0。每段 p95 都是 0；至少一段出尖峰的话轮占 1 − 0.96² = 7.84%，总耗时的 p95 是 100。
+
+论文自己的表也是提醒。Table 4 的 "Est. E2E TTFA" 写 P50 958、Mean 1054；三个分量的 P50 相加是 402 + 457 + 221 = 1080，Mean 相加是 407 + 622 + 226 = 1255，**两个都对不上**，论文没交代这一行怎么算，表注只写了 "sequential upper bound"。
+
+诚实的写法只有两种：测端到端的分布；或者用分段数字做预算，并明说那是估计。
+
+</Drill>
+
+---
+
+## 二、静音不等于说完了
+
+### 2.1 轮内停顿比换人间隙还长
+
+Levinson & Torreira 转述 ten Bosch et al. 2005：同一个人说话时的停顿 "about 140 ms (c. 25%) longer than the average gap in turn transitions between different speakers"。任何短到能及时接话的阈值都会切断一部分自然停顿，任何长到不切断的阈值都比人类接话慢。**静音长度这一个特征，在分布上就分不开「说完了」和「在想」两类停顿**。
+
+实验一：12 个合成的中文话轮（停顿时长和概率是编的，形状照着这条研究），每段话 800ms，final 转写在每段话结束后 200ms 到，任何一次停顿被提交就是误切。
+
+```text
+阈值     误切   平均死寂
+ 200ms    8/12     200ms
+ 300ms    8/12     300ms
+ 500ms    5/12     500ms
+ 700ms    3/12     700ms
+1000ms    1/12    1000ms
+```
+
+误切从 8 降到 1，死寂一毫秒不少地涨上去（转写滞后不超过阈值，死寂恰好等于阈值）。1000ms 仍然切了 `t06` 「嗯……让我想想……还是算了吧」里那个 1100ms 的停顿。**没有一个阈值同时做到不切人和不慢**。
+
+顺带一个方法学的坑：Levinson & Torreira 转述的电话语料，间隙均值 "345–456 ms … (depending on the threshold used in the automatic detection of speech)"。两个不同 VAD 下量出的死寂不可比。
+
+### 2.2 四家的默认值没有一个相同
+
+| 系统 | 默认静音窗 | 第二个信号 | 最长等待 | 投机 |
+|---|---|---|---|---|
+| OpenAI Realtime | 500ms（`server_vad`） | 要显式开 `semantic_vad` | semantic：8s / 4s / 2s | 服务端内部 |
+| LiveKit | 0.5s（流式检测器 0.3s） | 话轮模型，默认开 | 3.0s（流式 2.5s） | 默认开，只投 LLM |
+| Pipecat | VAD stop 0.2s；或 0.6s 静音策略 | Smart Turn，纯音频，大于 0.5 判完 | 3s | Eager 策略，超时 5s |
+| Deepgram Flux | 由模型置信度驱动 | `eot_threshold` 0.7 | 5s | `eager_eot_threshold`，默认关 |
+
+没有行业标准值。原因正是 2.1：单一静音阈值分不开两类停顿，每家都叠了第二个信号，介入方式不同，第一个阈值的最优值就跟着不同。Pipecat 默认快、需要时慢；LiveKit 默认中速、需要时慢。
+
+<Pitfall title="「接上 Realtime 就有智能话轮」">
+
+OpenAI [VAD 指南](https://platform.openai.com/docs/guides/realtime-vad)："the default value is `server_vad`"：500ms 静音计时，阈值 0.5，前置 padding 300ms。`semantic_vad` 要显式打开，打开后 `eagerness` 控制的是**最长等待**："`low`, `medium`, and `high` have max timeouts of 8s, 4s, and 2s respectively"。确定的句子几乎不等，拖尾的句子最坏等 4 秒（默认 medium）：延迟分布变成双峰，只报 p50 会把它藏起来。
+
+OpenAI 自己承认 VAD 超时可感知。[Realtime conversations](https://platform.openai.com/docs/guides/realtime-conversations) 谈 push-to-talk："it feels snappy because we're not waiting for a VAD timeout"。
+
+</Pitfall>
+
+### 2.3 VAD：一帧过阈值不算开口
+
+lab 的 VAD 照 Pipecat 默认值：置信度 0.7、start 0.2s、stop 0.2s（Pipecat 另有 `min_volume` 0.6，lab 省掉了）。四态滞回：
+
+```text
+quiet    ──有声──▶ starting
+starting ──有声且已满 startMs──▶ speaking，发 speech_start
+starting ──无声──▶ quiet（计时清零）
+speaking ──无声──▶ stopping
+stopping ──有声──▶ speaking（不发事件：这只是一次停顿）
+stopping ──无声且已满 stopMs──▶ quiet，发 speech_end
+```
+
+TODO 1 `myVadStep` 的两个典型错法：**单帧过阈值就切状态**（A3 把一帧 0.9 夹在静音里；A4 在说话中间夹 160ms 低概率）；**`speech_end` 的说完时刻用判定时刻**。A5：15 帧有声加 15 帧静音，判定发生在 500，最后有声帧在 300，差了整整 `stopMs`，而端点等待要从 300 起算。A6 测 starting 中途掉下阈值要从头计时（320 开口）；A7 测 p 恰好等于阈值算有声。
+
+### 2.4 语义模型只延长等待，不缩短
+
+[LiveKit Agents](https://docs.livekit.io/agents/build/turns/) 默认 `min_delay` 0.5s、`max_delay` 3.0s。话轮模型怎么用，`audio_recognition.py` 里就这几行：
+
+```python
+endpointing_delay = self._endpointing.min_delay
+...
+if (
+    end_of_turn_probability is not None
+    and unlikely_threshold is not None
+    and end_of_turn_probability < unlikely_threshold
+):
+    endpointing_delay = self._endpointing.max_delay
+```
+
+**话轮模型从不让 agent 比 `min_delay` 更快接话**，它只在「说完了」的概率低于语种阈值时把等待延长到 3.0s。实验二，同一组话轮，纯静音 500ms 对比这条规则（中文阈值）：
+
+```text
+话轮  停顿（ms / 概率）             静音 500    LiveKit
+t01   —                             死寂 500    死寂 500
+t02   420/0.004                     死寂 500    死寂 500
+t03   310/0.003 650/0.002           误切@2      死寂 500
+t04   —                             死寂 500    死寂 500
+t05   280/0.03 760/0.001            误切@2      死寂 500
+t06   1100/0.003                    误切@1      死寂 500
+t07   —                             死寂 500    死寂 3000
+t08   350/0.2                       死寂 500    死寂 500
+t09   520/0.05                      误切@1      误切@1
+t10   —                             死寂 500    死寂 500
+t11   240/0.01 480/0.003            死寂 500    死寂 500
+t12   900/0.001                     误切@1      死寂 3000
+静音 500：误切 5，死寂 最小 500 / 平均 500 / 最大 500
+LiveKit ：误切 1，死寂 最小 500 / 平均 954 / 最大 3000
+```
+
+误切从 5 降到 1，但**死寂的下限仍是 500ms**：模型买的是少截断，不是更快。结尾概率低的 `t07` 「那如果我……」和 `t12` 「我再看看……那个……」要等满 3000ms。`t09` 的停顿 520ms、概率 0.05，高于中文阈值 0.0066，模型照样切。
+
+阈值按语种分开。LiveKit 多语种模型的 [`languages.json`](https://huggingface.co/livekit/turn-detector/raw/v0.4.1-intl/languages.json) 里中文 0.0066、英文 0.011，各语种 TPR 都钉在 0.993 附近（厂商自测）；中文 TNR 0.8661，即厂商测试集上静音已满 `min_delay` 的「没说完」停顿约 13% 仍被判成说完。B4 断言同一个 0.008 中文等 500、英文等 3000。Deepgram `flux-general-multi` 的 10 种语言里没有中文。
+
+<Note title="把「立即打断」当成误切的信号">
+
+LiveKit `DynamicEndpointing`（默认关）从停顿习惯里学 `min_delay`，其中一类样本是 "Pauses between an utterance and next immediate interruption"，源码注释写 "this should be a false EOT"。用户在 agent 刚开口就插话，说明上一次端点判早了；这个信号你自己的评测也能用。
+
+</Note>
+
+### 2.5 速度来自投机生成
+
+话轮等待是唯一一段纯在等的时间，所以延迟优化的第一刀不是换更快的 LLM，而是**让 LLM 在等待期间就开始**。LiveKit `preemptive_generation` 默认开，只投 LLM；Pipecat 的 Eager 策略列了三种撤回：用户接着说、"the committed transcript differs from the eager one"、超时没提交，且 "the user message written to the context is always the committed transcript, never the eager one"。
+
+**投机结果能不能直接用，不只看转写**。LiveKit 在提交时比四样：转写（`casefold()`、忽略标点）、chat context、tools、tool_choice，任一变了就 "preemptive generation invalidated"。代价是被撤回的生成成为常态：[Deepgram Flux](https://developers.deepgram.com/docs/flux/voice-agent-eager-eot.md) 写 "at the cost of 50-70% more LLM calls"（厂商估计，没给测量方法）；OpenAI 提醒 "Include unused speculative work in your backend cost measurements."
+
+TODO 3 `myNormalizeTranscript` + `mySpeculationValid`：ASCII 字母转小写，去中英文标点，连续空白压成一个空格，只去 ASCII 空格；然后四样都比。典型错法：**只比转写**（C3、C4 让版本或 `toolChoice` 变了）；**用 `\w` 判标点**：TS 的 `\w` 只认 `[A-Za-z0-9_]`，`[^\w\s]` 把汉字当标点删光，`好的，查一下。` 归一化成空串，任何两句中文都「相等」（C2）。
+
+<Drill title="投机闸门、Flux 的协议保证，和 L16 的终态">
+
+Pipecat 的 `SpeculationGate` 三态：`OPEN`、`HOLDING`、`DROPPING`。"This holds everything such a response produces until the turn is confirmed, then releases it, or discards it if the guess is withdrawn." `HOLDING` 里的帧就是「已生成、未渲染」；`DROPPING` 是对作废的生成，继续到达的尾巴静默丢掉。L16 lab 的 `applyChunk` 在 `aborted` 之后丢弃一切后到的 delta，是同一个形状；这一节的 `PlaybackLedger` 用 epoch 做同一件事（D7）。
+
+Flux 把有效性做进了协议："The `EndOfTurn` transcript will always match the immediately preceding `EagerEndOfTurn` transcript. If the transcript changes after an `EagerEndOfTurn`, a `TurnResumed` event will occur first." 没收到 `TurnResumed`，投机生成就一定有效。但它只管转写这一项；上下文和工具有没有在等待期间变化，仍然是你的事。
+
+</Drill>
+
+### 2.6 提交：等转写，复说就取消
+
+Pipecat 的静音策略是两个计时器，"The user turn stop is triggered only when both have finished and at least one transcript has been received"。**至少收到一条转写是硬条件**：VAD 说停了、STT 还没吐字，这时触发 LLM 等于拿空串去问模型。lab 的 `commitTurn`：
+
+```text
+commitAt = max(lastSpeechAt + endpointDelay(eouProb), sttFinalAt)
+sttFinalAt 为 null → 不提交
+nextSpeechStart 早于 commitAt → 不提交（那只是一次停顿）
+```
+
+| TODO 2 `myCommitTurn` 的错法 | 后果 | 断言 |
+|---|---|---|
+| 用概率把等待缩短到 min 以下 | 「模型说很像说完了」就立刻接话 | B3 对 8 个概率逐个查 `≥ minDelayMs` |
+| 不等 final 转写 | 拿空串或半句去问 LLM | B5、B8 |
+| 忘了复说取消 | 用户停顿后接着说，agent 已经开口 | B6 |
+
+B6 的后半还用你的实现重跑实验二：静音 500 必须恰好误切 `t03,t05,t06,t09,t12`，LiveKit 规则只误切 `t09`。
+
+---
+
+## 三、用户听到的才算说过
+
+### 3.1 服务端比实时快
+
+OpenAI truncate 事件的说明，第一句就是根因：
+
+> "The server will produce audio faster than realtime, so this event is useful when the user interrupts to truncate audio that has already been sent to the client but not yet played."
+>
+> "Truncating audio will delete the server-side text transcript to ensure there is not text in the context that hasn't been heard by the user."
+
+**生成、发送、播放是三本账**。实验四：一条回复切成 5 块、每块 1000ms，TTS 以 3 倍实时生成、生成完立刻发出；用户在播放 1200ms 时打断。
+
+```text
+全留（LLM 写完的整段）        您的订单已经发货了，预计明天下午送到，运费已经原路退回，优惠券也补发到您的账户，还有其他问题吗？
+留已发送（Gemini 语义）       您的订单已经发货了，预计明天下午送到，运费已经原路退回，优惠券也补发到您的账户，
+截到已播放（OpenAI truncate） 您的订单已经发货了，预
+打断时已发送 4000ms 音频，实际播放 1200ms；audio_end_ms 要填后者。
+```
+
+前两种历史里都有用户没听到的话。下一轮用户问运费，模型会答「我刚才说过了，运费已经原路退回」。
+
+### 3.2 三家的「说过」不是同一个意思
+
+| 系统 | 打断后历史保留到哪 | 谁负责 |
+|---|---|---|
+| OpenAI Realtime | **已播放**的位置（`audio_end_ms`） | WebRTC / SIP 下服务端自动截断；WebSocket 下客户端算位置、发 `conversation.item.truncate` |
+| [Gemini Live](https://ai.google.dev/gemini-api/docs/live-guide) | **已发送**给客户端的内容 | 服务端；文档里没找到对等的客户端截断事件 |
+| LiveKit | 按语速常数（每秒 3.83 个音节）估算；一帧没播则整条丢弃 | 框架 |
+
+Gemini 原文："Only the information already sent to the client is retained in the session history." 「已发送」一般领先于「已播放」，客户端缓冲里没播出的那几秒在 Gemini 的历史里算说过了。Pipecat 的截断语义调研没有深读，不下结论。厂商自动处理打断，**不等于厂商把历史截到了用户听到的位置**。
+
+文字稿也截不准。OpenAI："The realtime model doesn't have enough information to precisely align transcript and audio"，truncate 删掉未播部分的文字稿 "but doesn't provide a truncated transcript"。lab 的 `heardText` 按码点比例估算，和 LiveKit 按语速估算是同一类近似。WebSocket 下还有三条约束：`audio_end_ms` 超过实际音频时长会报错；"Only assistant message items can be truncated"；`content_index` "Set this to `0`"。
+
+### 3.3 这就是 L16 的撤回
+
+| L16（文本） | L16y（语音） |
+|---|---|
+| `reset-step`：这一步作废 | `response.cancelled`：这次回复作废 |
+| 已渲染 ≠ 已生成；撤回删到 step 边界 | **已生成 ≠ 已发送 ≠ 已播放**；截断删到播放位置 |
+| 前端知道自己画了什么，服务端不知道 | 客户端知道自己播了多少，服务端不知道（WebSocket 下） |
+| 不撤回：屏幕上重复半句话 | 不截断：模型以为用户听到了没播出来的话 |
+
+L16 说一个只会 append 的前端在协议层面就不合规。这里同样：**把整段生成写进历史的客户端，历史就是错的**，而且错得不报错。
+
+### 3.4 播放账本
+
+lab 的 `PlaybackLedger` 是单通道串行播放：每块从「入队时刻」和「上一块播完」中较晚的那个开始。入队可以远早于播放，账本只认播放。TODO 4 `MyPlaybackLedger.bargeIn(t)`：t 时没有在播或待播的音频返回 null；否则找到正在播（或排在最前、还没开始）的那个 item，`audioEndMs` 是它**实际播了多少**、item 内的毫秒；`heardText` 用 shared 的函数算；一帧没播则 `dropItem`；然后 epoch 加一、清空队列、通道从 t 起空闲。
+
+| 断言 | 钉什么 |
+|---|---|
+| D1、D10 | 播放按实时走：从 100 起播的 3 块，到 1300 只播了 1200；5 块一次性入队，2500 时只播了 2500 |
+| D2 | 截到已播放（1200）不是已入队（3000）；两条 item 时是第二条的 400 |
+| D3 | 两块之间的空档不算播放，`audioEndMs` 不超过已入队总时长 |
+| D4、D5 | 听到的文字不含第 3 块的字；9 字的块播一半是 4 字 |
+| D6 | 一帧没播 → `dropItem` |
+| D7、D8 | epoch 加一，迟到的旧块是 `stale`、不会播出来；新 epoch 照常 |
+| D9 | 连续打断两次，第二次返回 null |
+| F10 | 按码点截断：`好😀好` 播 500ms 是「好」，按 UTF-16 切会多出半个 emoji |
+
+两个典型错法：**截到已生成或已发送**；**忘了 epoch**，用户刚说「停」，迟到的 TTS 块又冒出半句。后者就是 L16 lab 里「`aborted` 之后还往屏幕上写字」。
+
+<Pitfall title="已入队不等于已播放">
+
+OpenAI 只说客户端要 "note how much of the last audio response was played"，没规定怎么算。最自然的写法是数交给播放管线的字节：PCM16 单声道 24kHz 每秒 48,000 字节，20ms 是 960 字节。但这些字节后面还有抖动缓冲、`AudioWorklet` 队列、蓝牙耳机的缓冲，按字节数算出的 `audio_end_ms` 会系统性偏大，偏大的正是用户没听到的部分。应该用实际播放位置（比如 `AudioContext.currentTime` 推出的已播样本数）。这是从管线结构推出来的，没有厂商给出数字。
+
+</Pitfall>
+
+### 3.5 打断判定：持续够久才算
+
+「一出声就打断」把正常对话当成了故障。Levinson & Torreira 引 Heldner and Edlund：约 40% 的换轮是重叠；"a gap or overlap under 120 ms is not perceived as gap or overlap"；"continuers like hmhm" 不被听成抢话。LiveKit 的打断默认要求持续 0.5s，`resume_false_interruption` 开着，停下 2.0s 内没有转写就当误打断、接着说。实验五：
+
+```text
+声音      时长    理想       min=0      min=200    min=500
+回声尖峰  120ms   ignore     resume     ignore     ignore
+「嗯」    300ms   ignore     interrupt  interrupt  ignore
+咳嗽      80ms    ignore     resume     ignore     ignore
+关门声    700ms   resume     resume     resume     resume
+真打断    900ms   interrupt  interrupt  interrupt  interrupt
+判错                         3          1          0
+```
+
+`min=0` 时每个声音都让 agent 停一下，「嗯」有转写还被当成真打断。关门声三列都是 `resume`：够长、没转写，agent 停一下再接着说，用户听到了一次卡顿。E 组测的是参考实现 `judgeBargeIn`。Flux 推荐用 `StartOfTurn` 触发打断，因为它 "is guaranteed to contain a non-empty transcript"，天然过滤咳嗽和关门声，代价是多等第一个词。
+
+### 3.6 回声：关耳朵、靠 AEC、抬阈值
+
+agent 的声音从扬声器回到麦克风，被当成用户说话，agent 打断自己。三种处理：**关耳朵**（论文的 "echo gate that attenuates mic input while the agent is speaking"）；**靠浏览器 AEC**；**抬阈值**，误触发少了，轻声说话的用户也打断不了。AEC 的保证范围很窄：W3C [Media Capture and Streams](https://www.w3.org/TR/mediacapture-streams/) 只规定 `echoCancellation: true` "MUST attempt to cancel at least as much as "`remote-only`""，而 `remote-only` 指 "`MediaStreamTrack` s sourced from WebRTC `RTCPeerConnection` s"，消除所有系统播放只是 SHOULD。用 WebSocket 收 PCM、`AudioContext` 播放的语音，规范不保证会被消掉；各浏览器实际怎么做，调研没有找到一手测量。
+
+<Pitfall title="echo gate 一并关掉了打断">
+
+「agent 说话时压低麦克风」一劳永逸地消除了自打断，所以它出现在论文里。代价是 agent 说话期间用户也被压掉，永远打断不了。第 3.5 节的打断判定在这种架构里根本收不到输入。
+
+</Pitfall>
+
+<Drill title="浏览器端为什么先选 WebRTC">
+
+OpenAI [WebSocket 指南](https://developers.openai.com/api/docs/guides/voice-websockets.md)："For browser and mobile applications, start with WebRTC." WebSocket 适合 "when your server captures audio or relays an audio stream for a client"。三个差异：
+
+1. **谁来截断**。WebRTC 和 SIP 下 "the server manages a buffer of output audio, and thus knows how much audio has been played"；WebSocket 下客户端 "must stop playback and handle truncation"，`output_audio_buffer.clear` 标着 WebRTC/SIP Only。3.4 那套账本落进了前端代码
+2. **回声消除**。规范只保证 `RTCPeerConnection` 来源
+3. **节奏和格式全归你**。"supply a continuous microphone stream paced at its recorded sample rate"；"Changing the format setting does not convert your input bytes."
+
+还有一条和 L16 第 2.2 节「块边界和帧边界没有任何关系」同构："PCM chunks must contain complete 16-bit samples, so their byte length must be even. … Chunk boundaries are otherwise arbitrary"。切到奇数字节，后面全部错位成噪声。
+
+</Drill>
+
+---
+
+## 四、「闭嘴」不等于「取消订单」
+
+### 4.1 两个信号，三个动作
+
+L16 第五节的结论是「取消渲染 ≠ 取消生成」。语音里这条要拆成两半讲：
+
+| 信号 | 话语（播放、生成、历史） | 后台任务 | 口头能说什么 |
+|---|---|---|---|
+| 话语打断：用户开口了 | 停播放、停生成，历史截到已播放 | 照常跑 | 已验证状态不变 |
+| 任务取消：「帮我取消订单」 | 不必停，可以说「正在取消」 | 后端执行取消动作 | 后端确认成功之后才能说「已取消」 |
+
+- **话语，方向和 L16 相反**。用户一开口，正在生成的那段话就过期了（它是基于上一句写的），打断 = 停播放，且停生成，且回滚历史
+- **任务，方向和 L16 相同**。[Delegation and tools in GPT-Live](https://developers.openai.com/api/docs/guides/live-delegation.md)："Interrupting the spoken conversation leaves backend work running." [Prompting GPT-Live](https://developers.openai.com/api/docs/guides/live-prompting.md)："Handle changes to a task separately from interruptions to speech. "Stop talking" asks the assistant to yield; "Cancel my booking" asks the backend to take an action."
+
+lab 也这么分：`PlaybackLedger.bargeIn` 只管话语那一行，任务交给 `TaskBoard`，它的注释写着「话语打断不碰这里」。
+
+<Pitfall title="把 barge-in 接到「abort 所有在途请求」上">
+
+最顺手的实现：一个 `AbortController` 管这一轮的所有请求，用户一开口就 `abort()`。用户在扣款工具运行时说了句「嗯等一下」。支付网关那边的请求早发出去了，abort 丢掉的只是**结果**：钱扣了，agent 不知道，下一轮可能再扣一次。话语的取消和任务的取消必须是两个信号。
+
+</Pitfall>
+
+### 4.2 口头更新只来自已验证的状态
+
+GPT-Live 委派文档："For spoken updates, send `session.commentary.append` with content that matches the task's verified state"：
+
+| State | Example content |
+|---|---|
+| Still working | "I'm checking the available appointments." |
+| Completed | "You're booked for Thursday at 2:00 PM." |
+| Failed | "That time is no longer available." |
+| Cancellation confirmed | "Your appointment has been canceled." |
+
+用户改了需求："if they change Friday to Thursday, use Thursday for subsequent work and ignore results from the outdated Friday request. Manage any cancellation in the backend, and confirm it succeeded before telling the user that the work was canceled." lab 的 `TaskBoard` 把它压成一个 epoch：每改一次需求加一，旧 epoch 的结果一律 `stale`；口头更新只能从 `utterable()` 取。实验八：
+
+```text
+事件                          可以说出口的状态
+订周五（epoch 1）             working
+改成周四（epoch 2）           working
+周五的结果回来：stale         working
+周四的结果回来：accepted      completed
+```
+
+周五的结果先回来，而且是成功的。如果口头更新取自「最近一个回来的结果」，agent 会说「您已订好周五」。G5 断言旧结果 `stale`、状态仍是 `working`；G6 断言只有被接受的成功结果才是 `completed`，旧 epoch 的取消确认也作废。
+
+另外三条，后两条都是 L19 第四节幂等键的用武之地，不在这里重讲：
+
+- **确认送达不等于说出来了**："The acknowledgment waits for estimated context injection, not for speech or playback to finish."
+- **重试前先查是否已经发生**："a lost response should not cause a second booking"
+- **多条连接看到同一个事件**。[SIP 文档](https://developers.openai.com/api/docs/guides/voice-sip.md)："Choose one owner for each side effect, even if multiple connections observe an event."
+
+### 4.3 填充语不是免费的
+
+L16 第六节把等待期设计成「有信息的」，那依赖一块屏幕。语音的等待期只能放声音，而填充语占用的正是用户可能要插话的那条通道。OpenAI [Realtime prompting guide](https://developers.openai.com/api/docs/guides/voice-prompting.md)："Used well, they reassure the user that the assistant is working. Used poorly, they become filler and increase perceived latency." 何时不要用：答案能直接给出；用户只是确认、纠正或拒绝；音频不清楚；最新音频是静音或噪声；"the tool call is lightweight and the user would not benefit from an update"。
+
+什么时候说也有讲究。LiveKit `with_filler`："waits for the session to be continuously idle for `delay` seconds"，任一方开口都重置，默认 `delay` 是 0。实验七，填充语本身 1200ms：
+
+```text
+场景                                  调度        触发    撞上用户  答案推迟
+工具 1800ms，用户在 400–900 说话      开始后计时  500     是        0ms
+                                      连续空闲    1400    否        800ms
+工具 300ms，delay=0（LiveKit 默认）   开始后计时  0       否        900ms
+                                      连续空闲    0       否        900ms
+工具 300ms，delay=500                 开始后计时  —       否        0ms
+                                      连续空闲    —       否        0ms
+```
+
+「开始后 500ms 说」正好撞在用户说话的那段上；连续空闲调度等用户说完再满 500ms，1400 才说。**连续空闲不撞车，但不是没有代价**：填充语一开口就要说完，工具在 1800 回来了，答案排到 2600，推迟 800ms。默认 `delay=0` 时，一个 300ms 的工具被换成一句 1.2 秒的「我查一下」，答案推迟 900ms——这就是官方说的 "increase perceived latency"。
+
+TODO 6 `myScheduleFillers` 的典型错法：`toolStart + delayMs` 直接触发；填充语播放期间也当成空闲。G1（300ms 的工具、delay 500，不说）、G2（1400 不是 500）、G3（`intervalMs` 为 null 最多一次）、G4（`maxSteps=2`、`intervalMs=1000` 时是 `[500,2200]`：interval 从上次触发按墙钟算，到 1500 时第一句还在播，要等 1700 播完再满 500）。
+
+### 4.4 用户在工具运行时开口，以及沉默的账单
+
+三家三种默认：Pipecat 的 `FunctionCallUserMuteStrategy` "mutes the user while a function call is executing"，是可选策略；Gemini 3.8 Live 默认异步函数调用，结果上可声明 `INTERRUPT`、`WHEN_IDLE`、`SILENT`（3.1 Flash Live Preview 只支持顺序调用，引用要带模型名）；GPT-Live 前后台并行。没有正确默认，取决于副作用：正在扣款时静音用户是对的，正在查天气时是错的。
+
+L15 说延迟和成本是两条轴。按时长计费时它们耦合了。[Cost optimization](https://developers.openai.com/api/docs/guides/voice-latency-cost.md)："Active session time includes time when the user speaks, the assistant speaks, both are silent, or the backend is working." 后台慢一秒，语音前台多收一秒；文档里的 $0.05/min 标着 "an illustrative voice rate"，不是实价。同一家的 Realtime API 按 token 计费，"VAD will effectively filter out empty input audio"。**同一家厂商的两个语音产品，沉默对账单的影响方向相反**。
+
+---
+
+## 五、中文的句号后面没有空格
+
+### 5.1 TTS 要上下文，首音要快
+
+[ElevenLabs WebSocket TTS](https://elevenlabs.io/docs/api-reference/text-to-speech/v-1-text-to-speech-voice-id-stream-input.mdx) 的默认偏质量："the first chunk of audio will not be generated until you send text that totals at least 120 characters long"；关掉缓冲的 `auto_mode` "is only recommended when sending full sentences or phrases, sending partial phrases will result in highly reduced quality"。LiveKit 的 ElevenLabs 插件默认开 `auto_mode`，一句一送。所以**分句器同时决定首音延迟和韵律**。厂商阈值的单位是「字符」，120 个英文字符约一两句，120 个汉字是一大段；ElevenLabs 没说 CJK 怎么计。
+
+| 来源 | 句末集合 | 最小长度 | 前瞻 | 中文 |
+|---|---|---|---|---|
+| arXiv 2603.05413 | `.` `!` `?` **后跟空白** | 10 字符 | 等一个空白 | 永远不触发 |
+| LiveKit `split_sentences` | `.!?。！？` | 大于 20 字符 | 流式时 10 | 能切，但 20 字符把短句合并，还在句间插 ASCII 空格 |
+| Pipecat `SimpleTextAggregator` | 拉丁标点交给 sentencex；`。？！；` 等直接切 | 无 | 等句末后第一个非空白字符 | 能切；逗号不在集合里 |
+
+论文规则原文 "Detect sentence-ending punctuation (., !, ?) followed by whitespace"。中文句号后面没有空格，整段回答会攒到流结束才冲出去。
+
+### 5.2 实验六：三种分句器
+
+合成 token 流：每个汉字或全角标点一个 token，ASCII 连续串一个 token，第 i 个在 300 + 30·i ms 到达。`naive` 见到 `.!?。！？` 立刻切；`paper` 是论文四条规则；`proposed` 是 lab 的 `splitStream`。节选（完整 24 行见 `pnpm voice`，和调研独立写的脚本逐行相同）：
+
+```text
+分句器    样本           首段ms  首段单位  段数  误切
+naive     zh-basic          570         8     3     0
+naive     zh-decimal        480         7     5     3
+naive     zh-longcomma     1920        52     1     0
+naive     en-tricky         390         4     8     5
+paper     zh-basic         1410        32     1     0
+paper     zh-decimal       1020        24     1     0
+paper     zh-longcomma     1950        52     1     0
+paper     en-tricky         480         7     3     0
+proposed  zh-basic          600         8     3     0
+proposed  zh-decimal        540         9     3     0
+proposed  zh-longcomma      540         8     2     0
+proposed  en-tricky         480         7     3     0
+paper/zh-basic        1410|好的，我帮您查一下。您的订单已经发货了，预计明天下午送到。还有其他问题吗？
+proposed/zh-basic     600|好的，我帮您查一下。 ‖ 1170|您的订单已经发货了，预计明天下午送到。 ‖ 1410|还有其他问题吗？
+proposed/zh-longcomma 540|根据您提供的信息， ‖ 1950|我查到您在上周三下单的那台笔记本电脑目前正在从上海仓库发出，物流单号已经同步到您的手机上了。
+```
+
+1. **论文的规则在中文上完全失效**。`paper` 在五个中文样本上全部只有 1 段，首段时间就是整段生成完：zh-basic 1410ms，`naive` 570ms。英文上测出 sub-second 的级联，换成中文后分句退化成「等 LLM 说完」。这不是论文的错，它只测了英文
+2. **`naive` 最快，误切严重**。en-tricky 8 段里 5 处（`$39.`、`Dr.`、`1.`、`2.`、`example.`），zh-decimal 3 处：交给 TTS 的第一段是 `这款套餐每月39.`，第二段从「9元」开始。它在 zh-quote 上切在 `。` 之后，后引号 `”` 被甩到下一段开头，这不计入误切但同样难听
+3. **LiveKit 的英文规则扎实，中文吃亏**。调研直接加载 LiveKit 的分句代码跑同一组样本：`p.m.`、`Dr.`、`$39.99`、`1.2.3`、`example.com` 全对；但中文首段被 20 字符阈值合并成 `好的，我帮您查一下。 您的订单已经发货了，预计明天下午送到。`，按 lab 的 `speechUnits` 是 25 个单位，英文首段 `Sure, let me check that.` 是 5 个。拼接时的 `pre_pad = " "` 还在中文句间插了空格；对中文 TTS 有没有影响没有证据，但它暴露了「句子之间有空格」这条贯穿论文和 LiveKit 的假设
+4. **长逗号句是中文特有的问题**。zh-longcomma 52 个字只有一个句号，`naive` 和 `paper` 要等到 1920–1950ms。`proposed` 允许**第一段**在逗号处切，540ms 出首段；后续段至少 8 个单位、不在逗号处切。首段为延迟，后续为韵律，和 ElevenLabs 递增的 `chunk_length_schedule` 同一个思路
+5. **前瞻有固定成本**。`proposed/zh-basic` 比 `naive` 慢 30ms，就是吸收后引号多等的那 1 个字符
+
+<Drill title="proposed 分句器为什么是这四条">
+
+1. **中文句末（`。！？；`）和 `! ? ;` 无歧义，但多等 1 个字符**，让后引号 `”」』` 跟着这一句走（F6）
+2. **`.` 必须前瞻 1 个字符**：下一个是空格或汉字、且前一个词不是缩写（`ABBR` 里的或单个字母），才是句号（F3–F5）。Pipecat 注释是最好的一手解释："`Hello. N`: check immediately and emit `Hello.`. In contrast, `Dr. N` and `$29.9` stay buffered as an abbreviation and a decimal."
+3. **第一段可以在逗号处切**（`，,、：:`，够 4 个语音单位）；后续段至少 8 个、不在逗号处切（F7、F8）
+4. **长度按语音单位，不按字符**：一个汉字算 1，一串连续的 ASCII 字母数字算 1
+
+外加一条不变量：**分句只决定在哪切，不改字符**，段间只丢掉切点处的空格（F9），LiveKit 插空格是反例。前瞻窗口越大越准，也越慢：Pipecat 说「等词完整」在他们一个样本上最多花了 297ms，这是厂商单样本观察；lab 只前瞻 1 个字符，代价是一个 token。
+
+</Drill>
+
+TODO 5 `mySplitStream` 的三个典型错法：见句号就切；只认 `.!?` 加空白（F2 要求五个中文样本都至少切出 2 段）；按字符数定阈值。F1 钉住 `proposed` 在全部 8 个样本上的四列。中文数字读法（`39.9元`、`2026年`）调研没找到主流 TTS 的一手规范；lab 的立场是分句器不做归一化。
+
+<PyMirror>
+
+Python 通道 `labs/l16y/voice.py` 与 TS 同名（snake_case）、输出逐字节相同。调研专门放了三个跨语言探针：
+
+| 探针 | TS | Python | lab 的规定 |
+|---|---|---|---|
+| `"好😀".length` 与 `len()` | 3（UTF-16 码元） | 2（码点） | 一律按码点：TS 用 `Array.from(s).length` |
+| `\w` 匹配 `好` | false | true | 禁用 `\w`，写显式字符类 |
+| `\d` 匹配全角 `３` | false | true | 禁用 `\d`，写 `[0-9]`，和 L16 同一个坑 |
+
+落到这一节的 lab 里：
+
+- **`\w` 去标点，两边错在不同的地方**。TS 的 `[^\w\s]` 把汉字删光，C2 红；Python 的 `\w` 认汉字，同一行正则 C2 是绿的
+- **`strip()` 去的不只是空格**。Python 的 `strip()` 和 `\s`、JS 的 `trim()` 和 `\s` 都认 U+00A0；C6 断言 `'\u00a0x'` 原样保留，两边都会被抓
+- **整数除法**。`heardText` 的 `Math.floor(码点数 * 已播 / 块时长)` 在 Python 写成 `len(cps) * left // ms`，百分位 rank 是 `(q * n + 99) // 100`，都只用在非负整数上
+- **F10 是给 TS 留的**。`"好😀好".length` 是 4，`slice` 一半得到「好」加一个孤立代理项；Python 的 `len()` 本来就数码点
+
+</PyMirror>
+
+---
+
+## 六、动手
+
+<Lab title="l16y/voice：六个 TODO，每一个对应一条反过来的直觉">
+
+<Steps>
+<li>`cd labs && pnpm voice`。先跑八个观察实验，什么都不写。重点看实验二（语义模型只延长）、实验四（三种历史）和实验六（论文规则在中文上不切）。</li>
+<li>`VOICE_IMPL=shared pnpm verify:l16y`，先确认测试本身是对的：56 条全绿。</li>
+<li>实现 `l16y/voice.ts` 下半部分的六个 TODO。建议顺序：TODO 1 → 2 → 3 → 4 → 6 → 5，分句最长，留到最后。</li>
+<li>`pnpm verify:l16y`。红的那条会打印实际值，对照下表找是哪种错法。</li>
+<li>Python 侧：`uv run python -m l16y.voice` 跑观察实验，`uv run python -m l16y.verify` 跑断言。两边的实验输出应该逐字节相同。</li>
+</Steps>
+
+| TODO | 要点 | 典型的「看起来对」 | 主要被谁抓 |
+|---|---|---|---|
+| 1 ★ `myVadStep` | 四态滞回；`lastSpeechAt` 记最后一个有声帧 | 单帧过阈值就切状态；说完时刻用判定时刻 | A3、A4、A5 |
+| 2 ★★ `myCommitTurn` | 按概率选 min 或 max；等 final；复说取消 | 用概率缩短到 min 以下；不等 final；忘了复说取消 | B3、B5、B6、B8 |
+| 3 ★ `myNormalizeTranscript` / `mySpeculationValid` | 中英文标点归一化；四元组 | 只比转写；用 `\w` 去标点 | C2、C3、C4、C6 |
+| 4 ★★ `MyPlaybackLedger.bargeIn` | 截到已播放；item 内毫秒；`dropItem`；epoch | 截到已生成或已发送；忘了 epoch | D2、D3、D6、D7、F10 |
+| 5 ★★ `mySplitStream` | 中文句末加后引号；`.` 前瞻；首段软切；语音单位 | 见句号就切；只认 `.!?` 加空白；按字符计长度 | F1–F9 |
+| 6 ★ `myScheduleFillers` | 连续空闲满 delay；填充语本身算忙；interval、maxSteps | `toolStart + delayMs` 直接触发；填充语期间算空闲 | G1–G4 |
+
+56 条断言：A VAD 7 · B 端点 8 · C 投机 6 · D 播放截断 10 · E 打断判定 5 · F 分句 10 · G 填充语与任务板 6 · H 延迟账 4。E 组和 H 组测的是参考实现（`judgeBargeIn`、`ledger`、`percentile`），G5、G6 测 shared 的 `TaskBoard`，F10 测你的 `bargeIn`。B6 和 F1 会用你的实现重跑实验二和实验六，要求和上面的表一致。
+
+</Lab>
+
+---
+
+## 七、收尾
+
+五个面试里会被追问的问题，答案就是这一节的五个主题：
+
+1. 「你们的首音延迟是多少？」 先反问起点和终点。论文的 TTFA 不含话轮等待和 STT，LiveKit 的 e2e 含话轮等待不含下行，用户的死寂全含。报端到端的 p50 和 p95，填充语和有用答案分开报；分段百分位不能相加
+2. 「语义 VAD 能让 agent 更快吗？」 不能。它只把等待从 min 延长到 max，买的是少切人，延迟分布变成双峰。更快要靠等待期间就开始生成，投机结果的有效性是四元组
+3. 「用户打断后，历史里留什么？」 留到播放位置，不是已生成、也不是已发送。说清传输是 WebRTC 还是 WebSocket、谁在算 `audio_end_ms`，以及你用的厂商把「说过」定义成什么
+4. 「用户说『等一下』时，正在跑的退款怎么办？」 接着跑。打断停的是话语，口头确认只来自已验证的状态，重试前先查是否已经发生；填充语和沉默都不是免费的
+5. 「分句器在中文上测过吗？」 拿首段时间和误切数回答，不要拿「能切」回答。中文句号后面没有空格，阈值按语音单位，不按字符
+
+<Note title="这一节刻意没有当事实讲的说法">
+
+调研查不到一手来源的：哪种架构是生产主流；「600ms 以上的沉默被读成拒绝」对人-机对话是否成立；Gemini Live 自动 VAD 的默认参数；浏览器对 WebSocket 加 `AudioContext` 播放的语音做不做回声消除；8kHz 电话音频对 ASR 的影响；中文 TTS 的数字读法和 ElevenLabs 对 CJK 的计数；典型 RTT 和抖动缓冲数值；GPT-Live 的实际价格；Pipecat 打断后的截断语义。Flux 的「50-70% more LLM calls」和 Pipecat 的「297 ms」是厂商自报，讲义引用时都标了出处。
+
+</Note>
+
+回头看前置课：L15 的 TTFT 和成本账在这里变成了四种首音延迟和按秒计费；L16 的撤回变成了截断到已播放，「取消渲染 ≠ 取消生成」变成了「闭嘴 ≠ 取消订单」，块边界不对齐帧边界变成了 PCM 的奇数字节和分句的前瞻；L19 的幂等键在工具重试和 SIP 多连接里又出现了一次。

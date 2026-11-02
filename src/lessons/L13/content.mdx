@@ -1,0 +1,731 @@
+L12 给了你测量工具。但测量工具需要输入——你得能从生产环境里持续捞出有代表性的样本，尤其是失败的那些。
+
+这一节讲那件事，以及它更难的一半：一次失败发生之后，你怎么知道当时到底发生了什么。
+
+而这里有个先要破掉的直觉。大多数人把"可观测性"理解成一个配置问题：装上 OpenTelemetry、接个后端、把采样率调到能承受的水平，然后就有了一份记录。
+
+<Key>
+**你以为在建一份记录，其实在建三份互相冲突的东西。**
+
+| | 它要什么 | 而它做不到什么 |
+|---|---|---|
+| **监控** metrics | 便宜、全量、能报警 | 算不出成本 |
+| **调试** trace | 完整、带内容 | 完整的 trace 是二次方增长的，且默认不带内容 |
+| **复现** cassette | 确定性 | 模型本身不可复现 |
+
+把这三件事当成一件事做，是这一节里几乎所有故障的来源。
+</Key>
+
+而 OpenTelemetry 的规范其实在暗示这个分离——它的内容上传钩子**不受采样决策影响**，那正是"trace 采样到 1%、录音留全量"这个架构。只是它没把这句话说出来。
+
+L12 的每个失效会给你一个错的数字。这一节的每个失效会给你一份**错的现场**——一条看起来完整的 trace。
+
+---
+
+## 一、先说一件让人不舒服的事
+
+在讲任何技术细节之前，得先说清你脚下这块地的状态。
+
+OTel 的 GenAI 语义约定**已经不在 OpenTelemetry 的 semantic-conventions 仓库里了**。semconv v1.42.0（2026-06-12）把所有 `gen_ai.*`、`openai.*`、`mcp.*` 弃用并搬到了独立仓库 `semantic-conventions-genai`，而那个仓库**到现在一个 tag 都没有**。
+
+变更日志里写的是，埋点实现"should refer to it for the corresponding `schema_url` to use"——但那个 `schema_url` 还不存在。
+
+<Pitfall title="你没有版本号可以钉">
+所以你跑的是"你的埋点库编译那天 main 上的那一版"。
+
+而且**每一个 GenAI 元素都是 `Development` 级别**，零个 stable、零个 release candidate。OTel 自己对 `Development` 的定义是：MAY 在无预告的情况下移除、SHOULD NOT 用于生产。
+
+更容易骗人的是，同一张表里引用的共享属性（`error.type`、`server.address`）**是 Stable 的**——这让整张表看起来比实际稳定得多。
+</Pitfall>
+
+于是改名一直在发生：
+
+| 旧名 | 新名 | 版本 |
+|---|---|---|
+| `gen_ai.usage.prompt_tokens` | `gen_ai.usage.input_tokens` | 1.27.0 |
+| `gen_ai.usage.completion_tokens` | `gen_ai.usage.output_tokens` | 1.27.0 |
+| `gen_ai.system` | `gen_ai.provider.name` | v1.37.0 |
+| `gen_ai.openai.*` | `openai.*`（前缀整个去掉） | v1.37.0 |
+| `gen_ai.prompt` / `gen_ai.completion` | 无——废弃，"no replacement at this time" | v1.28.0 |
+| `gen_ai.usage.cache_creation.input_tokens` | `gen_ai.usage.cache_write.input_tokens` | **尚未发布，已在 main 上** |
+
+最后那一行值得停一下。这个改名在缓存属性引入（v1.40.0）之后才落地，而且**还没发布**。意思是 2026 年 8 月及之前所有讲这套约定的文章——包括搜"GenAI conventions stable"排第一的那篇——写的都是 `cache_creation`。它们已经错了。
+
+顺带一个能校准你对"这东西多稳"的判断的数字：那篇被广泛引用的博客说，截至 2026-08-13 有"63 个 `gen_ai` 属性键"。今天 main 上是 **72 个**。
+
+**而改名的症状不是报错，是看板查到 0 条。** span 正常创建、exporter 返回成功、collector 报告吞吐健康，而你的查询匹配不到任何东西。
+
+这和"系统很安静"长得一模一样。
+
+<Note title="Python 侧还有一个更隐蔽的版本">
+Python 侧还有一个更隐蔽的版本：`opentelemetry-instrumentation-openai-v2` 已被废弃，它对齐的是 semconv v1.30.0，除非你设了 `OTEL_SEMCONV_STABILITY_OPT_IN=gen_ai_latest_experimental`。而它的替代品 `opentelemetry-instrumentation-genai-openai` **无条件发送最新的实验版约定，没有开关**。
+
+换个包，所有属性名同时改指向，**中间没有任何一层报错**。
+</Note>
+
+---
+
+## 二、双发：两个数字各自都对，加起来错一倍
+
+改名带来的第一个实际问题在过渡期。
+
+框架为了兼容，会把同一个值**同时写到新旧两个键上**。而一个这样写的成本看板：
+
+```sql
+SELECT SUM(prompt_tokens) + SUM(input_tokens) AS total_input
+```
+
+会把你的报告花费**翻一倍**。
+
+注意这里的关键：**两个键各自的值都是对的**。没有任何一层会报错，因为没有任何一层出错。
+
+```
+埋点发出了 8 个属性，其中 4 对是双发的
+  gen_ai.usage.prompt_tokens → gen_ai.usage.input_tokens
+  gen_ai.usage.completion_tokens → gen_ai.usage.output_tokens
+  gen_ai.system → gen_ai.provider.name
+  gen_ai.usage.cache_creation.input_tokens → gen_ai.usage.cache_write.input_tokens
+
+一个 SUM(prompt_tokens) + SUM(input_tokens) 的看板会报：2400 输入 token
+去重后的真实值：                                   1200
+```
+
+修法是**按优先级取一个，绝不相加**。
+
+而去重函数还该报一种更糟的情况：**两个键的值不一样**。那意味着两条埋点路径在测不同的东西，这时候取哪个都是错的，你需要先搞清为什么。
+
+---
+
+## 三、同一个字段名，两家相反的语义
+
+这是整节课最容易错一个数量级的地方。
+
+Anthropic 和 OpenAI 都有一个叫 `usage.input_tokens` 的字段。它们的含义**正好相反**。
+
+```
+Anthropic：input_tokens 不含缓存
+           总输入 = input_tokens + cache_read + cache_creation
+
+OpenAI：   input_tokens 已含缓存
+           普通输入 = input_tokens − cached − cache_write
+```
+
+拿一次具体的调用：10 万 token 的系统 prompt 命中缓存，用户消息 50 token。
+
+| 提供方 | 原始 `input_tokens` | 照字段名映射 | 正确值 |
+|---|---|---|---|
+| Anthropic | 50 | **50** | 100,050 |
+| OpenAI | 100,050 | 100,050 | 100,050 |
+
+<Pitfall title="少算 2001 倍，而同一段代码在另一家上完全正确">
+一个照着字段名做的映射在 Anthropic 上把 100,050 记成 50。
+
+Anthropic 自己的文档里写了这句话：`input_tokens` 在你有效使用缓存时"通常会**远小于**你的总输入"。它的字段定义是"不是从缓存读取、也不是用于创建缓存的输入 token 数（即最后一个缓存断点之后的 token）"。
+
+而这个 bug 最坏的性质是：它在 OpenAI 上一点问题都没有。所以你在一家上写好、测好、上线，然后接第二家的时候复制粘贴。
+</Pitfall>
+
+OTel 规范把这个不对称**显式编码进去了**，这是最好的印证：
+
+- Anthropic 提供方页注 `[27]`：Anthropic 的 `input_tokens` **excludes** cached tokens，要算 `input_tokens + cache_read_input_tokens + cache_write_input_tokens`。注 `[22]`/`[23]` 都用了 **MUST be added**。
+- OpenAI 提供方页注 `[24]`：`cache_read.input_tokens` 对应 `usage.input_tokens_details.cached_tokens`——**不加**，因为它已经在里面了。
+- 通用注册表对 `gen_ai.usage.input_tokens` 的规定：这个值 "SHOULD include all types of input tokens, **including cached tokens**"。
+
+也就是说约定的口径是"`input_tokens` 是全量总和"，它和 OpenAI 的原始字段一致，和 Anthropic 的正好相反。
+
+<Note title="另外两个「不要相加」的包含关系">
+还有两个同类的包含关系，规则也是**不要相加**：
+
+- `output_tokens` **已包含** `reasoning_tokens`。OpenAI 的一个例子：75 输入 / 1186 输出，其中 **1024 是推理**——86% 的计费输出是不可见的，但它不是额外的一笔。
+- 按模态拆的属性是**三层**包含：`{modality}.cache_read.input_tokens` 同时属于 `cache_read.input_tokens` **和** `{modality}.input_tokens`。
+
+所以求总量的规则很简单：**只对 `input_tokens` 和 `output_tokens` 求和，其余全是明细，用来算钱，不用来求总量。**
+</Note>
+
+---
+
+## 四、为什么"用 metrics 建成本看板"办不到
+
+现在讲一条广为流传、听起来很合理、而且是错的建议：
+
+> metric 的表面比 span 小、比 span 稳定，所以成本和延迟面板建在 `gen_ai.client.token.usage` 上、按 `gen_ai.token.type` 拆，span 只用来调试。
+
+它在任何开了 prompt caching 的系统上都产不出正确的成本。理由不在架构层面，在一个枚举里。
+
+**`gen_ai.token.type` 只有两个取值：`input` 和 `output`。** 没有 cache 维度，没有 reasoning 维度，没有 modality 维度。
+
+而 `gen_ai.client.token.usage` 这个 metric 的**全部**属性是：`gen_ai.operation.name`、`gen_ai.provider.name`、`gen_ai.request.model`、`gen_ai.response.model`、`gen_ai.token.type`、`server.address`、`server.port`。
+
+于是所有这些价格全部塌进 `token.type=input` 这一个桶：
+
+| token 类别 | 倍率 |
+|---|---|
+| 普通输入 | 1x |
+| 缓存读 | **0.1x**（两个新模型上是 0.025x） |
+| 5 分钟档缓存写 | **1.25x** |
+| 1 小时档缓存写 | **2x** |
+
+一个跨度 20 倍的桶（算上 0.025x 那两个模型是 **80 倍**）。
+
+拿一次典型的长上下文调用算：
+
+```
+普通输入        200 tok  ×1      $0.000600
+缓存读       180000 tok  ×0.1    $0.054000
+5 分钟写       4000 tok  ×1.25   $0.015000
+1 小时写      16000 tok  ×2      $0.096000
+输出            800 tok          $0.012000
+────────────────────────────────────────────
+从 span 算                       $0.177600
+从 metric 算（所有 input 一个价） $0.612600   高估 245%
+```
+
+<Key>
+所以正确的分工和常见建议是**反的**：
+
+- **metrics** → 量、延迟、loop 长度 SLO
+- **spans** → 成本
+
+所有缓存和推理的拆分**只存在于 span 属性上**。
+</Key>
+
+这一节里我最喜欢这个例子，因为它是一条听起来完全合理的建议，而推翻它只需要读一个枚举的取值列表。
+
+<Pitfall title="顶层字段藏了价格档位">
+Anthropic 的 `cache_creation_input_tokens` 等于 `cache_creation` 对象里两档之和（`ephemeral_5m_input_tokens` + `ephemeral_1h_input_tokens`）。
+
+只读顶层那个字段，你**分不出 1.25x 的写和 2x 的写**。要算钱必须读明细。
+
+而这些倍率还会**叠加**在别的定价修饰上——Batch API 折扣、数据驻留区域，文档里明写了 "These multipliers stack"。
+</Pitfall>
+
+---
+
+## 五、trace 是二次方增长的
+
+这是这一节最漂亮的一个算术结果，而且它完全是初等的。
+
+agent 就是 LLM 调用放在循环里。每一步往 message 数组里追加，而**整个数组会作为下一次调用的输入再发一遍**。可观测性平台记录每次 LLM 调用的输入。
+
+于是 k 轮下来你存了：
+
+```
+1 + 2 + … + k = k(k+1)/2 条消息
+```
+
+而其中只有 k 条是不重复的。
+
+| 轮数 | 存了多少条 | 唯一 | 朴素字节 | 去重后 | 冗余 |
+|---|---|---|---|---|---|
+| 10 | 55 | 10 | 49 KB | 7.8 KB | 6.2x |
+| 30 | 465 | 30 | 358 KB | 22.8 KB | 15.7x |
+| 50 | 1275 | 50 | 995 KB | 40.5 KB | 24.6x |
+
+**运行长度翻倍，存储量翻四倍。**
+
+单个 span 的上限也能推出来：整个数组必须塞得进上下文窗口，而多数框架在 80% 处压缩，所以 1M token 上下文下一个 LLM span 的输入上限约是 `0.8 × 1M` ≈ **3.2 MB 的 JSON**。
+
+一次逼近上限的 50 轮运行会写 **~160 MB**，其中 **~98% 是同一批字节被记了 50 遍**。
+
+修法是**内容寻址**：对每条消息的规范化 JSON 取哈希，每个 trace 只存一份，读的时候再拼回来。O(k²) 变成 O(上下文窗口)。
+
+<Pitfall title="哈希前必须规范化 JSON">
+键序不同的同一条消息会哈希成两个值。于是去重率变成 0，而且**不报错**——你会得到一个功能完整、只是完全没用的去重层。
+
+所以哈希的输入必须是排过键的 JSON，不是 `JSON.stringify(obj)` 的直接结果。
+</Pitfall>
+
+顺带说一句关于开销的话，因为它常被讨论错。OTel Java 的官方基准里，一个符合规范的 span 配置大约 **305 纳秒**；OTel Go 的批处理器 `OnEnd` 约 **173 纳秒、0 次分配**。而一次 LLM 调用是几百毫秒到几分钟。
+
+**差四到六个数量级。** 任何聚焦于 CPU 或延迟的"tracing 开销"讨论都在测错的东西。真实成本是**字节**。
+
+---
+
+## 六、4 MiB 那道墙，以及它为什么专杀最有价值的 trace
+
+现在把上一节的字节数和一个协议上限放在一起。
+
+OTLP 规范（1.11.0）：
+
+> "The server implementations typically enforce a default incoming message size limit of **4 MiB**... If the limit is exceeded, the gRPC server implementations MUST report a `RESOURCE_EXHAUSTED` code as a **non-retryable** error."
+
+再加两件事：
+
+1. 一个 LLM span 的输入可以合法地达到 ~3.2 MB（上一节）。
+2. **OTel 的 batch processor 按条数分批，不按字节。** `send_batch_max_size` 数的是 span 个数，没有字节上限。
+
+结果：一个胖 span 和几个普通 span 打成一批，超过 4 MiB，**整批作为不可重试错误被丢掉**——连带那几个毫不相关的 span。
+
+真实日志里 `dropped_items` 在 2000 到 8196 之间，报错是：
+
+```
+received message after decompression larger than max (4194305 vs. 4194304)
+```
+
+注意那个大小：**恰好是上限 + 1 字节**。
+
+<Pitfall title="SDK 那一层不会救你——而理由是个混淆">
+一条广为流传的说法是"OTel 的 exporter 默认会在 128 字符处静默截断属性值"。
+
+**这是错的**，而混淆来自"数量"和"长度"：
+
+| 配置项 | 默认值 | 它限的是 |
+|---|---|---|
+| `AttributeCountLimit` | **128** | 每条记录最多几个**属性** |
+| `AttributeValueLengthLimit` | **Infinity** | 单个属性值的**长度** |
+
+所以一个 3 MB 的 prompt 字符串**不会被截断**。它一路顺畅地穿过 SDK，撞到 4 MiB 那道墙上。
+
+（那个 128 的数量限制倒是有它自己的风险：规范现在定义了 72 个 `gen_ai.*` 属性，加上 `server.*`、`error.*` 和提供方专属的 `openai.*` / `anthropic.*`，一个埋点丰富、还带了自定义租户属性的 span 是能接近它的。）
+</Pitfall>
+
+<Key>
+这道墙最坏的性质：**它系统性地杀掉最有价值的 trace。**
+
+最胖的 span 来自最长、最复杂、最该被看的那次运行。
+</Key>
+
+修法有两层：分批的时候按字节算而不是按条数算；单条就超限的必须**内容外部化**——存到你自己的对象存储，span 上只留引用。分批救不了它。
+
+---
+
+## 七、采样：偏的方向正好是错的
+
+采样是这一节唯一一个"所有人都知道要做，而做法几乎全错"的话题。
+
+OTel SDK 的默认采样器是 head-based：`ParentBased(TraceIdRatioBased(r))`，在 **root span** 上对 trace ID 取哈希。
+
+它在 agent 上失败**不是因为不精确，是因为信息顺序**：做决定的那一刻，这次运行还没跑。它不可能知道这一次将会失败、将会跑 40 轮、或者将会烧穿预算。
+
+于是 10% 的采样率保留 10% 的成功，**也保留 10% 的失败**。
+
+```
+1000 次运行，50 次失败（5%）。失败的普遍更长更贵。
+
+head 采样 @10%：留下 87 条，其中失败 4.6%
+  失败召回 8% —— 和成功的保留率一样
+```
+
+<Key>
+**你的调试语料不只是生产流量的一个小样本，它是一个有偏的样本，而且偏的方向正好是错的。**
+
+1% 采样率下，你会在留住一条罕见灾难轨迹之前，先留住中位数请求一百次。
+</Key>
+
+注意这里一个反直觉的地方：head 采样的"公平"恰恰是它的缺陷。一个统计上无偏的采样器，在你要找罕见事件的时候是最坏的选择。
+
+所以所有人都推荐 tail 采样——等运行结束再决定。而**几乎没人提它在 agent 上的三个专属缺陷，全部来自默认值。**
+
+| 配置项 | 默认值 | 对 agent 的后果 |
+|---|---|---|
+| `decision_wait` | **30s** | 一次 4 分钟的运行会在只看到局部树的时候被判掉，早了 8 倍 |
+| `num_traces` | 50,000 | 环形缓冲，满了**淘汰最老的**——而长 agent trace 永远是最老的 |
+| `sampled_cache_size` | **0** | 缓存不启用。后果见下 |
+
+第一条的后果有多脏，用一个例子最清楚。写一条正好瞄着我们要的东西的策略：**失败的留下，跑够 20 轮的留下**。
+
+```
+tail 采样（全用默认值）：
+  留下 0 条，失败召回 0%
+```
+
+一条都没留下。因为失败的运行要跑 3 分钟，而 `decision_wait` 在第 30 秒就替它做了决定——那一刻它还没失败，也还没跑到 20 轮。**策略写得再对也没用。**
+
+<Pitfall title="同一次运行可以拿到两个互相矛盾的采样决策">
+第三条的后果来自 `tailsamplingprocessor` 自己的 README：
+
+> **Scenario 2（默认，未配置 decision cache）：** After the sampling decision is removed from the buffer, it's as if this component has never seen the trace before: the late spans are buffered for `decision_wait` seconds and **a new sampling decision is made**.
+
+也就是说在默认配置下，一次长 agent 运行的**前半段被留下、后半段被丢掉**。
+
+而你打开它的时候，看到的是一条**看起来完整的、只是有点短的** trace。
+
+修法是把 `sampled_cache_size` 和 `non_sampled_cache_size` 设成远大于 `num_traces`——两个的默认值都是 **0，也就是不启用**。
+</Pitfall>
+
+<Note title="采样器自己也要被埋点，以及一个扩容那天才出现的约束">
+采样器自己也需要被埋点。这四个指标是必须看的：
+
+```
+# 缓冲淘汰：有 trace 在决策前就被挤出去了
+otelcol_processor_tail_sampling_sampling_trace_dropped_too_early
+
+# 拿它的 p1 和 decision_wait 比：p1 更小就说明在淘汰活跃 trace
+otelcol_processor_tail_sampling_sampling_trace_removal_age
+
+# 有多少 span 迟到：迟到的那些拿不到正确决策
+otelcol_processor_tail_sampling_sampling_late_span_age
+
+# 超过 1 秒就会把实际决策点推过 decision_wait
+otelcol_processor_tail_sampling_sampling_decision_timer_latency
+```
+
+另外一个部署约束，在单 collector 的演示里完全看不见：**tail 采样不能跑在节点本地的 agent collector 上**，因为一条 trace 的 span 散落在请求经过的每个节点上。它必须在 gateway 上，而如果你的 gateway 有多个副本，你还需要 `loadbalancing` exporter 按 `trace_id` 路由。
+
+这个问题在你第一次横向扩容的那天出现。
+</Note>
+
+---
+
+## 八、出路：loop 长度不需要 trace
+
+上一节留下一个困境：采样率 1% 的时候，怎么发现失控的循环？
+
+答案不在 trace 里。规范里有两个被严重低估的 metric：
+
+```
+gen_ai.invoke_agent.inference_calls   Histogram   {inference_call}
+gen_ai.invoke_agent.tool_calls        Histogram   {tool_call}
+```
+
+它们是 **Histogram，不是 Counter**。规范的定义是"单次调用中 agent 发起了多少次推理调用"，作用域是**一次 invocation**，**且包含失败的调用**。
+
+<Key>
+**你可以在不存任何一条 trace 的前提下，对 p99 的 loop 长度报警。**
+
+这是上一节所有采样缺陷唯一影响不到的数字。
+</Key>
+
+```
+p50 5 轮 / p90 7 / p99 37 / 最长 40
+失控（≥20 轮）：50 次，全部被这个直方图看到
+```
+
+注意 p50 是 5 而 p99 是 37。**只看均值看不出任何问题。**
+
+顺带一个能说明规范作者怎么想的细节：`gen_ai.invoke_agent.duration` 的桶边界是 `[0.1, 0.2, … 204.8, 409.6]` 秒——规范预设 agent 单次调用可以跑到 **~7 分钟**。
+
+而 `decision_wait` 的默认值是 30 秒。同一套生态里的两个默认值差了 14 倍。
+
+<Note title="span 的形状：规范没有规范性指引，而且它自己说了">
+顺带把 span 的形状也讲清楚，因为这里有个常见误解。
+
+关于 agent trace 的层级，规范**没有规范性指引，而且它自己说了**。非规范示例里描述一次工具往返的两个 chat span 时写的是：
+
+> "The relationship between below spans depends on how user application code is written. They are likely to be **siblings** if there is an encompassing span."
+
+所以预期的形状是**一个总 span 下面一排兄弟**，不是嵌套链：
+
+```
+invoke_agent code-fixer  [INTERNAL]
+  ├─ chat claude-x       [CLIENT]
+  ├─ execute_tool read   [INTERNAL]
+  ├─ chat claude-x       [CLIENT]
+```
+
+跨轮次的关联靠 `gen_ai.conversation.id`，**不靠父子关系**。
+
+仓库里没有 `examples-agents.md`（404）。agent span 那篇文档只有定义，没有一条完整的示例 trace。**你的 agent trace 长什么形状是你自己的决定，而这份约定不会替你裁决。**
+
+两个必须做对的细节：
+
+1. **五个 sampling-relevant 属性必须在 span 创建时就存在**：`gen_ai.operation.name`、`gen_ai.provider.name`、`gen_ai.request.model`、`server.address`、`server.port`。等到 span 结束前再补，tail 采样器看不到它们，而你的采样策略会**静默地不再区分任何东西**。注意这个列表里**没有** token 数和成本——你没法用规范属性按成本采样。
+
+2. v1.41.0 把 `invoke_agent` 拆成了 client 和 internal 两种 span，而 internal 那种**故意不带 token usage 属性**。这对 token 会计是好消息：进程内 agent（LangChain、CrewAI）的 token 只挂在子推理 span 上，所以按 span 求和不再重复计算。
+</Note>
+
+---
+
+## 九、你复现的不是计算，是一份录音
+
+现在讲复现。先破掉两个直觉。
+
+**第一个：temperature 0 不是确定性的，而通常给的解释是错的。**
+
+那个解释是"并发 + 浮点非结合律"：并行线程完成顺序不定，浮点加法不满足结合律，误差滚雪球。Thinking Machines 的 *Defeating Nondeterminism in LLM Inference* 把它拆掉了：
+
+1. 浮点非结合律是真的。他们的玩具例子：固定数组按 10000 种随机顺序求和，得到 **102 个不同结果**。
+2. 但那种顺序不确定性需要类似 atomic add 的东西，而 **"the forward pass of an LLM involves no operations that require atomic adds"**。
+3. 所以 `torch.mm(A, B)` 跑 1000 次是**逐位相同**的，LLM 的前向传播是 run-to-run 确定的。
+
+真正的原因是**缺少批不变性**（batch invariance）。kernel 的逐元素数值会随 batch size 和序列分块方式变化。而 batch size 由**服务器负载**决定。
+
+<Key>
+从你的角度看，**其他并发用户不是这个系统的输入，而是它的一个不确定属性**。
+
+论文原话：*"The primary reason nearly all LLM inference endpoints are nondeterministic is that the load (and thus batch-size) nondeterministically varies!"*
+
+四句话同时为真，这是理解它的最好框架：
+
+1. GPU 上有些 kernel 是不确定的。
+2. 然而语言模型前向传播用到的所有 kernel 都是确定的。
+3. 而且像 vLLM 这样的推理服务的前向传播也可以说是确定的。
+4. 但从任何使用这个推理服务的人的角度看，结果是不确定的。
+</Key>
+
+它**不是 GPU 问题**——论文明确说了，"LLM inference endpoints served from CPUs or TPUs will also have this source of nondeterminism"。
+
+实测数据值得记住，因为它给了你一个量级感。模型 `Qwen3-235B-A22B-Instruct-2507`，temperature 0，prompt "Tell me about Richard Feynman"，**1000 次采样 × 1000 token**：
+
+- **80 个不同的完成**，最常见的那个出现 78 次
+- 前 **102 个 token 完全相同**，第一次分叉在**第 103 个 token**
+- 所有完成都产出 "Feynman was born on May 11, 1918, in"，然后 **992** 个接 "Queens, New York"，**8** 个接 "New York City"
+- 开启批不变 kernel 后：**1000 个全部相同**
+
+<Note title="这件事在 2026 年已经落地了">
+这件事在 2026 年已经落地了。vLLM 里是一个 beta 特性：
+
+```bash
+VLLM_BATCH_INVARIANT=1 vllm serve meta-llama/Llama-3.1-8B-Instruct
+```
+
+代价是实测的：单卡 Qwen3-8B、1000 条序列，vLLM 默认 **26 秒**，未优化的确定性版本 **55 秒**（2.1x），改进 attention kernel 后 **42 秒**（1.6x）。
+
+而实现已经演化过了，这个细节挺有意思：在 **Hopper（SM90）和 Blackwell（SM100）** 上，"the only source of batch variance is split-k"，靠两个环境变量（`CUBLAS_WORKSPACE_CONFIG=":16:8"`、`CUBLASLT_WORKSPACE_SIZE="1"`）就能关掉，**完全不需要自定义 matmul kernel**。SM80（Ampere）上才需要 Triton 覆盖。
+
+所以"怎么拿到确定性"的答案现在是**依架构而定**的，在最新硬件上就是两个环境变量。
+
+还有一句值得引用的脚注：批不变**不等于可移植**——"your GPU/PyTorch version may return a different value, but it should deterministically return the same value"。逐位可复现的作用域是一套硬件加一个框架版本。
+</Note>
+
+**第二个直觉：那"设个 seed"呢？**
+
+OpenAI 的文档措辞很谨慎：系统会"make a **best effort** to sample deterministically"，而"**Determinism is not guaranteed**"，你应该看 `system_fingerprint` 来监控后端变化。
+
+<Pitfall title="`seed` 在 Responses API 里不存在">
+而 Responses 正是 OpenAI Agents SDK 的底座。
+
+`openai-node` issue #1613（"Missing seed parameter in responses"，2025-08-14 开，**至今 open**）在 2026-07-06 被一个 OpenAI 官方账号打上了 `upstream` 标签。那个标签就是答案：这不是 SDK 的缺口，是 API 的缺口。
+
+所以在 2026 年的 OpenAI 上，你必须在**现代 agent 原生 API** 和**本来就很弱的那个可复现原语**之间选一个。两个不能都要。
+</Pitfall>
+
+顺带纠正一个常见的理解反了的地方：`system_fingerprint` **不保证**两个指纹相同的请求产出相同输出。它保证的是**指纹不同你就该预期漂移**。它是一个**漂移检测信号，不是确定性契约**。
+
+Azure 的文档比 OpenAI 自己的更实在：
+
+> "Even in cases where the seed parameter and `system_fingerprint` are the same across API calls it's currently **not uncommon to still observe a degree of variability** in responses. Identical API calls with larger `max_tokens` values will generally result in **less deterministic** responses."
+
+最后那句和上面的"第 103 个 token 分叉"是同一件事的两个独立证据——一份厂商文档和一份 kernel 级分析互相印证。
+
+### 所以"确定性重放"到底是什么
+
+**模型的输出没法重放。** 所有声称 "deterministic replay for agents" 的工具做的事情都是**把模型输出缓存下来当成 oracle 再发一遍**，不是重新执行模型。
+
+你重放的是一份**录音**，不是一次**计算**。
+
+这不是吹毛求疵——它决定了这个工具能回答什么问题：
+
+| 问题 | 能答吗 |
+|---|---|
+| 当时到底发生了什么 | 能，但 trace 也能告诉你 |
+| 换个模型会怎样 | **不能**，那是两个不同的 prompt（见下） |
+| 如果当时那个工具返回的是别的，后面会怎样 | **能，而且只有 hybrid 模式能** |
+
+而最后那个才是事故当下你真正想问的问题。**hybrid 模式**——重放录音直到第一次分叉，然后转真实调用——是这个领域里最值得学的一个设计。纯重放只能告诉你已经发生过的事。
+
+### 六件会让重放失效的事，每一件都不抛异常
+
+1. **内容没录。** OTel 的四个内容属性（`gen_ai.system_instructions`、`gen_ai.input.messages`、`gen_ai.output.messages` 等）全是 `opt_in`，**默认不发**。一个完全"合规"的埋点产出的 trace，在你主动打开内容采集之前**对重放毫无用处**。
+
+2. **请求 id 没录。** SDK 每次生成新的，**第一次调用就分叉**。
+
+3. **并发。** 真正并发的调用是按**完成顺序**录的。而每个现代 agent 都在做并行工具调用——这是 cassette 式重放的实际天花板。
+
+4. **`previous_response_id` 根本没法重放。** 用它做会话状态时，之前的上下文存在**提供方的服务端**。你的 trace 记录的是一个指向你不拥有、而且会过期的状态的**指针**。没有东西可以重放。
+
+5. **推理内容能重放但读不了。** 无状态模式（`store: false`，或任何开了零数据保留的组织）下，reasoning item 带一个 `encrypted_content`，你可以传给后续调用，模型能用，**你的调试器看不进去**。你为它付钱、它塑造了整条轨迹、而它不可见。
+
+6. **换个模型重放会静默改掉 prompt。** Anthropic 的文档写得很直白：在较早的 Opus/Sonnet 和所有 Haiku 模型上，"all previously-cached thinking blocks are **stripped from context**"。而它甚至点名提到了重放这个场景：*"for example, one you replay to an earlier model"*。
+
+<Key>
+第 6 条的后果值得单独说：任何"换个模型跑一遍录音来比成本"的功能，**比的是两个不同的 prompt**。
+
+不是你的重放有 bug，是提供方按模型做了不同的裁剪。
+</Key>
+
+---
+
+## 十、归因：最好的模型只有 11%
+
+最后一块：拿到一条 trace，怎么知道哪里坏了。
+
+一个自然的想法是把 trace 丢给一个大模型让它告诉你。**TRAIL** 这个基准（arXiv 2505.08638）正好测了这件事：
+
+- **148 条 trace**（118 条来自 GAIA 的开放搜索任务，30 条来自 SWE-Bench Lite）
+- **1987 个 OpenTelemetry span**，其中 575 个至少含一个错误
+- **841 条标注错误**，平均每条 trace 5.68 条
+- **每条 trace 约 110 分钟的专家标注时间**——这是认真做这件事的人力成本
+
+结果：
+
+| 模型 | GAIA 联合准确率 | SWE-Bench 联合准确率 |
+|---|---|---|
+| Gemini-2.5-Pro-Preview | **0.183** | **0.050** |
+| Gemini-2.5-Flash | 0.100 | 0.000 |
+| OpenAI o3 | 0.092 | 上下文超限 |
+| Claude-3.7-Sonnet | 0.047 | 上下文超限 |
+| GPT-4.1 | 0.028 | 0.000 |
+| OpenAI o1 | 0.013 | 上下文超限 |
+
+到处被引用的"11%"是两个 split 的平均。真实数字是 **GAIA 18.3% 和 SWE-Bench 5.0%**，引用的时候两个都该说。
+
+**8 个模型里 3 个直接上下文超限。** 而长度统计解释了为什么：GAIA 那一份在 Claude-3.7 的 tokenizer 下**平均**长度就是 262.67K，超过它 200K 的窗口。最大值总是上限的两倍以上。
+
+而分项比总分更说明问题：
+
+<Key>
+- **Context Handling Failures：几乎所有模型 F1 = 0.00**（只有 Claude-3.7 拿到 0.18）
+- Task Orchestration：除 Gemini-2.5-Flash 的 0.47，其余全在 0.00–0.08
+- 而 Language-Only 幻觉所有模型都测得不错（0.14–0.59）
+
+**agent 独有的那些失败，恰恰是 LLM judge 看不见的。**
+</Key>
+
+这个结论很具体：**"用 judge 查幻觉"可行，"用 judge 定位 agent 故障"不可行。**
+
+所以分类学的取舍是——**能被程序判定的分类，才值得进你的分类学**，判不了的部分明确交给人，而不是假装 judge 能处理。
+
+MAST（arXiv 2503.13657）给了 14 个失败模式分 3 大类，其中最高频的几个恰好都能用 trace 结构判定：
+
+| 编号 | 失败模式 | 占比（v3） | 怎么用 trace 判 |
+|---|---|---|---|
+| FM-1.3 | 步骤重复 | **15.7%** | 同一个工具被调用超过阈值次 |
+| FM-2.6 | 推理与行动不一致 | 13.2% | 需要人 |
+| FM-1.5 | 不知道终止条件 | 12.4% | 轮数超阈值且未结束 |
+| FM-1.1 | 违背任务规格 | 11.8% | 部分可判 |
+| FM-3.3 | 验证错误 | 9.1% | 需要人 |
+| FM-3.1 | 过早终止 | 6.2% | 一轮结束且无工具调用 |
+
+<Pitfall title="引用这些数字之前先看版本号">
+那组到处被引用的 **41.77% / 36.94% / 21.30%** 来自论文 **v2**，已经不匹配当前版本。
+
+v3 的对应数字是 ≈44.2% / ≈32.35% / ≈23.5%，而且第一大类的名字从 **Specification Issues** 改成了 **System Design Issues**。样本量也从"7 个框架、200+ 任务"变成了"5 个框架、150+ trace"。
+
+单项里 FM-2.5 从 0.17% 变成 1.90%——**差 11 倍**。
+
+这件事本身就是这一节的主题：一个数字看起来很权威，而它的来源在动。
+</Pitfall>
+
+MAST 有三个结论比那张分类表本身更有用：
+
+1. **设计比模型重要。** 只改进 agent 的角色说明，ChatDev 的成功率 **+9.4%**——同样的用户 prompt、同样的 GPT-4o。论文的话：MAS 的失败"不只是底层模型能力的函数"。
+2. **验证器有用但不是银弹。** 有显式验证器的系统失败更少，"however, the presence of a verifier is not a silver bullet"。他们的例子：一个 ChatDev 生成的国际象棋程序通过了所有验证轮次（能编译、有注释），而它在运行时接受非法走法——**验证器从来没有对着棋规校验过**。
+3. **失败画像是架构特有的。** AppWorld 偏向过早终止（星形拓扑、没有预定义流程，于是终止条件不明显），OpenManus 偏向步骤重复。所以通用修法不管用。
+
+还有一个诊断上的细节值得记：**相似的表面行为有不同的根因。** "信息缺失"可能来自主动隐瞒（FM-2.4）、忽略了别的 agent 的输入（FM-2.5）、或者上下文管理不当（FM-1.4）。这正是要做细粒度 trace 归因、而不是打粗标签的理由。
+
+<Note title="MAST 和 TRAIL 给出的图景不一致，而这有价值">
+MAST 和 TRAIL 对失败的形状**给出了不一致的图景**，而这个不一致本身是有价值的，不是问题。
+
+MAST 报告三大类大致均衡，并把这读成分类覆盖良好的证据。TRAIL 报告 **42% 集中在格式错误和指令不遵循**（353/841），而系统执行错误很罕见。
+
+它们**不可比**：不同的分类学、不同的 agent 群体（MAST 是 5–7 个多 agent 框架跑 ProgramDev/GSM/MMLU；TRAIL 是一个深度研究 agent 加 SWE-Bench）、不同的计量单位（MAST 按 trace 标失败；TRAIL 按 span 标错误）。
+
+把它们当成两个互补的镜头，并且记住：**两个都不是你自己系统的总体估计。**
+</Note>
+
+---
+
+## 十一、把它接成一份复盘报告
+
+L12 的五道闸门有一个刻意的顺序：**先判评测可不可信，再看分数**。因为一旦你先看了分数，你就有了立场。
+
+复盘报告用同一个顺序，理由更强——这一节讲的每一个失效都在攻击"这份 trace 是完整的"这个假设。
+
+```
+失败复盘：conv-8821
+  31 轮 / 244 秒 / 25 个 span / 结果：失败
+
+① 这份 trace 可不可信
+  ✗ 不可信。下面的结论全部建立在一份可能不完整的记录上
+    · 埋点处在双发过渡期（2 对新旧键）
+    ★ 32 次运行拿到了两个互相矛盾的采样决策（sampled_cache_size 默认 0）
+    ★ 这次运行跑了 244 秒，而 decision_wait 是 30 秒
+    · trace 体积 676 KB，去重后只有 44 KB（15.4x 冗余）
+
+② 能重放吗
+  ✗ 不能：内容属性是 opt_in、默认不发
+
+③ 程序判出的失败模式
+  FM-1.3 步骤重复 —— 工具「search」被调用 8 次
+  FM-1.5 不知道终止条件 —— 跑了 31 轮仍未结束
+  FM-1.4 上下文被压缩过
+
+④ 成本
+  从 span 算    $0.9648
+  从 metric 算  $4.7808   偏差 +396%
+
+⑤ 交给人的部分
+  · 压缩本身是否导致了失败，程序判不了
+  ★ loop 长度分布来自 Histogram，不依赖任何一条 trace——
+    所以它是上面那些采样缺陷唯一影响不到的数字
+```
+
+第 ⑤ 段的存在本身就是一个主张：**不要假装程序能判完。** TRAIL 的最好成绩是 18.3%，而你的规则库比那个还窄。
+
+有一个特殊情况必须明确处理：**运行失败了，但一条规则都没命中。** 这**不是**"没有失败模式"，是你的分类学还没覆盖这一种。把它报成"分类学缺口"，而不是静默通过。
+
+<Pitfall title="`compacted` 字段缺失意味着「不知道」，不是「没压缩」">
+`gen_ai.conversation.compacted` 有一条容易忽略的规定：它是一个**只表示肯定**的指标。规范写的是埋点 "SHOULD NOT set it to `false`；SHOULD leave it unset otherwise"。
+
+于是一个写成 `compacted != true` 的看板过滤器会把所有**未埋点**的运行也算成"没压缩"。
+
+而上下文压缩是 agent 失败的一个主要原因，也正是 TRAIL 里所有模型 F1 = 0.00 的那一类。把"未知"写成"没有"，你会在错的地方找问题。
+</Pitfall>
+
+---
+
+## 十二、这一节的十条
+
+1. **你以为在建一份记录，其实在建三份互相冲突的东西。** 监控要便宜、调试要完整、复现要确定，而它们没有一个能靠另外两个的配置得到。
+2. **GenAI 约定已经搬出 semconv 仓库，而新仓库一个 tag 都没有。** 你没有版本号可以钉，而改名的症状是看板查到 0 条——和"系统很安静"长得一样。
+3. **双发期的两个键各自都对，加起来错一倍。** 按优先级取一个，绝不相加。
+4. **Anthropic 和 OpenAI 的 `input_tokens` 语义相反。** 照字段名映射在 Anthropic 上少算 2001 倍，而在 OpenAI 上完全正确。
+5. **"用 metrics 建成本看板"办不到**，因为 `gen_ai.token.type` 只有 `input` 和 `output`。0.1x 到 2x 全塌进一个桶。metrics 看量和延迟，成本从 span 算。
+6. **trace 是 k(k+1)/2 增长的。** 长度翻倍，存储翻四倍，其中 98% 是重复字节。修法是内容寻址，而哈希前必须规范化 JSON。
+7. **4 MiB 是不可重试的，而 batch processor 按条数分批。** 一个胖 span 拖垮整批，连带无关的 span。`AttributeValueLengthLimit` 默认是 Infinity，SDK 不会救你。
+8. **head 采样保留 10% 的失败**——因为决定是在运行开始前做的。而 tail 采样的 `decision_wait` 默认 30 秒，agent 跑几分钟。一条瞄准失败的策略可以一条都留不下。
+9. **loop 长度用 Histogram 报警，不需要 trace。** 这是所有采样缺陷唯一影响不到的数字。
+10. **归因的天花板是 18.3%，而 agent 独有的失败是 0.00。** 所以只把程序能判的放进分类学，剩下的明确交给人。
+
+<Lab
+  title="L13 实操：可观测性工具箱"
+  cmds={[
+    'cd labs && pnpm trace',
+    'cd labs && OBS_IMPL=shared pnpm trace',
+    'cd labs && pnpm verify:l13',
+    'cd labs && pnpm postmortem',
+  ]}
+>
+八个 TODO，覆盖这一节讲的每个失效。全部纯计算，一次 API 都不调——因为这些失效都发生在你调用模型之前或之后，不在调用里面。
+
+| TODO | 做什么 | 核心陷阱 |
+|---|---|---|
+| 1 | 属性名去重 | 双发把花费翻一倍，而两个数字各自都对 |
+| 2 | token 会计 | ★ 同一个字段名，两家相反的语义 |
+| 3 | 成本 | 为什么 metric 维度不够 |
+| 4 | 二次方增长 | ★ 哈希前必须规范化 JSON |
+| 5 | 按字节分批 | ★ 4 MiB 不可重试，且专杀最有价值的 trace |
+| 6 | 采样 | ★ 一次运行两个矛盾决策 |
+| 7 | span 形状与求和 | sampling-relevant 属性必须在创建时就有 |
+| 8 | 复现与归因 | ★ hybrid 模式；分类学只收程序能判的 |
+
+先跑 `OBS_IMPL=shared pnpm trace` 看参考实现的输出，再回来填自己的。`pnpm verify:l13` 有 76 条测试，带 ★ 的每一条对应一种"trace 看起来完整但不是"。
+
+最后 `pnpm postmortem` 把这些零件接成一份完整的复盘报告——它在现场不可信的时候**退出码为 1**。
+</Lab>
+
+<PyMirror cmds={['cd labs && OBS_IMPL=shared uv run l13/trace.py', 'cd labs && uv run python -m l13.verify', 'cd labs && uv run l13/postmortem.py']}>
+两边的输出是逐字节对齐的（除了内部哈希值，因为 JS 哈希 UTF-16 码元而 Python 哈希 UTF-8 字节）。
+
+而 Python 侧是这一节的**主场**，理由不是语言偏好：`opentelemetry-instrumentation-genai-openai`、`opentelemetry-sdk` 的采样器实现、collector 的配置生态，全部以 Python 和 Go 为一等公民。TypeScript 的 OTel 生态存在，但 GenAI 那部分的埋点包总是慢一两个版本——而这一节第一节讲了慢一个版本意味着什么。
+
+有一个跨语言的细节值得看一眼：trace 上下文在异步边界上的传播。TS 靠 `AsyncLocalStorage`，Python 靠 `contextvars`，而两个的陷阱不同——`asyncio.create_task` 拿到的是当前 context 的一个**副本**，所以在 task 内部设的 context var 不会传回外面。span 的父子关系就是这么断掉的，**而它不报错**：你会得到一堆没有父亲的孤儿 span，看起来就像一次"很简单"的运行。
+</PyMirror>
+
+<CursorHook>
+这一节的东西很适合让 agent 帮你做第一遍体检，因为它全是**读配置、对照规范**的活：
+
+> 读 `otel-collector.yaml` 和所有埋点初始化代码。逐项列出：（1）tail_sampling 的 decision_wait、num_traces、sampled_cache_size 各是多少，以及我们的 p99 agent 运行时长是多少；（2）batch processor 有没有字节上限；（3）用的 GenAI 属性名属于哪一代，有没有双发。只出这张对照表，不要改任何配置。
+
+最后半句和 L12 那个一样重要。这个任务的产出是一张表，而 agent 的默认倾向是顺手开始改 YAML——而改 collector 配置是能让你丢掉一整天遥测数据的操作。
+</CursorHook>
+
+---
+
+## 接下来
+
+到这里你有了测量（L12）和归因（L13）。而这两节都假设了一件事：**你的 agent 在做你让它做的事。**
+
+**L14 安全：Prompt 注入与权限沙箱**处理这个假设不成立的情况——当一段它读进来的文本变成了它的指令。而这一节的工具在那里会以一种不舒服的方式回来：一次成功的注入攻击，在 trace 里长得和一次正常运行**一模一样**。

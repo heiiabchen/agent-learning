@@ -1,0 +1,93 @@
+.sectionRail {
+  grid-area: rail;
+  /* 父级 align-items 是 start，格子会缩成导航自己的高度，
+     sticky 就没有可粘的范围，往下滚会整块离开视口。拉满这一列才粘得住。 */
+  align-self: stretch;
+}
+
+.sectionRailInner {
+  position: sticky;
+  top: 1.75rem;
+  padding-inline-start: 1.15rem;
+  border-inline-start: 1px solid var(--line);
+  max-height: calc(100vh - 3.5rem);
+  overflow-y: auto;
+  scrollbar-width: none;
+}
+
+.sectionRailInner::-webkit-scrollbar {
+  display: none;
+}
+
+.sectionRailInner .eyebrow {
+  display: block;
+  margin-block-end: 0.7rem;
+}
+
+.sectionRailInner ol {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  counter-reset: sec;
+}
+
+.sectionRailInner li {
+  counter-increment: sec;
+  position: relative;
+}
+
+.sectionRailInner li + li {
+  margin-block-start: 0.05rem;
+}
+
+.sectionRailInner a {
+  display: grid;
+  grid-template-columns: 1.45rem minmax(0, 1fr);
+  column-gap: 0.35rem;
+  align-items: baseline;
+  padding: 0.22rem 0;
+  font-family: var(--font-ui);
+  font-size: 0.78rem;
+  line-height: 1.45;
+  letter-spacing: -0.01em;
+  color: var(--muted);
+  text-decoration: none;
+  text-wrap: pretty;
+  transition: color 0.16s ease;
+}
+
+.sectionRailInner a::before {
+  content: counter(sec, decimal-leading-zero);
+  font-family: var(--font-ui);
+  font-size: 0.72rem;
+  line-height: 1.45;
+  font-variant-numeric: lining-nums tabular-nums;
+  font-feature-settings: 'tnum' 1;
+  letter-spacing: 0;
+  color: var(--faint);
+}
+
+.sectionRailInner a:hover {
+  color: var(--ink);
+}
+
+.sectionRailInner li[data-active='true'] a {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.sectionRailInner li[data-active='true']::after {
+  content: '';
+  position: absolute;
+  inset-block: 0.3rem;
+  inset-inline-start: calc(-1.15rem - 1px);
+  width: 2px;
+  border-radius: 2px;
+  background: var(--accent);
+}
+
+@media (max-width: 1240px) {
+  .sectionRail {
+    display: none;
+  }
+}

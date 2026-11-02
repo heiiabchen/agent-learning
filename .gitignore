@@ -1,0 +1,20 @@
+# 密钥：绝对不要提交。泄漏了先去平台吊销 key，再清历史。
+.env
+.env.local
+.env.*.local
+
+node_modules/
+dist/
+.DS_Store
+*.log
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# 早期版本的交卷落盘，机制已移除，残留文件本地留着就好
+progress/
+
+# L08 的会话日志与快照：跑 lab 时生成的，不该进仓库
+labs/*/.sessions/

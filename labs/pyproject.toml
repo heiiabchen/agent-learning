@@ -1,0 +1,59 @@
+[project]
+name = "agent-academy-labs-py"
+version = "0.1.0"
+description = "Agent 学院实操代码的 Python 通道。和 TypeScript 通道共用同一份 .env。"
+requires-python = ">=3.11"
+dependencies = [
+    # 1.x 是 2026 年初的大版本。别放宽到 >=0.x：0.x 和 1.x 的 API 不兼容，
+    # 解析器可能挑一个跑不起来的版本给你。
+    "anthropic>=1.0,<2",
+    "python-dotenv>=1.0",
+    # 只有 L05x（attention 与采样）用得到。装它的理由也是那一节的论点之一：
+    # 同一段向量运算，numpy 版比手写循环短一个数量级，而且意图可见。
+    "numpy>=2.0,<3",
+]
+
+# 这个仓库是一堆可执行的练习，不是要发布的库，所以不打包、不安装自己。
+# 代价是必须用 `python -m l00.hello` 这种模块路径来跑（cwd 会进 sys.path），
+# 不能 `python l00/hello.py`（那样 sys.path[0] 是 l00/，import shared 会失败）。
+[tool.uv]
+package = false
+
+[dependency-groups]
+dev = ["ruff>=0.9"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]
+
+[tool.ruff.lint.per-file-ignores]
+# 脚手架文件（lXX/ 下的直接子文件）里的 import 是留给你写 TODO 时用的，
+# 在你写完之前它们当然是「未使用」。solutions/ 下的不在这个豁免范围里。
+"l*/*.py" = ["F401"]
+# 观察夹具 / 骨架节点常为对照 TS 的长单行。
+"l09x/kb.py" = ["F401", "E501"]
+"l09x/verify.py" = ["F401", "E501"]
+"l10x/skills.py" = ["F401", "E501"]
+"l10x/verify.py" = ["F401", "E501"]
+"l14x/browse.py" = ["F401", "E501"]
+"l14x/verify.py" = ["F401", "E501"]
+"l16x/genui.py" = ["F401", "E501"]
+"l16x/verify.py" = ["F401", "E501"]
+"l16y/voice.py" = ["F401", "E501"]
+"l16y/verify.py" = ["F401", "E501"]
+"l18/bench.py" = ["F401", "E501"]
+"l18x/reward.py" = ["F401", "E501"]
+"l19/ops.py" = ["F401", "E501"]
+"l19/verify.py" = ["F401", "E501"]
+"l19x/ecosystem.py" = ["F401", "E501"]
+"l19x/verify.py" = ["F401", "E501"]
+"l21/map.py" = ["F401", "E501"]
+"l21/verify.py" = ["F401", "E501"]
+"shared/browse.py" = ["E501"]
+"shared/genui.py" = ["E501"]
+"shared/knowledge.py" = ["E501"]
+"shared/ops.py" = ["E501"]
+"shared/tsecosystem.py" = ["E501"]

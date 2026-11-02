@@ -1,0 +1,749 @@
+L13 结尾留了一句话：一次成功的注入攻击，在 trace 里长得和一次正常运行**一模一样**。
+
+这一节讲那件事。而它比"agent 会被骗"更难接受一点——
+
+不是你的 agent 有个 bug 会被人利用。是**你正在建的这个东西，它的基本形状就是这样的**：一个把指令和数据放在同一个通道里的系统，一个你没法在读完一段文本之后判断那段文本是不是指令的系统。
+
+<Key>
+**能读懂攻击的防御，全被绕过了；守住的那些，都是看不见攻击的。**
+
+所以这一节所有代码的纪律只有一条：**做授权判断的那段代码，绝不能读那段不可信的数据。**
+</Key>
+
+这句话听起来像个悖论——不看内容怎么判断危险？这一节大半的篇幅在回答这个问题，答案比你想的具体：你判的不是内容，是**参数的来源**。
+
+---
+
+## 一、先说一件让人不舒服的事：这节课的交付物刚刚被拿掉了
+
+课程大纲里 L14 的交付物写的是"沙箱与人工审批"。而在 2026 年，三家主要厂商刚刚把人工审批**从默认路径上移走了**：
+
+| 产品 | 变化 | 时间 |
+|---|---|---|
+| Cursor | 弃用 "Ask Every Time" | 3.5，2026-05-22 |
+| Cursor | Auto-review 成为推荐默认 | 3.6，2026-05-29 |
+| Claude Code | Pro/Max/Team 默认 `auto` 模式 | 2026 |
+| Codex | `approvals_reviewer = "auto_review"` | 2026 |
+
+Claude Code 的文档把这件事说得毫不含糊：**"a second model, the classifier, reviews actions instead of you."**
+
+如果你现在的反应是"所以人工审批被证明无效了"——不是。行业的结论是**人工审批不 scale**。这是两件完全不同的事，而混淆它们会让你做出错的架构。
+
+<Note title="被换掉的不是「审批」，是「人」">
+换掉之后剩下的东西反而更严格了。一个模型审批者有两条人做不到的性质：
+
+1. 你可以给它一份**写下来的**策略，并且这份策略不会被遗忘。
+2. 你可以强制它**失败时拒绝**。人做不到——人失败时是点"允许"然后去开会。
+
+所以这一节要建的不是弹框。是一个**策略决策点**（policy decision point），审批者是它的一个可替换零件：人、规则、模型都能插进去。
+</Note>
+
+这个视角一旦立起来，后面所有的东西都有位置了。
+
+---
+
+## 二、注入不是"越狱"
+
+先把两个经常被混在一起的词分开。
+
+**越狱**（jailbreak）：用户自己想绕过模型的限制。攻击者 = 用户。
+**注入**（prompt injection）：第三方通过 agent 读到的数据下指令。攻击者 ≠ 用户。
+
+<Note title="这个分法本身有争议，我选了一边，说一下为什么">
+两个权威来源在这件事上直接对立，你迟早会同时读到，所以现在就讲清楚。
+
+**Simon Willison**（"prompt injection" 这个词就是他造的），2025-06-16：
+
+> "A lot of people assume it refers to 'injecting prompts' into LLMs, with attackers directly tricking an LLM into doing something embarrassing. **I call those jailbreaking attacks and consider them to be a different issue than prompt injection.**"
+
+**OWASP Top 10 for LLM Applications 2026**，LLM01:2026：
+
+> "**Jailbreaking is the subset of prompt injection** where the attacker's goal is to make the model violate its safety protocols."
+
+一个说是两回事，一个说是包含关系。谁对？两个都对，因为他们在回答不同的问题。Willison 是这个词的来源，他分的是**威胁模型**；OWASP 是行业分类标准，它分的是**报告口径**——你以后在公司里填的安全表格大概率按 OWASP 的编号走。
+
+这一节用 Willison 的分法，因为我们要写代码：越狱和注入的攻击者不同、受害资产不同、防御手段完全不同，合成一类会让你写出错误的防御。但你去跟合规团队沟通的时候，记得他们用的是另一套。**这种地方的正确做法不是挑一个当真理，是知道有两套、说明你用哪套。**
+</Note>
+
+第二个才是这一节的主题，而它有个更精确的名字：**间接提示注入**（indirect prompt injection）。攻击者不跟你的 agent 说话——他往你的 agent 会读到的地方写东西。一个 GitHub issue、一份 PDF、一个网页、一条 commit message、一个 MCP 工具的描述。
+
+L02 里那句话现在要兑现了：模型对 system prompt 的**倾向**是统计上的偏好，不是代码级的强制。它没有一条硬边界把「这是我该听的」和「这是我在读的」分开，因为**这两样东西在它眼里是同一个 token 序列**。
+
+<Drill title="为什么这不是一个能靠训练解决的问题">
+OpenAI 的指令层级（instruction hierarchy）训练确实把这件事改善了不少。但注意它改善的是什么：模型**更倾向于**优先 system 消息。
+
+而"更倾向"和"不可能"之间的距离，就是攻击面的宽度。
+
+这里有一个反直觉的数据。AgentDojo 的 Table 3，同一个基准同一批攻击：
+
+| 模型 | 良性可用性 | 定向攻击成功率 |
+|---|---|---|
+| GPT-4o | 69.00% | **47.69%** |
+| GPT-3.5 Turbo | 33.86% | **8.43%** |
+| Command-R+ | 25.44% | **0.95%** |
+
+**更强的模型被打穿得更彻底。** 而原因不神秘：Command-R+ 的 ASR 低不是因为它抗注入，是因为它连正常任务都完不成——它同样也完不成攻击者交给它的任务。
+
+一个 2026 年的 272,000 次尝试的公开竞赛给出了同样形状的结论：ASR 从 0.5%（Claude Opus 4.5）到 8.5%（Gemini 2.5 Pro），而与模型能力的相关性被描述为 **"weak"**。
+
+所以你不能等一个更强的模型来解决这件事。能力和抗注入不在同一个轴上。
+</Drill>
+
+---
+
+## 三、那些数字：先学会怎么读，再学会怎么报
+
+在挑防御之前，你得能读懂防御的论文里那个数字。这一节大半的"常识"都是从误读一个数字开始的。
+
+### 分母是什么
+
+LLMail-Inject 竞赛最常被引用的数字是 **0.8%** 和 **0.3%**——听起来注入基本被解决了。
+
+那是**每次提交**的成功率。
+
+换成**每个队伍**：对四层防御全部叠在一起的配置，有 **16.6%** 的队伍打穿了。对 Prompt Shield 单独一层，**60% 的队伍**打穿了，中位数约 **89 次尝试**。
+
+| 防御 | 队伍成功率 |
+|---|---|
+| Prompt Shield | 0.600 |
+| Spotlight | 0.529 |
+| TaskTracker | 0.440 |
+| LLM Judge | 0.318 |
+| 四层全叠 | **0.166** |
+
+<Pitfall title="这两个分母对应两个完全不同的世界">
+"每次提交"回答的是：一个随机路人碰巧打穿的概率是多少。
+
+"每个对手"回答的是：一个**盯着你**、可以试 89 次的人打穿的概率是多少。
+
+你面对的是第二个。而 0.8% 和 16.6% 之间差了 20 倍。
+</Pitfall>
+
+### 快照有没有日期
+
+同一个 `claude-3-5-sonnet`：
+
+- `claude-3-5-sonnet-20240620` → ASR **33.86%**
+- `claude-3-5-sonnet-20241022` → ASR **1.11%**
+
+**30 倍。** 一篇不写日期后缀的论文，它的 ASR 数字不可比——不是不够严谨，是字面意义上不知道在说什么。
+
+### 攻击方会不会自适应
+
+这一条最重要。arXiv 2510.09023 拿 12 个已发表的防御做自适应攻击，结果是 **>90% ASR**，而论文的原话是：
+
+> "the majority of defenses originally reported near-zero attack success rates."
+
+近乎零 → 九成以上。差别只在攻击者知不知道防御的存在。
+
+**所以静态基准上的低 ASR 不构成一个安全性质。** OWASP 2026 现在明确要求拒绝只有静态评测的声明。
+
+<Key>
+一个 ASR 数字要可比，六项缺一不可：分母是每个对手、攻击方自适应、模型快照带日期、基准带版本号、**以及同时报出良性可用性**。
+</Key>
+
+最后那一项是下一节的主题。
+
+### 顺手说一个反直觉的：注入其实不是最高频的漏洞
+
+这一节讲怎么读数字，那就把这一节自己引用的权威也读一遍。
+
+OWASP 2026 做了一件很诚实的事：他们收集了 **7,714 个真实事件**，其中 **6,639 个**信息足够完整能被分类，然后按 **社区投票 3/4 + 事件数据 1/4** 加权排名。项目负责人在卷首信里写：
+
+> "Prompt injection is the clearest case. Practitioners rank it the number one risk. **Rank the categories by the raw incident record instead, and it falls out of the top 10 entirely.** That gap is a defense effect."
+
+按真实事件数量排，提示注入**掉出前十**。它排第一是投票投上去的。
+
+这不是说 OWASP 排错了——恰恰相反，他们给的解释（"that gap is a defense effect"：事件少是因为大家在防它，以及很多注入事件根本没被识别出来上报）是合理的。真正的问题是**你引用它的时候说了什么**。
+
+"提示注入是最常见的 LLM 漏洞"——这句话，按 OWASP 自己的语料库，是假的。
+"提示注入是从业者判断攻击面最大的风险"——这句话是真的，而且是个更有力的说法，因为它经得起追问。
+
+<Note title="为什么要在一节讲安全的课里花篇幅纠一句话">
+因为你要用这些数字去说服人给你排期。一个被追问一次就塌的论据，比没有论据更糟——它会让对方顺带怀疑你后面所有的数字。
+
+顺带一个同方向的提醒：**AgentDojo 没有排行榜。** 官方结果页上写着 "this is not a leaderboard because we did not attack all models with all attacks and defenses"，而且最新一行是 `claude-3-7-sonnet-20250219`，日期停在 2025-02-24——上面没有任何 2026 年的前沿模型。任何声称引用"当前 AgentDojo 排行榜"的东西，引的是一个不存在的页面。
+</Note>
+
+---
+
+## 四、in-band 防御的记录
+
+"in-band" 指的是：防御机制去读那段不可信的数据，然后判断它是不是攻击。
+
+AgentDojo 官方结果页上 `gpt-4o-2024-05-13` / `important_instructions` 那几行，是这个领域最好的一张表：
+
+| 防御 | 良性可用性 | 定向 ASR |
+|---|---|---|
+| 无 | 69.07% | 47.69% |
+| 分隔符（spotlighting） | 72.16% | **41.65%** |
+| 把用户 prompt 再重复一遍 | 84.54% | 27.82% |
+| 工具过滤 | 72.16% | 6.84% |
+| **注入分类器** | **41.24%** | 7.95% |
+
+两行值得停下来。
+
+**分隔符那一行**：47.69% → 41.65%。降了 6 个百分点，全表最弱——比"把用户的 prompt 在最后再重复一遍"这种土办法（27.82%）还差得多。而分隔符是所有人第一个想到、并且写进无数篇最佳实践的东西。
+
+**分类器那一行**：ASR 压到 7.95%，看起来很成功。同一行里，良性可用性从 69.07% 掉到 **41.24%**。论文作者自己的话：
+
+> "The prompt injection detector has too many false positives, however, and significantly degrades utility."
+
+掉 27.8 个百分点，相对损失 40%。
+
+<Key>
+那不是一个防御。那是决定发布一个更差的产品。
+</Key>
+
+### 而它们全都不是安全性质
+
+微软自己的注入分类器 XPIA，被 EchoLeak（CVE-2025-32711，微软自己给了 CVSS 9.3）绕过的方式是：**用第一人称写，从不提"Copilot"或"AI"**。
+
+分类器学会的是"攻击长什么样"。那是一个**分布**，不是一条边界。而攻击者可以走出这个分布，成本是改写几句话。
+
+---
+
+## 五、唯一一个有效的分类器，和它有效的原因
+
+上一节说完 in-band 防御的记录之后，这里有个例外，而它是整节课的支点。
+
+Claude Code 的审批分类器**是有效的**。它的文档说了为什么：
+
+> **"Tool results are stripped, so hostile content in a file or web page can't manipulate it directly."**
+
+它有效，恰恰是因为它**看不见那段不可信的数据**。
+
+<Key>
+这不是一个巧合，是这一节唯一的架构原则：做授权判断的那段代码，绝不能读那段不可信的数据。
+</Key>
+
+再读一遍第四节那些失败的防御，它们全都违反了这一条：分隔符要读数据才知道边界在哪、分类器要读数据才能分类、LLM Judge 要读数据才能判。它们把「判断者」放进了攻击者能写的那个通道里。
+
+于是攻击者的第一个目标不再是你的 agent，是**你的审批者**。
+
+<Pitfall title="这条纪律有一个很难受的推论">
+你的审批者看不见工具结果，意味着它**没法告诉你为什么这个动作是危险的**。
+
+它只能告诉你：这个参数来自一个不可信的地方。
+
+如果你觉得这个信息量太少，那正是问题所在——任何比这更多的信息，都是从攻击者写的那段文本里读来的。
+</Pitfall>
+
+---
+
+## 六、参数才是攻击面
+
+现在来讲那个"判来源不判内容"具体怎么落地。这是这一节最重要的一段，也是整个 lab 的重心。
+
+L04 里立过的规矩现在要兑现：**把工具参数当成 HTTP 请求体来对待。** 那节课说的是路径穿越，这节课说的是同一件事的一般形式。
+
+CaMeL 论文的 §3.1 把它说透了：
+
+> "being able to **change the arguments to the tool calls** ... while the control flow is protected by the Dual LLM pattern, the data flow can still be manipulated... **This is analogous to an SQL injection attack in which an adversary manipulates the query parameters rather than the structure of the query itself.**"
+
+PACT 那篇（arXiv 2605.11039）给了更短的版本：注入变危险，
+
+> 不是在不可信内容进入上下文时，而是在它**决定了一个承载权限的参数**时。
+
+### 一个真实事故，用来说明"按工具名授权"为什么不够
+
+2025 年 GitHub MCP 的那次事故（Invariant Labs），攻击链是三步：
+
+1. `read_issue` —— 读一个公开仓库的 issue，正文里有注入
+2. `read_file` —— 读私有仓库的文件
+3. `post_comment` —— 把内容发到攻击者能看到的地方
+
+**这三个工具都在用户的授权白名单上。** 每一步单独看都是合法的，每一步在 trace 里都是绿的。按工具名做的授权检查，从头到尾一次都没有触发。
+
+现在换一个视角：不看工具，看**每个参数的来源**。
+
+| 步骤 | 参数 | 角色 | 来源 | 判定 |
+|---|---|---|---|---|
+| 1 | `repo` | destination | user | 放行 |
+| 2 | `path` | destination | **第 1 步的返回值** | **拒绝** |
+| 3 | `repo` | destination | **第 1 步的返回值** | **拒绝** |
+| 3 | `body` | payload | 第 1、2 步的返回值 | 放行 |
+
+第 2 步就断了。而注意最后一行——`body` 也来自不可信数据，而它**放行**。
+
+<Key>
+`post_comment` 的 `body` 天生就该是不可信数据：把 issue 正文摘要发出去正是这个工具的用途。而 `repo` 被不可信数据决定，就是那次事故。
+
+**同一次调用，同一个"污染"，一个放一个拦。区别在参数的角色。**
+</Key>
+
+这就是为什么分类器要付 27.8 个百分点：它把这两件事当成了一件事。而按参数角色授权，可以在拦住攻击的同时**不动**那个正常调用。
+
+### 四种参数角色
+
+| 角色 | 它决定什么 | 接受不可信来源？ |
+|---|---|---|
+| `destination` | 动作作用在哪儿 | **不** |
+| `payload` | 传输的内容 | 可以 |
+| `selector` | 在已定范围内选哪一个 | 可以 |
+| `literal` | 一个数值/常量 | 看情况 |
+
+再加一条默认规则，它挡住的东西比看起来多：**契约里没写的参数一律拒绝。**
+
+<Drill title="这条默认规则挡住的是 rug pull">
+一个 MCP server 在你批准之后给 `post_comment` 的 schema 加一个 `bcc` 字段。
+
+这个字段的值可能完全来自可信来源——是你的 agent 老老实实按新 schema 填的。来源检查通不过它，因为来源没问题。
+
+拦住它的是"我的契约里没有这个参数"。**默认拒绝不是防御纵深的一层，它是唯一能挡住"你没预料到的参数"的那一层。**
+</Drill>
+
+### "可信"不是一个档位
+
+有一格容易写错。`send_money` 的收款人参数，正确的契约是**只接受 `user`**——连 `config` 都不行。
+
+因为这个参数要的不是"来源可信"，是「**这一笔是这个人此刻要求的**」。一份可信的配置文件也不能替他做这个决定。
+
+这也是 CaMeL 在 banking 域拒绝率最高的原因。这个代价是设计出来的，不是 bug。
+
+<PyMirror>
+两边的形状完全一样，`Tainted` 是一个带依赖图的包装：
+
+```python
+@dataclass(frozen=True)
+class Tainted(Generic[T]):
+    id: str
+    value: T
+    deps: tuple[str, ...]
+    own: Provenance | None = None
+```
+
+Python 侧没有类型系统帮你，所以 `combine()` 漏写一个上游参数**不会有任何提示**。这一点在 lab 的 TODO 1 里有一个专门的测试。
+</PyMirror>
+
+---
+
+## 七、通道：只有"移除"有记录
+
+参数授权挡住的是「动作被劫持」。但还有一半：数据已经在上下文里了，它怎么出去。
+
+这里有一张表，它本身就是这一节的论据。每一行都是一个真实的、有 CVE 的事故：
+
+| 控制手段 | 厂商 | 结果 | 怎么破的 |
+|---|---|---|---|
+| 重写外链 | M365 Copilot | **被绕过** | 参考式 markdown `[t][ref]` 没被覆盖 |
+| CSP `img-src` 白名单 | M365 Copilot | **被绕过** | `*.teams.microsoft.com` 上有个开放代理 |
+| CSP 白名单 | Salesforce Agentforce | **被绕过** | 白名单里的域名过期了，5 美元重新注册 |
+| **HMAC 签名**的图片代理 | GitHub Copilot Chat | **被绕过** | 按字母表预先铸好一批合法签名 URL |
+| 注入分类器 XPIA | Microsoft | **被绕过** | 第一人称措辞 |
+| **整个关掉图片渲染** | GitHub Copilot Chat | **守住** | 通道没了 |
+| **服务端出站白名单** | Salesforce | **守住** | agent 完全被控也拦得住 |
+| **不带凭据浏览** | OpenAI Atlas | **守住** | 拿掉的是另一条腿 |
+
+CamoLeak（CVE-2025-59145，CVSS 9.6）那一行值得单独说。GitHub 的 Camo 代理是**带 HMAC 签名**的——一个正儿八经的密码学控制。攻击者的办法是：预先为字母表里每个字符各铸一个合法签名的 URL，然后一次请求泄一个字符。
+
+签名没被伪造。**签名机制被当成了一个字典用。**
+
+而 GitHub 最后的修法是：把图片渲染整个关掉。
+
+<Key>
+每一个"过滤"都被绕过了。每一个"移除"都守住了。
+
+而"移除"守住的原因和第五节是同一个：它不需要判断这一条请求是不是攻击。
+</Key>
+
+### 你的出口控制可能根本看不见那条通道
+
+比"过滤会被绕过"更糟的一类：过滤配置写在那儿，而执行点不在路径上。
+
+Codex 的文档自己列了清单——它的代理**不过滤**：web search、app/connector 工具调用、MCP server 连接、浏览器/Computer Use、云端任务。
+
+Check Point 在 2026 年记录了 ChatGPT 代码执行环境里一条静默的 DNS 通道。
+
+<Pitfall title="所以通道审计的顺序是有讲究的">
+先判「**看得见吗**」，再判「加了什么防护」。
+
+反过来写，一条你根本看不见的通道会被报告成"已过滤"。这一行是 lab 里 TODO 4 唯一的考点，而它不会报错——它只会让你的报告变绿。
+</Pitfall>
+
+---
+
+## 八、致命三要素，以及 Meta 把它改宽的那一条
+
+Simon Willison 的三要素（2025-06-16）：
+
+1. 能访问你的私有数据
+2. 接触到不可信内容
+3. 能对外通信
+
+三条同时成立 → 数据外泄是可达的。
+
+Meta 的 Agents Rule of Two（2025-10-31）把第三条**放宽**了：
+
+> [C] An agent can **change state** or communicate externally
+
+<Drill title="为什么这个差别对编码 agent 是关键的">
+`rm -rf`、`terraform destroy`、合并一个 PR——纯粹的完整性/可用性破坏，**零数据外流**。
+
+这些动作**触发 Rule of Two，但不触发字面意义上的三要素**。而它们恰好是编码 agent 每天在做的事。
+
+所以对你要建的东西，Meta 那个版本更贴。lab 里的 `trifecta()` 两个都报，因为它们在有些配置上会给出不同的答案——而那个差别本身就是信息。
+</Drill>
+
+三条里最多占两条。这不是一句口号，是一个可执行的检查：
+
+- 拿掉 [A] → 换个不带凭据的身份跑（OpenAI Atlas 的 logged out mode）
+- 拿掉 [B] → 不读不可信内容（很难，通常不可行）
+- 拿掉 [C] → 没有出站通道（GitHub 关掉图片渲染）
+
+哪一条最便宜，取决于你的产品。但**必须有一条被真的拿掉**——三条都在、靠中间那层"判断"顶着，就是第四节那张表。
+
+---
+
+## 九、沙箱：厂商自己说它不是边界
+
+L04 那个路径沙箱现在要继续了。
+
+先看厂商自己的定性。Claude Code 的文档，原文：
+
+> **"Sandboxing reduces risk but is not a complete isolation boundary."**
+
+AWS 关于容器的表述更直接：
+
+> **"AWS does not consider containers a security boundary."**
+
+2025 年 11 月的三个 runc 逃逸里，有**两个影响所有已知版本**。
+
+<Key>
+沙箱是一个减少影响面的措施，不是一条边界。把它当边界用，是这一节里最贵的一个误解。
+</Key>
+
+### 路径判定：最具体的规则赢
+
+这条语义必须写对，因为写错不会报错。Claude Code 的文档给了三行表：
+
+| 配置 | 结果 |
+|---|---|
+| `denyRead:["~/"]` + `allowRead:["~/projects"]` | 只有 `~/projects` 可读 |
+| `allowRead:["~/"]` + `denyRead:["~/.env"]` | `~/.env` 挡住，其余可读 |
+| `allowRead:["~/"]` + `denyRead:["~/**/.env"]` | 通配 deny 在更宽的 allow 里依然成立 |
+
+中间那一行的原话是：**"a broad allow can't silently re-expose a secret."**
+
+如果你写成"先看 allow 再看 deny"或者反过来，第二行就会错。而它不会抛异常——它只会让 `~/.env` 可读。
+
+### 那张被忘掉的清单
+
+沙箱配置对了，下面这些依然是通的。每一条都来自某个在售产品的文档：
+
+| 缺口 | 出处 |
+|---|---|
+| 环境变量默认被子进程继承 | Claude Code：**"no built-in credential deny list"** |
+| 沙箱只盖住 Bash 子进程，其它工具不在里面 | Claude Code |
+| domain fronting——代理不检查 TLS，只信客户端给的 hostname | Claude Code |
+| DNS 是一条独立的、静默的外发通道 | Check Point 2026 |
+| MCP / 连接器 / web search / 云端任务，代理一律看不见 | OpenAI Codex |
+| `.git/hooks`、shell 启动文件、agent 自己的配置目录 | 通用 |
+| 失败后允许不带沙箱重试 | 等于没有沙箱 |
+
+<Note title="一个具体的版本事实，免得你按旧文章配">
+Codex 在 Linux 上从 **0.115** 起用的是 **bwrap + seccomp**，不是 Landlock。网上大量教程写的还是 Landlock。
+</Note>
+
+### 同一页文档上还有一个更便宜的坑：白名单写了，但执行点没开
+
+上面整张表讲的都是"你的白名单能被绕过"。这一条讲的是另一种事：**你的白名单根本没接上。**
+
+Codex 官方文档，原文一句：
+
+> "Adding domain rules **does not enable** the [proxy]."
+
+完整真值表：
+
+| 网络 | 代理 | 实际效果 |
+|---|---|---|
+| 关 | 开 | 网络还是关的，这个开关什么也没做 |
+| 开 | **关** | **"network stays on with unrestricted direct"**——白名单一条不生效 |
+| 开 | 开 | 才真的受限 |
+
+第二行是默认组合。也就是说：你可以写一份语法完全正确、code review 能过、安全审计能过的域名白名单，而它一条都不拦。
+
+<Pitfall title="这个坑的危险之处在于它没有失败的样子">
+配错权限，你会看到一个报错。配了白名单但没开代理，你**什么都看不到**——请求正常发出、正常返回、日志干干净净，只是没走那个代理。
+
+这就是为什么 `SandboxSpec` 里有 `proxyEnabled` 这个看着多余的字段，而 `egressVerdict` 的第一件事是查它、不是查白名单：
+
+```ts
+if (!spec.proxyEnabled) {
+  return { allow: true, reason: '★ 代理没开：白名单一条都没生效' }
+}
+```
+
+顺序是有讲究的。把这个判断写在"命中白名单吗"之后，你会得到一个 `allow: false`——看起来完全合理，语义上完全错误。
+
+**一条写了但没生效的规则，比没写更糟：它让你以为你防住了。** 这也是为什么 `gate` 的第一节叫「不跑 agent 也能查的部分」——这类缺陷跑多少次 agent 都跑不出来，只能靠读配置。
+</Pitfall>
+
+---
+
+## 十、审批：一个策略决策点，五条不可谈判的性质
+
+回到第一节。审批不是弹框，是一个可插拔的决策点。三种审批者（人 / 规则 / 模型），五条性质：
+
+<Steps>
+<li>**审批者看不见工具结果。** Claude Code 把它们剥掉了。否则那次注入连你的审批者一起注入了。</li>
+<li>**任何失败都是拒绝。** Codex：*"Prompt-build, review-session, and parse failures fail closed."*</li>
+<li>**上面压一个熔断器**，任何规则、任何钩子、任何审批者都不能覆盖。</li>
+<li>**策略写在文件里**，不写在对话里。</li>
+<li>**参数解析不出实际目标就不批。**</li>
+</Steps>
+
+第 2 条上两家厂商**明确不一致**：Claude Code 的 subagent review 在检查本身失败时**放行**，只贴一句 `"unreviewed and should be treated as untrusted"`。
+
+<Pitfall title="那句警告要起作用，得有人读它">
+CHI 2018 的现场数据：Chrome 上 SSL 警告的遵从率是 **37.6%**。
+
+也就是说，一个 fail-open + 贴警告的设计，在现实里约等于放行。这一节选 fail closed。
+</Pitfall>
+
+### 第 4 条：策略住在哪儿
+
+Claude Code 的文档给了这一节最干净的一个 TOCTOU：
+
+> "Boundaries are not stored as rules. The classifier re-reads them from the transcript on each check, so **a boundary can be lost if context compaction removes the message that stated it**. For a hard guarantee, add a deny rule instead."
+
+你在对话里说的"别 push"，会随着上下文压缩消失。**策略本身住在一个会丢东西的缓冲区里。**
+
+### 第 5 条：两个方向
+
+Claude Code v2.1.205+ 的规则，原文说的是 `rm -rf "$VAR"` 里的 `$VAR`
+
+> "isn't assigned anywhere in the conversation the classifier sees. The value came only from earlier command output, which the classifier never receives, so the classifier can't verify the deletion target."
+
+注意这个理由：它拒绝的原因**正是第五节那条纪律**——分类器看不见工具输出，所以它没法确认删除目标，所以它拒绝。同一个设计选择，在这里表现为一次拒绝。
+
+而这条规则有两个方向，容易只写一个：
+
+```bash
+echo "$(rm -rf ~)"     # 方向一：替换藏了「动作」
+rm -rf `echo ~`        # 方向二：替换藏了「目标」
+```
+
+Claude Code 对方向一的措辞是：
+
+> "Hiding the removal inside command substitution with `$(...)` or backticks, or process substitution with `<(...)`, doesn't skip the check."
+
+所以熔断器必须**展开替换**再匹配。一个直接对整条命令跑正则的实现，看到的是一条 `echo`。
+
+<Drill title="风险分级的主轴是可逆性，副轴是参数来源">
+Codex 的四档处置是写死的：
+
+> "Low-risk and medium-risk actions can proceed when policy allows them. The policy **denies critical-risk** actions. **High-risk** actions require enough user authorization and no matching deny rule."
+
+OWASP LLM03:2026 给的例子最清楚：客服 agent 可以自动退成**店铺积分**（可恢复），而**对外付款**（不可逆）必须走人工。
+
+但只有可逆性这一个轴是不够的。看这两行：
+
+| 动作 | 不可逆 | 跨边界 | 参数受污染 | 风险 |
+|---|---|---|---|---|
+| 对外付款 | 是 | 是 | 否 | high |
+| 同一笔付款，收款人来自邮件 | 是 | 是 | **是** | **critical** |
+
+同一个工具、同一笔金额、同样不可逆同样跨边界。差的只有一个 bit：收款人是用户给的，还是邮件正文给的。
+
+而这一个 bit 把 high（**要授权**）翻成 critical（**一律拒绝**）。
+
+如果你把 `payout` 一律定成 critical，你就废掉了这个工具——那正是第四节那 27.8 个百分点。
+</Drill>
+
+还有一格：**关掉沙箱**这个动作不可逆和跨边界都是"否"，但它是 critical，因为它改的是监督机制本身。三家厂商在这一条上完全一致。
+
+而它必须在**熔断器**里，不能只在风险分级里——因为风险分级需要有人先把 `altersOversight` 标成 true，而 `--dangerously-skip-permissions` 是 agent 自己拼出来的一个字符串，没人会去标它。熔断器是唯一一个"谁都不能覆盖"的位置，所以它得自己认得出来。
+
+### 如果那个审批者是人：最好的现场数据和民间共识是反的
+
+前面说了 37.6% 的遵从率。那接下来的问题很自然：**人为什么不看？** 以及更实际的：**怎么让他看？**
+
+几乎所有人的答案都是"审批疲劳/习惯化"——弹得太多，麻木了。这个答案有一份 5,041 人的 Chrome 现场采样研究直接反驳（Reeder et al., CHI 2018）：
+
+> "**Habituation was not a major factor** in participants' decision making; in fact, a majority of our participants showed strong evidence of **not** being habituated to contemporary warnings."
+
+而且证据很硬：**50.6%** 的 Chrome 用户和 **64.1%** 的 Firefox 用户**行为不一致**——同一类警告，他们有时点过去、有时退回来。这是在逐次判断，不是麻木。同一份研究里，遵从率按警告类型差得很远：SSL **37.6%**、恶意软件 **76.9%**、钓鱼 **79.9%**。真正主导决策的因素，研究说的是**来源信誉**。
+
+这个反转对你有直接后果，因为它改变了该往哪儿花力气：
+
+| 做法 | 效果 | 出处 |
+|---|---|---|
+| 改文案 | **+1.2%** | Felt et al., CHI 2015 |
+| 改结构（把危险选项降级、安全选项升级） | 现场 **37% → 62%** | 同上，Chrome 36→37，共约 4,500 万次曝光 |
+| 抑制型注意力引导（临时禁用危险按钮，把注意力导到关键字段） | 做出知情决策的概率 **2–3 倍** | Bravo-Lillo et al., SOUPS 2013 |
+| 黄色背景替代灰色 | **−5 个百分点** | Felt et al., CHI 2015 |
+
+同一份 CHI 2015 研究里，光改文案挪动了 1.2 个百分点；改设计把现场遵从率从 37% 抬到 62%，几个月后在 2,650 万次曝光上仍然保持 61%。
+
+<Key>
+**别再改你的审批弹框文案了。** 把力气花在三件事上：把危险选项从默认位置挪走；在**唯一重要的那个字段**上放一个抑制型引导（目标主机、解析后的真实路径、收款人）；以及把**来源**显示出来——因为人真正在推理的就是这个。
+
+注意最后一条正好是你前面已经建好的东西：`Provenance` 链。你的审批界面上该显示的不是"agent 想执行一条命令"，是"**这个收款人来自一封邮件的正文**"。
+</Key>
+
+Bravo-Lillo 那个 2–3 倍尤其值得记，因为那个实验是**专门先把受试者习惯化之后**再测的——在一个刻意制造疲劳的环境里，结构性设计仍然有效。这进一步说明问题不在疲劳上。
+
+---
+
+## 十一、MCP：那个尾巴在这里收
+
+L10 留了两条尾巴。先说一件事，它比两条尾巴本身更能说明状况：
+
+<Key>
+MCP 官方的 Security Best Practices 文档**从头到尾没有提过一次** prompt injection、tool poisoning、rug pull 或 tool shadowing。
+
+它整篇讲的是 OAuth。
+</Key>
+
+也就是说，这一节讲的所有 MCP 攻击面，**协议方没有认领**。
+
+### rug pull：唯一一个有干净解法的
+
+server 在你**批准之后**改掉工具描述。88.6 天面板、19,099 个 server 的实测：
+
+- **8.6%** 改过工具的 `description`
+- **24.8%** 改过 `descriptor`（schema、参数、类型）
+
+第二个数字是第一个的三倍。**只哈希 description 的实现会漏掉大部分。**
+
+而"定期重扫高漂移的 server"这个策略，在 top-5% 预算下只覆盖到全部描述变更的约 **10%**，因为
+
+> "roughly half of all description changes land on **new arrivals** a history ranking cannot reach."
+
+新出现的 server 没有历史，漂移排名永远排不到它。
+
+论文自己给的对照组就是**内容绑定**：哈希 `[name, description, inputSchema]`，一动就重新征求同意。40 行代码，是这一节性价比最高的一项。
+
+<Note title="协议把这个窗口写进去了">
+MCP 2026-07-28 把 `ttlMs` 和 `cacheScope` 变成了 `tools/list` 的**必填**字段。
+
+也就是说协议现在正式承认客户端会拿着一份可能过期的工具描述做事。rug pull 的窗口是规范的一部分。
+
+同一版还弃用了 Roots、Sampling 和 Logging。
+</Note>
+
+### 别指望扫描器
+
+现成的 MCP 安全扫描器标出 **96.89%** 的 server「有风险」，而真正的阳性率**不到 50%**。
+
+一个把 97% 都标红、其中一半是错的信号，等于没有信号。
+
+---
+
+## 十二、报数：两个轴，缺一个就不算数
+
+这一节的最后一条纪律，也是最容易违反的。
+
+**只报 ASR 是错的。** 一个只测攻击的评估，可以用"什么都拦掉"拿满分。
+
+看这两行，它们的 ASR 都是 0：
+
+| 防御 | ASR | 良性可用性 | 相对基线 |
+|---|---|---|---|
+| 按参数授权（CaMeL 的形状） | 0% | 77% | **−7 pp** |
+| 注入分类器（AgentDojo 实测） | ~8% | 41.24% | **−27.8 pp** |
+
+第一行是一个防御。第二行是一个更差的产品。
+
+<Note title="一个经常被引错的数字">
+CaMeL 的可用性是 **77% vs 84% 无防御**（v2，2025-06-24），不是被广泛引用的 67%——那是 v1 的数字。
+
+差别不大，但引一个已经被作者自己修正过的数字，会让人怀疑你别的数字。
+</Note>
+
+lab 里的 `twoAxis()` 把这两行分到不同的判定档，分界线在 **15 个百分点**。这不是一个精确的科学阈值，是一个刻意的工程判断：低于它是"防御的代价"，高于它是"另一个产品"。
+
+---
+
+## 十三、动手
+
+<Lab title="l14/inject：八个 TODO，每一个对应一种静默失效">
+```bash
+cd labs
+pnpm inject                 # 你的实现
+pnpm inject:shared          # 参考输出，先跑这个
+pnpm verify:l14             # 99 项
+GUARD_IMPL=shared pnpm verify:l14   # 确认测试本身是对的
+```
+
+Python 侧完全对称，输出**逐字节一致**：
+
+```bash
+uv run python -m l14.inject
+uv run python -m l14.verify
+```
+
+八个 TODO：
+
+| # | 做什么 | 漏了会怎样 |
+|---|---|---|
+| 1 | 来源标记与传播 | 漏一个 `combine` 上游，污染悄悄消失 |
+| 2 | 按参数角色的能力契约 | 检查工具名——第六节那个事故全程绿灯 |
+| 3 | 三要素 / Rule of Two | 少报 Meta 放宽的那一条 |
+| 4 | 通道审计 | 判序写反，看不见的通道被报成"已过滤" |
+| 5 | 熔断器 | 不展开替换，`echo "$(rm -rf ~)"` 过去 |
+| 6 | 审批门 | fail open——和一家在售产品一样 |
+| 7 | rug pull 哈希钉定 | 只哈希 description，漏掉 24.8% |
+| 8 | 两轴指标 | 只报一个轴，藏掉 27.8 个百分点 |
+
+**它们全都不抛异常。** 脚手架跑起来是 59/99 通过，剩下的 40 项里带 ★ 的那些，就是这一节真正要教的东西。
+</Lab>
+
+<Lab title="l14/gate：交付物，一个能进 CI 的安全门">
+```bash
+pnpm gate                   # 或 uv run python -m l14.gate
+echo $?                     # 非零
+```
+
+它按顺序查四件事，然后**以非零码退出**：
+
+<Steps>
+<li>**配置本身**——沙箱漏了什么。这一步不需要跑 agent。</li>
+<li>**通道**——哪些外发路径你的执行点看不见。</li>
+<li>**会话**——逐个工具调用过一遍参数来源和审批门。</li>
+<li>**两轴**——安全和可用性一起报。</li>
+</Steps>
+
+第 1 步在最前面是有意的：一份漏了 DNS、漏了环境变量、允许 agent 自己关沙箱的配置，后面三步做得再漂亮都没有意义。
+
+跑出来的那段会话里有一次注入，而它长得和正常运行一模一样。你会看到：第 2、3 步被参数契约拦住，第 4 步——一次**完全正常**的 `post_comment`——照常放行。ASR 0%，可用性 100%。
+
+那就是第十二节表里第一行的形状。
+
+而它的最终判定刻意**不说**"安全"。它最好的输出是「**在你测过的这些攻击上没有失败**」。这句话的每个字都要保留。
+</Lab>
+
+<CursorHook>
+你每天在 Cursor 里点的那个「Auto-review」，就是这一节第十节那个策略决策点。
+
+而这一节的几个概念在它身上都能对上：
+
+- 它是**模型审批者**，不是规则
+- Cursor 3.5 弃用 "Ask Every Time"、3.6 把它设成默认，是第一节那张表
+- 你在 `.cursor/rules` 里写的东西是**文件里的策略**；你在聊天里说的"别动这个目录"是**对话里的策略**——后者会随上下文压缩消失
+
+下次它拦下一条命令、而你觉得"这明显是安全的"的时候，值得想一下：它拦的很可能不是这条命令危险，而是它**没法确认这条命令的目标**——因为它看不见前面那条命令的输出。
+
+那正是第五节那条纪律在替你工作。
+</CursorHook>
+
+---
+
+## 收尾
+
+这一节和前面十三节有一个结构性的差别：前面那些，做对了就是做对了。这一节做对了，你得到的是**一个更小的攻击面**，不是一个安全的系统。
+
+所以最后再说一遍那条纪律，它是这一节唯一需要背下来的东西：
+
+<Key>
+能读懂攻击的防御，全被绕过了；守住的那些，都是看不见攻击的。
+
+**所以做授权判断的那段代码，绝不能读那段不可信的数据。**
+</Key>
+
+八个 TODO 全都是这一条的不同侧面。参数角色是它、通道移除是它、审批者剥掉工具结果是它、哈希钉定是它——钉定不判断新描述像不像攻击，它只判断它变了没有。
+
+**L14x 浏览器 agent 与多模态输入**（深度选修）把这条纪律搬到网页上：模型看到的快照、用户看到的像素、实际被点到的元素是三样东西，浏览器本身又多出一组新的 sink。
+
+**L15 性能与成本**接着这条线走下去。而它会有一个不舒服的连接点：这一节让你加的每一层检查都有延迟和 token 成本，而下一节要砍的正是这些。到时候你会发现，缓存、批处理和上下文复用这几件事，每一个都在**动**这一节建立的那些边界——一个跨会话共享的 prompt 缓存，本身就是一条你没打算开的通道。

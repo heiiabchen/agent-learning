@@ -1,0 +1,56 @@
+{
+  "compilerOptions": {
+    "target": "ES2023",
+    "lib": [
+      "ES2023"
+    ],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "types": [
+      "node"
+    ],
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "verbatimModuleSyntax": true,
+    "allowImportingTsExtensions": true,
+    "noEmit": true
+  },
+  "include": [
+    "shared",
+    "l00",
+    "l01",
+    "l02",
+    "l03",
+    "l04",
+    "l05",
+    "l05x",
+    "l06",
+    "l07",
+    "l08",
+    "l09",
+    "l09x",
+    "l10",
+    "l10x",
+    "l11",
+    "l11x",
+    "l12",
+    "l13",
+    "l14",
+    "l14x",
+    "l15",
+    "l16",
+    "l16x",
+    "l16y",
+    "l17",
+    "l18",
+    "l18x",
+    "l19",
+    "l19x",
+    "l21"
+  ],
+  "exclude": [
+    "l16/ui"
+  ]
+}

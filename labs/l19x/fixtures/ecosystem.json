@@ -1,0 +1,199 @@
+{
+  "versions": [
+    ["ai", "7.0.137"],
+    ["@ai-sdk/anthropic", "4.0.78"],
+    ["@ai-sdk/mcp", "2.0.73"],
+    ["@mastra/core", "1.76.0"],
+    ["@anthropic-ai/claude-agent-sdk", "0.3.296"],
+    ["@openai/agents-core", "0.20.0"],
+    ["@langchain/langgraph", "1.4.21"]
+  ],
+
+  "loops": [
+    { "id": "ai-sdk/generateText", "defaultLimit": 1, "onLimit": "return", "signal": "finishReason=tool-calls，text 为空", "evidence": "E1-B 实测" },
+    { "id": "ai-sdk/ToolLoopAgent", "defaultLimit": 20, "onLimit": "return", "signal": "finishReason=tool-calls，text 为空", "evidence": "E1-A 实测" },
+    { "id": "ai-sdk/WorkflowAgent", "defaultLimit": null, "onLimit": "none", "signal": "—", "evidence": "文档" },
+    { "id": "mastra/Agent.generate", "defaultLimit": 5, "onLimit": "return", "signal": "finishReason=tool-calls", "evidence": "E3 实测" },
+    { "id": "openai-agents/run", "defaultLimit": 10, "onLimit": "throw", "signal": "MaxTurnsExceededError（error.state 还在）", "evidence": "E6-A 实测" },
+    { "id": "claude-agent-sdk/query", "defaultLimit": null, "onLimit": "none", "signal": "—", "evidence": "E5-A 实测" },
+    { "id": "langgraph.js", "defaultLimit": 25, "onLimit": "throw", "signal": "GraphRecursionError", "evidence": "源码常量" }
+  ],
+
+  "toolError": { "name": "Error", "message": "ENOENT nope (secret=sk-123)", "code": "ENOENT", "tool": "read_file" },
+
+  "backfills": [
+    { "framework": "ai-sdk", "rule": "toString", "isError": "true", "evidence": "E1-A 实测" },
+    { "framework": "mastra", "rule": "message", "isError": "未核实", "evidence": "E3 实测" },
+    { "framework": "claude-agent-sdk", "rule": "message", "isError": "true", "evidence": "E5-A2 实测" },
+    { "framework": "openai-agents", "rule": "fixed", "isError": "—", "evidence": "E6-A 实测" }
+  ],
+
+  "mcpCases": [
+    { "label": "isError: true（E2 原样）", "result": { "content": [{ "type": "text", "text": "EACCES: permission denied" }], "isError": true } },
+    { "label": "成功", "result": { "content": [{ "type": "text", "text": "3 files" }] } },
+    { "label": "isError: \"true\"（字符串）", "result": { "content": [{ "type": "text", "text": "quota exceeded" }], "isError": "true" } },
+    { "label": "失败，消息里带 key", "result": { "content": [{ "type": "text", "text": "401 token=abc123 rejected" }], "isError": true } },
+    {
+      "label": "图片 + 资源 + 链接",
+      "result": {
+        "content": [
+          { "type": "image", "mimeType": "image/png", "data": "iVBORw0KGgo=" },
+          { "type": "resource", "resource": { "uri": "file:///r.txt", "text": "hello" } },
+          { "type": "resource_link", "uri": "file:///big.log" }
+        ]
+      }
+    },
+    { "label": "只有 structuredContent", "result": { "content": [], "structuredContent": { "rows": 2 } } },
+    { "label": "什么都没有", "result": {} }
+  ],
+
+  "ui": { "modelSaw": "Error: ENOENT a.ts; 试试 src/a.ts", "toolCallId": "call_1" },
+
+  "history": {
+    "log": [
+      { "toolCallId": "c1", "kind": "result", "text": "3 files" },
+      { "toolCallId": "c2", "kind": "error", "text": "[tool error] read_file: ENOENT a.ts\n下一步：路径不存在：先列出目录确认文件名，再换路径调用" },
+      { "toolCallId": "c3", "kind": "result", "text": "ok" }
+    ],
+    "ui": [
+      { "toolCallId": "c1", "state": "output-available", "text": "3 files" },
+      { "toolCallId": "c2", "state": "output-error", "text": "An error occurred." },
+      { "toolCallId": "c9", "state": "output-available", "text": "approved" }
+    ]
+  },
+
+  "runState": { "bytes": 3529, "measuredEffects": [1, 2], "evidence": "E6-B 实测" },
+
+  "thinking": [
+    { "path": "非流式", "signature": true, "outcome": "回传 [\"thinking\",\"tool_use\"]", "silent": false },
+    { "path": "非流式", "signature": false, "outcome": "AI_APICallError: Invalid JSON response", "silent": false },
+    { "path": "流式", "signature": true, "outcome": "回传 [\"thinking\",\"tool_use\"]", "silent": false },
+    { "path": "流式", "signature": false, "outcome": "thinking 被丢弃，只回传 [\"tool_use\"]，一条 warning", "silent": true }
+  ],
+
+  "defaults": [
+    { "inv": "INV-14", "what": "AI SDK abort", "default": "抛 AbortError，返回值里没有已完成的步", "fix": "onStepEnd 里自己落盘", "evidence": "E1-D 实测" },
+    { "inv": "INV-17", "what": "AI SDK 模型重试", "default": "429 共 3 次调用后 AI_RetryError，不带幂等键", "fix": "幂等键放在工具层", "evidence": "E1-F 实测" },
+    { "inv": "INV-24", "what": "AI SDK 审批（useChat）", "default": "历史由客户端发来，审批默认不签名", "fix": "签名密钥，或审批存服务端", "evidence": "文档" },
+    { "inv": "INV-25", "what": "Agents SDK 输入 guardrail", "default": "与模型并行：触发前模型已调用 1 次", "fix": "runInParallel:false → 0 次", "evidence": "E6-D 实测" },
+    { "inv": "INV-26", "what": "Agents SDK handoff", "default": "整段对话历史交给下一个 agent", "fix": "inputFilter", "evidence": "文档" },
+    { "inv": "INV-27", "what": "Agents SDK tracing", "default": "traceIncludeSensitiveData=true；伞包 import 即注册 OpenAI exporter", "fix": "只装 agents-core，exporter 自己设", "evidence": "E6-F 实测 + 源码" },
+    { "inv": "INV-29", "what": "@ai-sdk/anthropic 接 deepseek-v4-pro", "default": "max_tokens 被限到 4096，一条 warning", "fix": "显式 maxOutputTokens", "evidence": "E1-G 实测" },
+    { "inv": "INV-32", "what": "AI SDK reset-step", "default": "协议里有，streamText / ToolLoopAgent 从不发", "fix": "只有 WorkflowAgent 发", "evidence": "源码 grep" }
+  ],
+
+  "claudeAgentSdk": {
+    "permissionMode": "auto",
+    "mainModel": "deepseek-v4-pro",
+    "classifierModel": "claude-sonnet-5",
+    "classifierPerMainRequest": 10,
+    "classifierMaxTokens": "64 五次、8192 五次",
+    "classifierSystemStart": "You are a security monitor for autonomous AI coding agents.",
+    "autoDenial": "Auto mode could not evaluate this action and is blocking it for safety — run with --debug for details. This is not a judgment that the action is unsafe. This is usually transient — wait briefly and try this action again as-is; don't rewrite it.",
+    "defaultSystemPrompt": ["x-anthropic-billing-header: cc_version=2.1.296.31a; cc_entrypoint=sdk-ts;", "You are a Claude agent, built on Anthropic's Claude Agent SDK."],
+    "sessions": [
+      { "run": "A2", "sessionId": "e1027878…", "messages": 5, "costMicroUsd": 1200 },
+      { "run": "B：resume A2", "sessionId": "e1027878…", "messages": 8, "costMicroUsd": 1800 },
+      { "run": "C：resume A2 + forkSession", "sessionId": "9afbad74…", "messages": 11, "costMicroUsd": 2400 }
+    ],
+    "costExcludes": "Internal helper calls outside the query pipeline (e.g. the permission classifier, token-count probes) are excluded"
+  },
+
+  "dify": {
+    "app": { "name": "客服知识库", "mode": "advanced-chat" },
+    "kind": "app",
+    "version": "0.7.0",
+    "workflow": {
+      "graph": {
+        "nodes": [
+          {
+            "id": "start",
+            "type": "custom",
+            "position": { "x": 30, "y": 200 },
+            "positionAbsolute": { "x": 30, "y": 200 },
+            "width": 244,
+            "height": 90,
+            "selected": false,
+            "sourcePosition": "right",
+            "targetPosition": "left",
+            "data": { "type": "start", "title": "开始", "variables": [] }
+          },
+          {
+            "id": "kr",
+            "type": "custom",
+            "position": { "x": 330, "y": 200 },
+            "width": 244,
+            "height": 118,
+            "data": { "type": "knowledge-retrieval", "title": "知识检索", "query_variable_selector": ["sys", "query"], "dataset_ids": ["gAAAAABm9cW3…"] }
+          },
+          {
+            "id": "route",
+            "type": "custom",
+            "position": { "x": 630, "y": 200 },
+            "data": {
+              "type": "if-else",
+              "title": "命中了吗",
+              "cases": [{ "case_id": "true", "conditions": [{ "variable_selector": ["kr", "result"], "comparison_operator": "not empty" }] }]
+            }
+          },
+          {
+            "id": "llm",
+            "type": "custom",
+            "position": { "x": 930, "y": 120 },
+            "selected": true,
+            "data": {
+              "type": "llm",
+              "title": "回答",
+              "model": { "provider": "deepseek", "name": "deepseek-v4-pro", "mode": "chat", "completion_params": { "temperature": 0 } },
+              "prompt_template": [
+                { "role": "system", "text": "只根据资料回答：{{#kr.result#}}" },
+                { "role": "user", "text": "{{#sys.query#}}" }
+              ],
+              "memory": { "window": { "enabled": true, "size": 10 } }
+            }
+          },
+          {
+            "id": "ticket",
+            "type": "custom",
+            "position": { "x": 930, "y": 320 },
+            "data": {
+              "type": "http-request",
+              "title": "建工单",
+              "method": "post",
+              "url": "https://tickets.example.com/api",
+              "body": { "type": "json", "data": "{\"q\":\"{{#sys.query#}}\",\"draft\":\"{{#llm.text#}}\"}" },
+              "retry_config": { "enabled": false, "max_retries": 3 }
+            }
+          },
+          {
+            "id": "notify",
+            "type": "custom",
+            "position": { "x": 1230, "y": 420 },
+            "data": { "type": "tool", "title": "发通知", "provider_id": "feishu", "tool_name": "send_message", "tool_parameters": { "text": { "type": "mixed", "value": "新工单：{{#ticket.body#}}" } } }
+          },
+          {
+            "id": "answer",
+            "type": "custom",
+            "position": { "x": 1230, "y": 120 },
+            "data": { "type": "answer", "title": "直接回复", "answer": "{{#llm.text#}}" }
+          },
+          {
+            "id": "fallback",
+            "type": "custom",
+            "position": { "x": 1230, "y": 320 },
+            "data": { "type": "answer", "title": "转人工", "answer": "没找到答案，已建工单：{{#ticket.body#}}（{{#sys.query#}}）" }
+          }
+        ],
+        "edges": [
+          { "id": "e1", "source": "start", "sourceHandle": "source", "target": "kr", "targetHandle": "target", "zIndex": 0, "selected": false },
+          { "id": "e2", "source": "kr", "sourceHandle": "source", "target": "route", "targetHandle": "target", "zIndex": 0 },
+          { "id": "e3", "source": "route", "sourceHandle": "true", "target": "llm", "targetHandle": "target" },
+          { "id": "e4", "source": "route", "sourceHandle": "false", "target": "ticket", "targetHandle": "target" },
+          { "id": "e5", "source": "llm", "sourceHandle": "source", "target": "answer", "targetHandle": "target" },
+          { "id": "e6", "source": "ticket", "sourceHandle": "source", "target": "fallback", "targetHandle": "target" },
+          { "id": "e7", "source": "ticket", "sourceHandle": "source", "target": "notify", "targetHandle": "target" }
+        ]
+      }
+    }
+  }
+}

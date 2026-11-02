@@ -1,0 +1,19 @@
+{
+  "//": "L16 的界面是这个仓库里唯一需要 DOM 类型的 lab。它单独一份 tsconfig，而 labs/tsconfig.json 把 l16/ui 排除掉了——这个分界不是配置洁癖：它在编译期保证 shared/wire.ts 里一行 DOM API 都用不上，也就保证了那一层能在 Node 侧的转发器里复用、能被 Python 逐字节镜像。",
+  "compilerOptions": {
+    "target": "ES2023",
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "jsx": "react-jsx",
+    "types": ["vite/client"],
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "verbatimModuleSyntax": true,
+    "allowImportingTsExtensions": true,
+    "noEmit": true
+  },
+  "include": ["."]
+}

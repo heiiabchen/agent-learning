@@ -1,0 +1,571 @@
+这一节是选修，而且它和别的选修节不一样：**它不教你新的工程能力，它教你读别人的代码。**
+
+你写 TypeScript。但 agent 生态的重心在 Python——LangGraph、DSPy、几乎所有评测框架、几乎所有论文的参考实现。这件事的后果很具体：**你每次想搞清楚一个设计到底怎么回事，最后都会落到一份 Python 文件上。**
+
+<Key>
+这一节唯一的目标：让你能打开 LangGraph 或 DSPy 的源码，知道自己在看什么，并且判断得出"这个设计我该不该抄"。
+
+不是学 Python。是**把四个库的核心机制各剥出来重写一遍**——每个都短到能一眼看完。写完之后你会发现其中两件你在 L08 已经做过了，一件在 TS 里有一模一样的坑，只有一件是 Python 独有的。
+</Key>
+
+---
+
+## 一、先把"该不该学 Python"这个问题关掉
+
+这个问题问错了，所以怎么答都别扭。正确的问法是分成三件事：
+
+| 场景 | 需要什么程度 | 为什么 |
+| --- | --- | --- |
+| 生产 agent 的运行时 | 不需要 | TS 完全够用，而且你已经会了 |
+| 看懂生态里的设计 | **需要能读** | 你要判断的东西都写在 Python 里 |
+| 评测与 prompt 优化 | **需要能写** | numpy / scipy 这一层 JS 没有等价物 |
+
+第三行是唯一真正没得选的。原因在第八节。
+
+前两行合起来是这一节的定位：**读为主，写到"能改一个小 demo"就够。**
+
+<Note>
+这一节的 lab 因此也反过来了：`ecosystem.py` 是主通道，`ecosystem.ts` 是对照。TS 那边只有三个 TODO，因为四件机制里有一件在 TS 生态里根本不存在——而搞清楚"为什么不存在"比抄一遍更有用。
+</Note>
+
+---
+
+## 二、pydantic 和工具 API 之间那条缝
+
+从一个真实 bug 开始，因为它是这一节里唯一一个**你不学 Python 也会踩到**的坑。
+
+pydantic 是 Python 侧定义工具参数的事实标准，作用等于你熟的 zod。写法很直观：
+
+```python
+class Criteria(BaseModel):
+    field: str
+    op: str
+
+class SearchArgs(BaseModel):
+    query: str
+    filter: Criteria      # 嵌套一个 model
+    sort: Criteria        # 再用一次
+```
+
+然后 `SearchArgs.model_json_schema()` 生成的不是你以为的那个东西：
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "query": { "type": "string" },
+    "filter": { "$ref": "#/$defs/Criteria" },
+    "sort":   { "$ref": "#/$defs/Criteria" }
+  },
+  "$defs": {
+    "Criteria": { "type": "object", "properties": { "field": {...}, "op": {...} } }
+  }
+}
+```
+
+嵌套那部分被提到 `$defs` 里，用点上放一个 `$ref` 指过去。这是**合法的 JSON Schema 2020-12**，而且更紧凑——同一个类型用两次只描述一遍。
+
+问题是下一句：
+
+<Pitfall title="Anthropic 的 tools API 不解本地 $ref">
+
+模型收到 `{"$ref": "#/$defs/Criteria"}` 时，它不会去 `$defs` 里查。
+
+而失效方式有三种，一种比一种难查：
+
+1. **`$defs` 被中间层丢掉。** 很多框架的 `formatTools` 只复制 `type` / `properties` / `required` 三个键，`$defs` 就没了。剩下一个悬空指针，请求被拒。★ **这种反而是好的——它报错。**
+2. **`$defs` 传过去了。** 模型解不开 `$ref`，于是把那个参数**当成字符串**填。你收到的是一个 JSON 字符串，而不是对象。
+3. **schema 里有 `anyOf`**（通常来自 `Optional[X]`）。模型挑错分支，参数结构对不上。
+
+第 2 种最坑，因为它**看起来是成功的**：工具调用发生了，参数名对，值也像回事。然后你的工具实现里 `args["filter"]["status"]` 抛一个 `TypeError: string indices must be integers`——栈顶在你的工具里，和 schema 一个字的关系都看不出来。
+
+</Pitfall>
+
+修法就是在发出去之前把本地 `$ref` 内联掉。但有四种情况必须处理对：
+
+| 情况 | 正确做法 | 做错的后果 |
+| --- | --- | --- |
+| 简单引用 `A → D` | 内联，`$defs` 删掉 | —— |
+| 菱形 `A → D`，`B → D` | 解析一次，两处共享 | 只解第一处：第二个参数静默变空对象 |
+| 环 `Node → Node` | **`$ref` 留在原地**，`$defs` 保留 | 内联一个环 = 无限递归 |
+| 兄弟键 `{$ref, description}` | 兄弟键**覆盖**解析出来的值 | 弄反了：参数描述是错的，模型按错描述填值 |
+
+第三行值得多看一眼。自引用类型不是罕见情况——文件树、AST、评论楼层，全是递归结构，而它们都是很自然的工具参数。
+
+还有一条判断题：**解不出来的 `$ref` 该丢还是该留？**
+
+答案是留。悬空指针至少会让请求报错；丢掉会让模型看到一个"这个参数不存在"的 schema，然后静默走偏。**在两种坏结果之间，选会报错的那个。**
+
+<TsMirror>
+
+你可能想说"我不用 pydantic，这跟我没关系"。
+
+不对。**问题从来不在 pydantic，在工具 API 不解本地引用。**
+
+`zod-to-json-schema`、`typebox`、`ts-json-schema-generator`——只要一个类型被复用超过一次，它们生成的都是 `$ref`。理由和 pydantic 完全一样：那是合法且更紧凑的表示。
+
+那个真实修复（anything-llm 的 `dereferenceSchema.js`）就是 JavaScript 写的。
+
+★ 而 TS 这边有个额外的隐蔽点：**用一次的类型会被直接内联，用两次才会被提到 `$defs`。** 所以这个 bug 的触发条件是"某天有人把一个类型复用了第二次"——而那次改动看起来和工具调用毫无关系。
+
+</TsMirror>
+
+<Lab title="ecosystem.py TODO 1、2 + ecosystem.ts TODO 1、2">
+
+两边都写一遍，因为两边都会踩。
+
+`dereference` 要过菱形、链式、环、兄弟键、旧式 `definitions`（draft-07 用这个名字，生态里两种都有）五组测试，而且不能改原对象。
+
+`schema_health` 是那道主动检查。它的存在理由是：**上面三种失效全都不在你的代码里报错。**
+
+```bash
+cd labs
+uv run python -m l11x.ecosystem     # demo 一
+uv run python -m l11x.verify        # 前 13 项
+pnpm eco                            # TS 侧同一组
+```
+
+</Lab>
+
+---
+
+## 三、asyncio：一个失败之后，还有几个在烧钱
+
+Python agent 框架几乎都是 async 优先的。你会在源码里看到大量 `async def` / `await` / `asyncio.gather`。
+
+这里只有一件事值得从 TS 视角专门学，但它很值：**并发失败的语义。**
+
+`asyncio.gather` 有两个模式，而它们的差别不是"要不要抛异常"：
+
+```python
+# 模式一：默认
+await asyncio.gather(*tasks)
+# 第一个异常立刻上抛。而**其余任务不会被取消，会继续跑到底。**
+
+# 模式二
+await asyncio.gather(*tasks, return_exceptions=True)
+# 各自跑完，异常当成值收在结果列表里。也不取消。
+```
+
+模式一在 agent 里的后果很具体。L11 那节的 `fanout` 如果用它：一个 sub-agent 崩了，你的函数抛异常返回，而**另外三个 sub-agent 还在调模型、还在跑工具、还在花钱**——只是没有人会读它们的结果了。
+
+lab 里能直接看到这件事：
+
+```text
+asyncio.gather（朴素）
+  成功 3  失败 1  取消 0   失败瞬间还在跑 3 个
+  真正花了钱的：3 个  [slow-1, slow-2, slow-3]
+
+asyncio.TaskGroup
+  成功 0  失败 1  取消 3   失败瞬间还在跑 0 个
+  真正花了钱的：0 个  []
+```
+
+Python 3.11 给了这件事一个正确答案，`asyncio.TaskGroup`：
+
+```python
+async with asyncio.TaskGroup() as tg:
+    for brief in briefs:
+        tg.create_task(run_subagent(brief))
+# 第一个非取消类失败 → 取消组里其余任务 → 等它们结束
+#                    → 把失败打包成 ExceptionGroup 抛出
+```
+
+它还顺手解决了另一件事：**TaskGroup 对每个 task 持强引用。** 裸 `asyncio.create_task` 只有弱引用，任务可能在跑完之前被 GC 掉——症状是"某些请求偶尔没有响应"，和 L10 那个坑同一个形状。
+
+<Key>
+判据，两句话：
+
+**要"一个失败就全停"，用 `TaskGroup`。要"各自跑完再看"，用 `gather(return_exceptions=True)`。**
+
+朴素 `gather` 两个都不是。它是一个 bug 的名字。
+
+而 L11 的 `fanout` 要的是后者：一个 sub-agent 崩了，不该让其余三个白跑。
+</Key>
+
+<Drill title="ExceptionGroup 和 except*">
+
+TaskGroup 抛的不是普通异常，是 `ExceptionGroup`（PEP 654，3.11 引入）。接法是一个新语法：
+
+```python
+try:
+    async with asyncio.TaskGroup() as tg:
+        ...
+except* TimeoutError as eg:      # 注意是 except*
+    for e in eg.exceptions: ...
+except* ValueError as eg:
+    ...
+```
+
+为什么需要新语法：**多个任务可以同时失败。** 传统 `except` 一次只能匹配一个异常对象，而这里要匹配的是一个树。`except*` 会遍历这棵树，把匹配的类型摘出来，剩下的继续往上抛。
+
+★ 这一点对 agent 很实际：三个 sub-agent 同时超时，你要的是"三个都超时了"，而不是"第一个超时了"。朴素 `gather` 只给你第一个——于是你修完一个再发现还有俩。
+
+</Drill>
+
+<Pitfall title="CancelledError 不是 Exception 的子类">
+
+Python 3.8 起，`asyncio.CancelledError` 直接继承 `BaseException`。
+
+好的一面：你的兜底 `except Exception` **不会**把取消信号吞掉。
+
+坑的一面有两处：
+
+1. 想接住取消必须显式写 `except asyncio.CancelledError`。
+2. **接了之后必须 `raise` 出去。** 官方文档明确说：`TaskGroup` 和 `asyncio.timeout()` 内部就是用取消实现的，一个协程如果把 `CancelledError` 咽掉，它们会失灵——超时不再生效，任务组等不到子任务结束。
+
+而"失灵"的表现不是报错，是**卡住**。
+
+</Pitfall>
+
+<TsMirror>
+
+TS 这边有同一个坑，而且更隐蔽。
+
+`Promise.all` 的语义和朴素 `gather` 一模一样：第一个 reject 立刻上抛，其余 Promise 继续跑到底。原因更根本——**Promise 不可取消。**
+
+所以 TS 里"一个失败就全停"不是一个 API，是**三个东西拼出来的纪律**：
+
+| 你要的语义 | Python | TypeScript |
+| --- | --- | --- |
+| 一个失败就全停 | `TaskGroup` | `AbortController` + 每个 job 都尊重 signal |
+| 各自跑完再看 | `gather(return_exceptions=True)` | `Promise.allSettled` |
+| （bug） | 朴素 `gather` | `Promise.all` |
+
+★ 关键差别在第一行：Python 的 `TaskGroup` 是**语言原语**，它自己知道怎么取消子任务。TS 里你得自己把 `signal` 一路传下去，而**漏一个地方，那个任务就变成孤儿，没有任何东西会提醒你。**
+
+而 TS 这边还更安静一点：Python 至少会在进程退出时打一句 `Task was destroyed but it is still pending`。JS 什么都不说。孤儿请求安安静静跑完，账单上多一笔。
+
+</TsMirror>
+
+<Lab title="ecosystem.ts TODO 3">
+
+TS 侧写 `runTaskGroupLike`：一个 `AbortController`，第一个**非 AbortError** 的失败就 abort 其余，全部 await 完再返回。
+
+四条要过的测试里有两条是重点：
+
+- `cancelled.length === 2` —— abort 真的生效了。是 0 通常说明 `signal` 没往下传
+- `paid.length === 0` —— 被取消的任务**没有跑完，钱没花**。不是 0 说明有 job 没尊重 signal，而那个 job 就是孤儿
+
+Python 侧不用写这个（`TaskGroup` 是标准库），但 demo 二会把三种语义并排跑给你看。
+
+</Lab>
+
+---
+
+## 四、LangGraph：你在 L08 已经写过它的一半
+
+先说结论，因为它能省你很多时间。
+
+<Key>
+LangGraph 的核心机制，你在 L08 手写过了：
+
+| LangGraph | 你在 L08 写的 |
+| --- | --- |
+| `checkpointer` | 事件日志 + 快照 |
+| `thread_id` | session id |
+| `interrupt()` | L14 那个人工审批闸 |
+| **reducer** | **这一条是新的** |
+
+所以读 LangGraph 源码时，把注意力放在 reducer 上。其余部分你已经知道它为什么长那样了。
+</Key>
+
+LangGraph 的基本形状是一张图：节点是函数，边是控制流，节点之间通过一份共享 state 通信。
+
+```python
+class State(TypedDict):
+    messages: Annotated[list, add_messages]   # 注意这个 Annotated
+    findings: Annotated[list, operator.add]
+    current: str                              # 没有 reducer
+
+graph = StateGraph(State)
+graph.add_node("plan", plan_node)
+graph.add_edge("plan", "execute")
+app = graph.compile(checkpointer=MemorySaver())
+```
+
+`Annotated[list, add_messages]` 是整个设计的核心，而它解决的问题很具体：
+
+**图里多个节点并发更新同一份 state 时，怎么合并。**
+
+这个问题在链式流程里不存在——一次只有一个节点在写。扇出的时候立刻出现。而 LangGraph 的答案不是加锁，是**要求你为每个会被并发写的字段声明一个合并函数**。
+
+没声明的字段走默认行为：后写盖前写。
+
+<Pitfall title="没有 reducer 的字段，在并发扇出时会静默丢结果">
+
+上面那个 `current: str` 没有 reducer。三个节点并发跑完，各自写了 `current`：
+
+```text
+findings（有 reducer）  →  3 条，全保住了
+current（没有 reducer） →  'worker-3'
+                           worker-1 和 worker-2 写的东西消失了
+```
+
+而**没有任何地方会记录这件事**。
+
+真 LangGraph 的做法比"静默覆盖"硬得多：没声明 reducer 的字段被多个分支同时写，它直接抛 `InvalidUpdateError`。
+
+★ 这个选择本身值得学：**它宁可让你的图跑不起来，也不让你丢一次结果而不知道。** 你在 L07、L08 反复见过这个取舍——响亮地失败，而不是安静地错。
+
+</Pitfall>
+
+---
+
+## 五、`add_messages`：为什么它不是 `operator.add`
+
+`operator.add` 就是拼接，`add_messages` 多做一件事：**按 id 去重并覆盖。**
+
+差别只有这一点，但它决定了一个功能能不能用。
+
+场景：agent 停下来问人，人**修改了**已有的那条消息（把"删掉临时文件"改成"删掉 /tmp 下我自己建的临时文件"），然后恢复执行。
+
+```text
+operator.add  →  2 条消息
+    m1: 帮我删掉临时文件
+    m1: 帮我删掉 /tmp 下我自己建的临时文件
+
+add_messages  →  1 条消息
+    m1: 帮我删掉 /tmp 下我自己建的临时文件
+```
+
+第一种情况下，模型看到两条**互相矛盾**的指令。而它不会报错——它会挑一条，通常是后一条，有时不是。于是你得到一个"大部分时候对"的 bug。
+
+`add_messages` 还有一个容易写错的细节：**覆盖不能改位置。** 把被改的那条挪到列表末尾，会让对话顺序错乱，而模型对消息顺序是敏感的。
+
+<Lab title="ecosystem.py TODO 3、4 + ecosystem.ts TODO 4">
+
+`add_messages` 要处理六种情况：同 id 覆盖、新 id 追加、**保持原有顺序**、没有 id 的消息、空历史 / `None`、单条而非列表。
+
+`merge_parallel` 要返回"哪些字段被静默覆盖了"。判断条件是两个都满足：这个字段没有 reducer，且它在本批里已经被写过一次。
+
+★ 注意一条：**单次写入不算覆盖。** 会报假警的检查最后都会被人关掉。
+
+</Lab>
+
+---
+
+## 六、恢复会把节点重跑一遍
+
+这是 LangGraph 里最容易漏掉、也最容易在生产上出事的一条。
+
+`interrupt()` 让图停在节点里等人：
+
+```python
+def risky(state):
+    write_to_db(state["task"])              # 副作用
+    ok = interrupt({"q": f"要执行 {state['task']} 吗？"})
+    return {"done": True, "approved": ok}
+```
+
+批准之后用 `Command(resume=True)` 恢复。问题：**数据库里有几条记录？**
+
+<Pitfall title="两条。而这是正常行为，不是 bug">
+
+原因是一句话：**检查点存在"超步"边界上，不在节点函数中间。**
+
+所以恢复的时候，被中断那个节点会**从函数开头重跑一遍**——`interrupt()` 之前的代码和副作用会再执行一次。
+
+这就是 LangGraph 文档里那句"`interrupt` 之前的代码必须幂等"的由来。而它和 L08 那节的幂等键是同一件事：
+
+★ **恢复不是"接着往下走"，是"重放到断点"。**
+
+同一条规则也适用于 `interrupt_before`、任务重试、以及进程崩溃后的恢复。三种场景，一个机制。
+
+</Pitfall>
+
+绕开的办法和 L08 一样，一共三种：把副作用拆到前一个节点、用幂等键、或者在 state 里放一个"已经做过了"的标记。
+
+顺便：`interrupt_before=["node"]` 是**编译期**设置，每次必停，适合调试和强制审批；`interrupt()` 写在节点里，可以按运行时条件决定停不停——真实应用大多要后者。
+
+<CursorHook>
+
+Cursor 问你"要执行这个命令吗"的时候，你按了拒绝，然后改了改再让它继续——这一次它是**从头想了一遍**，不是从你按拒绝那一刻接着往下走。
+
+所以有时候你会看到它重复一句之前说过的话，或者重新读一次已经读过的文件。那不是它忘了，是重放。
+
+</CursorHook>
+
+<Lab title="ecosystem.py TODO 5（不写代码，跑一遍）">
+
+参考实现的 `StateGraph.invoke` 已经写好了。跑 demo 四，亲眼看到那个计数从 1 变成 2。
+
+然后看 verify 里这一组：`恢复会重跑节点，副作用执行两次`。它是**断言两次**的——如果哪天有人"修好"了这个行为，测试会告诉你它坏了。
+
+</Lab>
+
+---
+
+## 七、DSPy：把 prompt 当成可以被编译的东西
+
+DSPy 是这一节里唯一一件在 TS 生态里没有对应物的东西，也是最值得理解设计思想的。
+
+它的主张是：**不要手写 prompt。写清输入输出的签名，让 optimizer 编译出 prompt。**
+
+```python
+class Extract(dspy.Signature):
+    """从工单里提取结构化信息。"""
+    ticket: str = dspy.InputField()
+    severity: str = dspy.OutputField(desc="P0/P1/P2")
+    component: str = dspy.OutputField()
+
+program = dspy.ChainOfThought(Extract)
+compiled = dspy.MIPROv2(metric=my_metric, auto="light").compile(
+    program, trainset=train
+)
+```
+
+关键问题是：**编译产物到底是什么？** 这里值得说清楚，因为它比听起来朴素得多。
+
+| optimizer | 产出什么 | 搜索方式 |
+| --- | --- | --- |
+| `BootstrapFewShot` | few-shot 示例 | 跑程序，留下指标判对的 |
+| `MIPROv2` | 示例 **+** 重写过的指令 | 贝叶斯优化（TPE）联合搜索 |
+| `GEPA` | 重写过的指令 | 反思式进化，读指标返回的**自然语言反馈** |
+| `BootstrapFinetune` | 模型权重 | 监督微调 |
+
+前三个都只动 prompt，模型不碰——**所以闭源模型也能用。**
+
+而产物本身就是一组示例加一段指令。可以序列化成 JSON 存起来，可以被人读、被 review、被手改。没有权重，没有魔法。
+
+`BootstrapFewShot` 的机制最值得看，因为它解释了 "bootstrap" 这个词：
+
+1. 拿训练集里的样本，**用当前程序零样本跑一遍**
+2. 用你的指标给输出打分
+3. 分数达标的，把「输入 → **程序自己产出的输出**」留作 few-shot 示例
+4. 攒够就停
+
+<Key>
+第 3 步是重点：留下的示例里，**输出是模型自己生成的，不是训练集里的标注答案。**
+
+好处：示例的措辞、格式、思路都和模型的习惯一致，比人写的示例更"顺"。
+
+代价：**它会把模型自己的偏好固化下来**，包括偏见。而且它只能用程序**已经会做对**的那部分当示范——零样本全错的地方，bootstrap 一条示例也攒不到。
+</Key>
+
+<Pitfall title="DSPy 的入场券是一个指标，而这是它最常被跳过的一条">
+
+没有 eval 集和指标，optimizer 无事可做。它整个机制就是"生成候选 → 用你的指标打分 → 留下分高的"。
+
+所以两种失败形状要认得，而它们的正确应对都和直觉相反：
+
+| 症状 | 直觉反应 | 正确诊断 |
+| --- | --- | --- |
+| 一条示例都没攒到 | 训练数据不够，加数据 | **签名错了或指标错了。** 零样本成功率为 0，加数据没用 |
+| 编译完分数没提升 | optimizer 不行，换一个 | **指标太粗**（比如只判精确匹配），换 optimizer 也一样 |
+
+还有一件必须记住的：**报告里必须同时有编译前和编译后两个数字。** "编译后 0.82" 这个数字单独看没有任何意义——你不知道优化有没有起作用，也不知道它是不是**把 devset 记住了**。
+
+顺便说成本：`MIPROv2` 的 `auto="heavy"` 能跑到几千次模型调用，一次编译几十美元。它和 L11 那节"多 agent 是花钱策略"是同一个坑——**不记账的优化循环会让你在账单上才发现问题。**
+
+</Pitfall>
+
+<Note>
+DSPy 的前置条件，正好是下一节（L12）的交付物。
+
+这个顺序不是巧合：**大多数团队用不上 DSPy 的真实原因不是它难，是他们没有指标。**
+</Note>
+
+<Lab title="ecosystem.py TODO 6、7">
+
+`bootstrap_few_shot` 有一条最容易写错、而且写错了分数会**变好看**的地方：
+
+★ **bootstrap 阶段传给程序的 demos 必须是空的。** 如果把已经攒到的示例喂回去，后面的示例会被前面的带偏，分数虚高——那是自我确认，不是优化。
+
+`compile_report` 要把 `kept == 0` 和 `lift <= 0` 两种情况显式说出来，因为它们的正确应对和直觉相反。
+
+跑完之后 demo 五会给你看一次真实形状的编译：4 条训练样本攒到 3 条示例（有一条零样本答错，进不去），devset 从 0.33 涨到 1.00。
+
+</Lab>
+
+---
+
+## 八、为什么评测的重心一定在 Python
+
+第一节那张表里，只有"评测与 prompt 优化"这一行是没得选的。理由不是生态惯性，是**依赖不在 JS 这边**。
+
+评测要做的事情里，有三件绕不过统计：
+
+- 判断一次提升是不是显著，还是采样噪声（你只有 80 条样本，两次跑分差 3%，这算改进吗）
+- 处理小样本下的方差、置信区间
+- 分层看结果：按任务类型、按难度、按失败模式切片
+
+这三件在 Python 里是 `scipy.stats` 加 `pandas` 几行的事。JS 生态里没有等价物——不是差一点，是没有那一层。
+
+再加上现在主流的评测框架（`inspect-ai`、`ragas`、`deepeval`、OpenAI evals）基本都是 Python-only，以及数据集这一层（HuggingFace datasets）也在 Python。
+
+<Key>
+所以结论很实用主义，而且它是一条架构建议不是妥协：
+
+**agent 的运行时可以是 TypeScript，agent 的评测和优化跑在 Python 里。**
+
+这两件事本来就该分开部署——评测是离线批处理，不在请求路径上。它们之间的接口是一份轨迹数据（JSONL），不是共享代码。
+
+而这也意味着你需要的 Python 能力是有边界的：**能读懂评测脚本、能改指标函数、能跑通一次编译。** 不需要用 Python 写服务。
+</Key>
+
+---
+
+## 九、读 Python agent 代码时会绊你一下的几处
+
+不是 Python 教程，只列 JS/TS 背景的人容易误读的地方。
+
+**装饰器注册工具。** `@tool` / `@mcp.tool()` 这类写法等价于你熟的"定义完再 register 一次"，只是把注册动作提到了函数定义上。要注意的是**它靠类型注解和 docstring 生成 schema**——所以在 Python 里改一句 docstring 就等于改了模型看到的工具描述。L04 那节讲的"描述是给模型看的接口"，在这里更容易被无意破坏。
+
+**三种"结构体"，分工不同。** `TypedDict` 只是给 dict 加类型提示，运行时**不校验**（LangGraph 的 state 用它）。`dataclass` 是纯数据容器，也不校验。`pydantic.BaseModel` 会在运行时**真的校验并转换**（工具参数用它）。看到哪个就知道有没有校验。
+
+**`Protocol` 是结构化类型。** 等价于 TS 的 interface——不需要显式继承，形状对上就算实现。看到 `class Foo(Protocol)` 就按 TS 的 `interface` 读。
+
+**`with` 是资源生命周期。** `with open(...)` / `async with TaskGroup()` 保证退出时清理，等价于 `try/finally`。TaskGroup 用它不是巧合——"离开这个块之前所有子任务都已结束"这个保证，正是靠它实现的。
+
+**`python -m pkg.mod` 和 `python pkg/mod.py` 不一样。** 前者把当前目录加进 `sys.path` 并按包导入，后者只加脚本所在目录。这就是这一节的 lab 用 `uv run python -m l11x.ecosystem` 的原因——`from shared import ...` 只在前者下能找到。这个坑会以 `ModuleNotFoundError` 的形式出现，而它和你的代码无关。
+
+**`uv` 现在是默认选择。** 相当于 Python 的 pnpm，快一个数量级。`uv run` 会自动按 `pyproject.toml` 装依赖，不用手动管虚拟环境。
+
+<Drill title="LangChain 和 LangGraph 是什么关系">
+
+容易搞混，而且直接影响你该读哪份文档。
+
+**LangGraph 是状态图运行时**——节点、边、reducer、checkpointer。它不关心你怎么调模型。
+
+**LangChain 是模型和工具的封装层**——统一各家 API 的差异、prompt 模板、输出解析。
+
+现在的推荐用法是两者分开：用 LangChain 的模型封装，用 LangGraph 编排。LangChain 早期那套 `Chain` / `AgentExecutor` 抽象已经不是推荐路径了。
+
+★ 而这一点顺便解释了 LangGraph 最常见的批评：**图这个抽象对简单流程是纯开销。** 一个"调模型 → 调工具 → 再调模型"的循环，用 L05 那种 while 循环二十行就写完了，套成图反而多出节点定义、state schema、编译这几步。
+
+判据和 L11 那节一样：**图的价值在你需要 checkpoint、需要人工介入、需要恢复的时候才出现。** 只是要跑一个循环的话，别上图。
+
+</Drill>
+
+---
+
+## 九条要点
+
+1. **这一节的目标是读，不是写。** 生产运行时可以全在 TS；但你要判断的设计都写在 Python 里，而评测那一层没得选。
+
+2. **`$ref` 那个坑和 Python 无关。** 问题在工具 API 不解本地引用，zod 和 pydantic 生成的 `$ref` 一模一样。而最坑的失效方式是"工具调用成功了，只是嵌套参数变成了 JSON 字符串"。
+
+3. **解引用有四种情况**：简单、菱形、环、兄弟键。环**不能内联**，`$ref` 要留在原地。解不出来的 `$ref` 也要留——在两种坏结果之间，选会报错的那个。
+
+4. **朴素 `gather` 和 `Promise.all` 是同一个 bug 的两个名字。** 第一个失败上抛，其余继续跑到底、继续花钱。要全停用 `TaskGroup` / `AbortController`，要各自跑完用 `return_exceptions=True` / `allSettled`。
+
+5. **`CancelledError` 不是 `Exception` 的子类。** 兜底 except 接不到它（这是好事），但接住了必须 raise 出去——不然 `TaskGroup` 和 `asyncio.timeout` 会失灵，而失灵的表现是卡住，不是报错。
+
+6. **LangGraph 的 checkpointer、thread_id、interrupt 你在 L08 都写过。** 唯一真正新的是 reducer，它解决的是"并发节点怎么合并同一份 state"。没声明 reducer 的字段会后写盖前写——真 LangGraph 宁可抛 `InvalidUpdateError` 也不让你静默丢结果。
+
+7. **`add_messages` 按 id 覆盖，`operator.add` 只追加。** 差别只有这一点，但它决定了"人工改状态再恢复"能不能用——追加会让历史里同时存在两条矛盾的消息，而模型不报错，它会挑一条。
+
+8. **恢复会把节点从头重跑一遍。** 检查点在超步边界上，不在函数中间。所以 `interrupt` 之前的副作用会执行两次——和 L08 的幂等键是同一件事：恢复不是"接着往下走"，是"重放到断点"。
+
+9. **DSPy 的编译产物是一组示例加一段指令，而它的入场券是一个指标。** 示例的输出是模型自己产的（bootstrap 的含义），所以它只能放大程序已经会做对的部分。攒不到示例说明签名或指标错了，不说明数据不够。
+
+---
+
+## 接下来
+
+第 7 节和第 8 节都指向同一个地方：**你需要一个指标。**
+
+DSPy 没有它就没法工作；评测没有它就只是在看单个例子的输出好不好；而 L07 那些编排模式、L11 那些扇出决策，没有它就全是猜的。
+
+L12 就是把这件事做出来。它是整个课程的分水岭——**在它之前你是"感觉这样更好"，在它之后你能给出一个数字。**

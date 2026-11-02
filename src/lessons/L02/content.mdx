@@ -1,0 +1,536 @@
+L01 结束时你手上有一张表：六轮对话，累计输入几千 token，无状态的代价是几倍。
+
+那张表回答了「贵不贵」。这节课回答「贵多少、为什么、以及我能不能提前算出来」。
+
+<Key>
+这节课的产出不是知识，是两个模块：一个**成本账本**和一个**流式读取器**。它们会被后面十九节课反复 import。你现在把它们写扎实，L15 那节「把成本砍一个数量级」才有东西可砍。
+</Key>
+
+顺便说清楚一件事：Messages API 只有六七个字段真正重要，但每一个都有一个「不知道会咬人」的细节。这节课把它们全过一遍。
+
+---
+
+## 一、一次请求的完整解剖
+
+先把全貌摊开。你在 L00/L01 一直在用 `messages.create()`，但只用了它的四个字段。完整的样子是这样：
+
+```ts
+const res = await client.messages.create({
+  // ── 必填三件套 ──
+  model: 'deepseek-v4-flash',
+  max_tokens: 1024,
+  messages: [{ role: 'user', content: '你好' }],
+
+  // ── 指令层 ──
+  system: '你是一个前端技术顾问。',
+
+  // ── 采样控制 ──
+  temperature: 0,        // 0~1，L01 讲过
+  top_p: 0.95,           // 和 temperature 二选一，别同时调
+  stop_sequences: ['</result>'],
+
+  // ── 传输 ──
+  stream: false,
+
+  // ── 工具（L04 的主题）──
+  tools: [],
+  tool_choice: { type: 'auto' },
+})
+```
+
+返回的对象：
+
+```ts
+{
+  id: 'msg_01ABC…',          // 唯一 ID，日志里一定要记
+  type: 'message',
+  role: 'assistant',          // 永远是 assistant
+  model: 'deepseek-v4-flash', // 实际服务你的模型，可能和你请求的不同
+  content: [ /* 内容块数组 */ ],
+  stop_reason: 'end_turn',
+  stop_sequence: null,        // 命中了哪个停止串
+  usage: {
+    input_tokens: 87,
+    output_tokens: 214,
+    cache_creation_input_tokens: 0,  // 写入缓存的量
+    cache_read_input_tokens: 0,      // 命中缓存的量
+  },
+}
+```
+
+两个字段值得现在就注意，因为它们后面会救你的命。
+
+**`id`** —— 这是你唯一能拿去和服务商对账的凭据。出了问题（内容异常、计费对不上、延迟离谱）没有它你什么都查不了。**从今天起每条日志都带上它**，L13 会把这件事做成规范。
+
+**`model`** —— 你请求的和你得到的可能不是一个东西。服务商会做别名解析（`deepseek-chat` 可能被解析成某个具体版本）、灰度切换、甚至降级。**记你实际得到的那个**，否则某天模型悄悄换了版本、行为变了，你会以为是自己的 prompt 出了问题。
+
+<Pitfall title="temperature 和 top_p 不要同时调">
+
+两者都是采样层的旋钮，但作用于不同的环节：`temperature` 缩放 logits 分布的陡峭程度，`top_p` 截断候选集。同时调它们，你会得到一个你无法在脑子里推演的联合效果——出问题时也没法定位是哪一个的锅。
+
+**约定：只动 temperature，把 top_p 留给默认值。** 需要更强的确定性时降 temperature，需要多样性时升它。这条纪律的价值在 L12 做 evals 时会显现出来：变量越少，实验越可解释。
+
+</Pitfall>
+
+---
+
+## 二、messages 数组的四条不变量
+
+这个数组不是随便一个列表，它有硬性约束。按官方协议，违反了会得到 400——而 400 是**不可重试**的，你在 L00 写的 `withRetry` 会立刻放弃，这是对的。
+
+四条规则：
+
+1. **必须以 `role: 'user'` 开头。** 对话的发起方是用户，这是协议假设。
+2. **必须严格交替。** user、assistant、user、assistant……不能连续两个同角色。
+3. **最后一条通常是 user。** 如果是 assistant，那是「prefill」——一个很有用的技巧，L03 会专门讲。
+4. **不能为空。** 空数组直接报错。
+
+第 2 条最容易在真实代码里被违反，而且**是被 bug 违反的**，不是被你手写违反的。典型场景：
+
+```ts
+// 用户连发了两条消息（比如前端没做防抖，或者用户手快）
+messages.push({ role: 'user', content: '帮我看看这个函数' })
+messages.push({ role: 'user', content: '哦对了，用 TypeScript' })
+// ↑ 下一次请求直接 400
+```
+
+正确的处理是**合并**，而不是原样发出去：
+
+```ts
+function normalize(msgs: Anthropic.MessageParam[]): Anthropic.MessageParam[] {
+  return msgs.reduce<Anthropic.MessageParam[]>((acc, m) => {
+    const last = acc.at(-1)
+    if (last?.role === m.role) {
+      // 同角色相邻，合并成一条。用换行拼接，保留两段的边界感。
+      last.content = `${textOf(last.content)}\n\n${textOf(m.content)}`
+      return acc
+    }
+    acc.push({ ...m })
+    return acc
+  }, [])
+}
+```
+
+<Pitfall title="content 有两种形态，别假设它是字符串">
+
+`content` 可以是 `string`，也可以是内容块数组 `ContentBlock[]`。这两种写法在语义上等价：
+
+```ts
+{ role: 'user', content: '你好' }
+{ role: 'user', content: [{ type: 'text', text: '你好' }] }
+```
+
+字符串形式是块数组的语法糖。但一旦你开始用工具（L04），`content` 就**必须**是数组了——因为 `tool_result` 是一种内容块，没有字符串对应形式。
+
+后果：任何直接 `msg.content.slice(0, 100)` 或者 `content.length` 的代码，都会在你接入工具的那一天炸掉。所以从现在起，凡是要读 content 的地方都走一个 `textOf()` 函数，把两种形态都处理掉。这个函数你在 L00 已经写过雏形了，这节课把它挪进 `shared/`。
+
+</Pitfall>
+
+<Lab title="别信我，去测">
+
+上面四条规则是 Anthropic 官方协议的规定。但你用的是 **DeepSeek 的兼容端点**——兼容层对每条规则的执行严格程度，只有测了才知道。
+
+```bash
+pnpm anatomy
+```
+
+这个脚本故意违反每一条，记录真实返回。跑一次十几个小请求，几分钱。
+
+**剧透一下我跑出来的结果，因为它比我预想的更有意思：** 规则 1 和规则 2 在这个端点上**都不报错**。以 assistant 开头照样答，连续两条 user 照样答。规则 4（空数组）是唯一真的被拦下来的。
+
+先别急着高兴。往下那两段讲的就是为什么这是坏消息。
+
+</Lab>
+
+<Pitfall title="宽松是一种技术债">
+
+「本该报错却成功了」比「本该成功却报错了」危险得多。后者你立刻就知道，前者会安静地积累。
+
+具体的伤害路径是这样的：你的代码在这个端点上跑得好好的，于是那个「连发两条 user 消息」的 bug 从来没暴露过。半年后你要换 provider——换成 Anthropic 官方、或者别家更严格的兼容端点——**一上线就是大面积 400**。而且是那种最难查的 400：本地复现不了，因为你本地连的还是老端点。
+
+所以第 2 条那个 `normalize()` 函数，即使你的端点不强制，也要写。它是在**对齐到协议里最严格的那一档**，而不是对齐到你手头这个端点的实际行为。
+
+这条思路值得记住，它比这个具体的例子更通用：**面向协议编程，不要面向你当前那个实现的宽容度编程。**
+
+</Pitfall>
+
+<Note title="还有一条更阴的：prefill 不是真的 prefill">
+
+规则 3 的 prefill（最后一条是 assistant，让模型接着往下写）在这个端点上有个问题，而它**不是**通过报错表现出来的。
+
+我给的 prefill 是 `1. 苹果\n2.`，期待模型只回续写的部分。实际拿到的是：
+
+```text
+1. 苹果
+2. 香蕉
+3. 橙子
+```
+
+它把 prefill **重新说了一遍**。官方端点只回续写部分，你直接拼接就行；这个端点上你拼接就会得到 `1. 苹果\n2.1. 苹果\n2. 香蕉...`。
+
+注意这次失败的形状：**HTTP 200，没有任何报错，usage 正常，stop_reason 是 `end_turn`。** 只看状态码的检查一个字都抓不到。所以 `anatomy` 里我给这条探测加了个 `check` 函数去断言语义：
+
+```ts
+check: (res) =>
+  /1\.\s*苹果/.test(textOf(res))
+    ? 'prefill 被重新说了一遍，不是续写'
+    : null,
+```
+
+**200 的意思是「我收到了」，不是「我做到了」。** 兼容端点最常见的失败模式就是接受你的参数然后不照做——静默、不报错、看起来一切正常。这个区别在 L12 会展开成一整节 Evals，那节课的全部动机就是这一句话。
+
+顺便：这也是为什么 L03 讲 prefill 时我会让你先跑一遍探测再决定用不用它。
+
+</Note>
+
+---
+
+## 三、system prompt 为什么不是一条 message
+
+这是个设计问题，值得想清楚，因为面试常问。
+
+如果 system prompt 只是「第一条消息」，那它和用户输入在数据结构上就是同一个东西。而它们在**信任级别**上完全不同：system 是你写的，user 是外部输入的。把两者放进同一个数组，等于放弃了在结构上区分它们的能力。
+
+<Drill title="指令层级：为什么这个区分是安全机制的地基">
+
+模型在训练时被教导：system 里的指令优先级高于 messages 里的内容。这是通过 RLHF 阶段大量「用户试图推翻 system 指令，模型应当拒绝」的样本训练出来的一种**倾向**。
+
+注意这个词——**倾向**，不是保证。它是统计上的偏好，不是代码级的强制。这一点极其重要，而且是 L14 整节课的前提：
+
+- 好消息：把「不要泄露密钥」放在 system 里，比放在 user 消息里显著更难被绕过。
+- 坏消息：**它仍然可以被绕过**。任何声称「我把规则写在 system 里所以安全了」的人，都还没被 prompt injection 咬过。
+
+真正的边界必须在代码层：工具的权限范围、文件系统的沙箱、需要人工审批的动作清单。system prompt 是**第一道**防线，不是唯一一道。
+
+还有第二个原因，纯工程的：**缓存边界**。system prompt 是整个请求里最稳定的部分，把它放在结构的最前面且独立标记，服务商就能对它做前缀缓存。DeepSeek 的自动前缀缓存、Anthropic 的显式 `cache_control`，都建立在「system 在最前面且不变」这个假设上。如果 system 混在 messages 里随对话漂移，这个优化就没了。
+
+</Drill>
+
+那么什么该放 system，什么该放第一条 user 消息？判据是**变不变**：
+
+| 放 system | 放 messages |
+|---|---|
+| 角色、语气、输出格式约定 | 这次的具体任务 |
+| 工具使用纪律、边界规则 | 用户提供的数据、文件内容 |
+| few-shot 示例（如果固定） | 检索回来的上下文 |
+| 长期不变的项目背景 | 任何一轮才产生的东西 |
+
+一句话：**不变的往前放，变的往后放。** 这条规则在 L15 会以「省 50 倍钱」的形式回来找你。
+
+<CursorHook>
+
+你在 Cursor 里写的 `.cursor/rules` 和 `AGENTS.md`，本质上就是被拼进 system prompt 的内容。这解释了两个你可能观察到的现象：
+
+**一，为什么规则文件写得越长，Cursor 反应越慢、越容易忽略某条规则。** 它是 system prompt 的一部分，每轮都要重新过一遍，而且和其他所有内容竞争同一份注意力预算（L01 讲的注意力零和）。
+
+**二，为什么改了规则文件之后第一次对话明显更慢。** 前缀变了，缓存全部失效，要重新走一遍完整的 prefill。
+
+所以「规则文件应该短而具体」不是风格建议，是有成本依据的工程结论。
+
+</CursorHook>
+
+---
+
+## 四、stop_reason：把每一种都处理掉
+
+L01 你已经用真金白银撞过 `max_tokens` 了。这里补全整张表，以及每一种的**处置动作**——光知道含义不算会。
+
+| stop_reason | 含义 | 你必须做什么 |
+|---|---|---|
+| `end_turn` | 模型自己说完了 | 正常处理 |
+| `max_tokens` | 撞上输出闸门，被截断 | 内容不完整。报错、加大重试、或发「继续」 |
+| `stop_sequence` | 命中你指定的停止串 | 看 `stop_sequence` 字段知道是哪一个 |
+| `tool_use` | 模型要调工具 | 执行工具，回填 `tool_result`（L04/L05 的循环核心） |
+| `refusal` | 模型拒绝回答 | **不要重试**，重试只会再被拒一次 |
+| `pause_turn` | 长任务主动暂停 | 把原样内容回传，让它继续 |
+
+写代码的时候不要用 `if/else` 挑一两个处理，用**穷尽的 switch**：
+
+```ts
+switch (res.stop_reason) {
+  case 'end_turn':
+    return { ok: true, text: textOf(res.content) }
+  case 'tool_use':
+    return { ok: true, needsTools: true, blocks: res.content }
+  case 'max_tokens':
+    throw new TruncatedError(res)   // 半截内容绝不能静默入库
+  case 'stop_sequence':
+    return { ok: true, text: textOf(res.content), hitStop: res.stop_sequence }
+  case 'refusal':
+    throw new RefusedError(res)     // 不可重试
+  default:
+    // 新的枚举值会走到这里。别静默忽略，记一条 warn。
+    console.warn(`未见过的 stop_reason: ${res.stop_reason}`, res.id)
+    return { ok: true, text: textOf(res.content) }
+}
+```
+
+那个 `default` 分支是关键。协议会加新枚举值，兼容层可能返回文档里没写的值。**静默忽略未知状态是 agent 里最难查的一类 bug**：一切看起来正常，只是偶尔行为不对。
+
+<Pitfall title="max_tokens 是思考和正文共用的预算">
+
+写 `anatomy` 那个脚本时我踩了一次，值得单独说。
+
+我一开始给 `max_tokens: 16`——探测协议行为而已，不需要长输出，省点钱。结果几乎每条探测的正文都是空字符串。不是请求失败，返回是这样的：
+
+```text
+stop=max_tokens · 块[thinking] · out=200 · ""
+```
+
+`output_tokens` 是满的，内容块只有一个 `thinking`，**正文一个字都没有**。这 16 个（后来 200 个）token 全被思考块吃掉了，模型还没开始写答案就撞上闸门了。
+
+两条结论：
+
+**一，思考 token 算进 `output_tokens`，而且先花。** 所以它既花钱又占预算。V4 默认开着思考模式，这意味着你对 `max_tokens` 的直觉全部要重新校准——你以为在限制答案长度，实际在限制「思考 + 答案」的总长度。
+
+**二，这个失败模式在 agent loop 里特别毒。** L05 之后你会让模型输出工具调用。如果预算被思考吃光，你收到的是一个 `stop_reason: 'max_tokens'` 加一个空的 content——没有工具调用，也没有文字。循环拿不到任何可执行的东西，如果你没处理 `max_tokens`，它就会安静地空转一轮，或者直接卡死。
+
+所以上面那个 switch 里 `max_tokens` 抛错不是洁癖。**半截内容和空内容都必须响，因为它们在下游都会伪装成「模型什么都没想做」。**
+
+</Pitfall>
+
+<Note title="stop_sequences 的一个实用场景">
+
+`stop_sequences` 让你在模型输出撞到某个字符串时立刻停下。它最有用的场景不是省钱，是**结构控制**：
+
+```ts
+stop_sequences: ['</answer>']
+```
+
+配合 L03 会讲的 prefill，你能强制模型只输出一段被标签包裹的内容，然后在标签处干净地截断。这比事后用正则从一大段废话里抠答案可靠得多。
+
+注意：命中停止串时，**停止串本身不会出现在输出里**。想拼回完整结构得自己补上。
+
+</Note>
+
+---
+
+## 五、流式协议：把事件流看全
+
+L01 你用流式测了 TTFT。那时只关心了三种事件，现在把完整的事件序列摊开——因为 L05 写 agent loop 时，你要从这个流里实时解析出工具调用。
+
+一次典型的流式响应长这样：
+
+```text
+message_start          { message: { id, model, usage: { input_tokens } } }
+  content_block_start  { index: 0, content_block: { type: 'thinking' } }
+    content_block_delta  { index: 0, delta: { type: 'thinking_delta' } }
+    content_block_delta  { index: 0, delta: { type: 'thinking_delta' } }
+  content_block_stop   { index: 0 }
+  content_block_start  { index: 1, content_block: { type: 'text' } }
+    content_block_delta  { index: 1, delta: { type: 'text_delta' } }
+    content_block_delta  { index: 1, delta: { type: 'text_delta' } }
+  content_block_stop   { index: 1 }
+message_delta          { delta: { stop_reason }, usage: { output_tokens } }
+message_stop
+```
+
+四个必须理解的点：
+
+**一，`index` 不能忽略。** 一次响应里可能有多个内容块（思考块 + 文字块，或者文字块 + 多个工具调用块）。deltas 上的 `index` 告诉你这一小块属于哪个内容块。**按 index 分桶累积**，不要一路 `+=` 到同一个字符串上——否则思考内容和正文会糊在一起，工具调用的 JSON 参数会串行。
+
+**二，usage 被劈成两半。** `input_tokens` 在 `message_start`（服务端一开始就知道输入多长），`output_tokens` 在 `message_delta`（生成完才知道）。想记完整的账，两个事件都得抓。这是流式记账最常漏的地方。
+
+**三，`ping` 事件。** 服务端会周期性发送空的 `ping` 来保活，防止中间的代理层因为空闲把连接掐掉。你的代码要能安静地忽略它。
+
+**四，最阴的一条：流开始之后还可能出错。** HTTP 状态码是 200，头已经发出去了，然后流中间来一个 `error` 事件。
+
+<Pitfall title="200 之后才失败——这是流式最难处理的一件事">
+
+非流式请求里，「成功」和「失败」是互斥的：要么 200 拿到结果，要么非 2xx 抛错。流式打破了这个假设。
+
+已经发出去的 HTTP 头改不了了，所以服务端只能在**流内部**报错。你可能已经把半段文字渲染到用户屏幕上了，这时才知道这次调用失败了。
+
+三个后果：
+
+1. **重试语义变复杂了。** 你在 L00 写的 `withRetry` 是按「抛出的错误有没有 status」分类的。流中途的错误既不是 HTTP 错误，也不一定有 status。重试的话，前面那半段要不要保留？（答案：不保留。重发整个请求，前端丢弃已渲染的部分。所以前端必须支持「撤回已渲染内容」——L16 会做这个。）
+
+2. **`finally` 里的清理不能省。** 流可能在任意位置中断，累积到一半的状态得清理干净。
+
+3. **必须区分「流正常结束」和「流断了」。** 没收到 `message_stop` 就结束的流是**异常**的，哪怕没有 error 事件。判据只能是：见到 `message_stop` 才算成功。
+
+这就是为什么这节课要你把流式读取封成一个模块而不是每次现写——这些边界条件写一次就够了。
+
+</Pitfall>
+
+<Drill title="为什么是 SSE 而不是 WebSocket">
+
+流式 LLM 响应用的是 **SSE（Server-Sent Events）**，跑在普通 HTTP 上，`Content-Type: text/event-stream`。为什么不用 WebSocket？
+
+因为需求是**单向**的。请求发出去之后，剩下的全是服务端往客户端推。WebSocket 的双向能力在这里是纯粹的额外成本：它要升级协议、要自己做心跳和重连、经过企业代理和 CDN 时麻烦得多，而且没法用 HTTP 那一整套现成的基础设施（重试、缓存头、标准的鉴权、负载均衡）。
+
+SSE 的报文格式非常朴素：
+
+```text
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"你"}}
+
+event: ping
+data: {"type":"ping"}
+
+```
+
+以 `\n\n` 分隔事件。这个细节直接导致了 L00 提过的那个坑：**TCP 不保证一次 read 恰好读到一个完整事件**。你可能读到半个 JSON，也可能一次读到三个事件。所以解析必须维护一个缓冲区，按 `\n\n` 切分，处理完整的部分，把剩下的留着等下一块数据。
+
+你用 SDK 时没遇到这个坑，是因为 SDK 内部替你做了缓冲。但当你在 L16 把这个流从自己的服务端转发给浏览器时，你就在那一层重新面对它了——**转发不是搬运，中间那一层的缓冲逻辑得你自己写对。**
+
+</Drill>
+
+---
+
+## 六、把成本和延迟建成模型
+
+现在到本节的核心。你已经有一堆测量数据了，接下来把它们变成**能预测的公式**。
+
+### 延迟模型
+
+一次调用的墙上时间可以拆成两段，对应模型推理的两个阶段：
+
+```text
+总时长 ≈ TTFT + 输出 token 数 × TPOT
+
+其中  TTFT ≈ 固定开销 + 输入 token 数 × 每 token 预填充时间
+```
+
+- **TTFT**（time to first token）= 网络往返 + 排队 + **prefill**。prefill 是把整个输入过一遍算出 KV cache 的过程，可以高度并行，所以对输入长度是「近似线性但斜率很小」。
+- **TPOT**（time per output token）= 逐个生成 token 的速度。这一步**无法并行**——第 n 个 token 依赖第 n−1 个，必须串行。
+
+结论直接得刺眼：**想让 agent 变快，第一优先级永远是砍输出长度，不是砍输入长度。**
+
+你在 L00 已经无意中验证过这条了：加一句「只用一句话回答」，输出 token 减少 92%，耗时减少 90%。两个数字几乎相等，因为总时长基本就是输出长度的线性函数。
+
+<Note title="这条结论怎么用">
+
+- 让模型输出「要改的那几行」而不是「整个文件」——这是 Cursor 用 diff 而不是全文重写的**第一**理由（第二个理由是 L01 讲的 token 位置感知）。
+- 让模型输出结构化的短标签而不是长篇解释，需要解释时再单独问。
+- agent loop 里每一步都别让它长篇大论。十步各说五百字，等于用户等五千字。
+
+反过来，输入长虽然不太影响 TTFT，但**直接影响钱**，而且每轮都付。所以输入和输出要优化的是不同的指标：**输入管钱，输出管时间。**
+
+</Note>
+
+### 成本模型
+
+```text
+单次成本 = 未命中输入 × 单价_miss
+         + 命中输入   × 单价_hit
+         + 输出       × 单价_out
+```
+
+代入 DeepSeek V4 Flash 的价格（元 / 百万 token）：
+
+| | 单价 | 相对 |
+|---|---|---|
+| 输入 · 缓存未命中 | 1 | 50× |
+| 输入 · 缓存命中 | 0.02 | 1× |
+| 输出 | 2 | 100× |
+
+**输入命中和未命中差 50 倍。** 这个数字是 L15 一整节课的由来，也是「不变的往前放」那条纪律的全部价值所在。
+
+<Drill title="前缀缓存到底缓存了什么">
+
+缓存的不是文本，是 **KV cache**——prefill 阶段算出来的那堆中间张量。
+
+关键在于 attention 的因果性：第 n 个 token 的 K 和 V 只取决于它自己和它**前面**的 token，与后面的无关。所以只要请求的**前缀**逐 token 完全一致，那段前缀的 KV 就能原样复用，prefill 直接从第一个不同的 token 开始算。
+
+由此推出三条硬约束：
+
+**一，必须是前缀，不是「包含」。** 中间改一个 token，从那个位置往后全部失效。在历史中间插一条消息、改一下 system prompt 的某个字、甚至调整一下 JSON 里键的顺序，都会让后面全废。
+
+**二，必须逐 token 一致。** 不是「语义相同」，是分词后的整数序列完全相同。多一个空格就是不同的 token 序列。所以任何往 prompt 里注入**当前时间戳**的做法都是在自毁缓存——这是最常见的一个自伤操作。
+
+**三，命中同时省钱和省时间。** 少算 prefill 就是少花 GPU 时间，所以 TTFT 也一起降。这是少见的「两个指标同向改善」的优化。
+
+DeepSeek 的实现是**自动**的：你不用传任何参数，命中与否完全取决于你的前缀稳不稳定。Anthropic 官方需要显式打 `cache_control` 标记。两种机制对你的代码要求不同，但**纪律是同一条：前缀只追加，不修改。**
+
+</Drill>
+
+<Lab title="本节的两个交付物">
+
+这节课的动手部分不是练习，是**造两个你要用一整门课的模块**。
+
+```bash
+# TypeScript 主通道
+pnpm anatomy          # 探测兼容层的真实行为，产出一张差异表
+pnpm ledger           # 任务一：成本账本
+pnpm reader           # 任务二：流式读取器
+pnpm verify:l02       # 21 条测试，验证上面两个
+
+# Python 副通道（同样的两个任务，同一套测试）
+uv run python -m l02.ledger
+uv run python -m l02.reader
+uv run python -m l02.verify
+```
+
+`shared/ledger.ts` 和 `shared/stream.ts` 里已经有我的实现了——**先别看**。自己写完，跑过 verify，再拿你的版本和我的对照。差异比答案有价值：你会看到两种设计取舍，而不是一个「正确答案」。
+
+verify 里那 21 条有一半是我在真实项目里踩过的，标了 ★。特别是 `★★ 没收到 message_stop 就结束`那条——它是这节课最难自己想到的一个判据。
+
+</Lab>
+
+<Note title="先证明尺子是准的">
+
+开始写之前，先跑这个：
+
+```bash
+VERIFY_TARGET=shared pnpm verify:l02        # Python: VERIFY_TARGET=shared uv run python -m l02.verify
+```
+
+它会拿同一套测试去测 `shared/` 里我的实现，应该 21/21 全绿。
+
+这一步是为了让你后面**每一次出红都能确定是自己的代码有问题**，而不用怀疑测试写错了。测试本身也是代码，也会有 bug；在依赖一把尺子之前先量一个已知长度的东西，是个值得养成的习惯。L12 做 evals 时这件事会以更严肃的形式回来：**你的评估集本身，也需要被评估。**
+
+</Note>
+
+<PyMirror>
+
+Python 这边有两处形状差异，都不是语法层面的。
+
+**一，流式的上下文管理器。** TS 的 `for await...of` 结束时，如果你在中间 `break` 了，SDK 靠 async iterator 的 `return()` 钩子去关连接——很容易漏。Python 强制你写 `with`：
+
+```python
+with client.messages.create(..., stream=True) as stream:
+    for event in stream:
+        if done:
+            break          # 退出 with 时连接必定被关掉
+```
+
+这是 Python 在这件事上明显更好的地方：**资源释放被语法结构保证了**，而不是靠你记得。
+
+**二，账本的数据形状。** TS 那边我用了 interface + 可选字段，Python 这边用 `dataclass`：
+
+```python
+@dataclass
+class Usage:
+    input_tokens: int
+    output_tokens: int
+    cache_read_input_tokens: int = 0
+    cache_creation_input_tokens: int = 0
+```
+
+看起来只是写法不同，但有个实际差别：`dataclass` 默认不做运行时校验，SDK 返回的对象缺字段时你拿到的是 `AttributeError` 而不是 `undefined`。这是好事——**响得早的错比静默的 undefined 好查**。真要做校验就上 `pydantic`，那是 Python agent 生态的事实标准，L11x 会讲它为什么赢了。
+
+**三，一个 Python 独有的坑，而且它和这节课的主题撞得很巧。** dataclass 里放可变默认值必须用 `field(default_factory=...)`：
+
+```python
+@dataclass
+class Ledger:
+    entries: list[Entry] = field(default_factory=list)   # 对
+    # entries: list[Entry] = []                          # 错：所有实例共享同一个列表
+```
+
+写错的表现是：你以为每个账本各记各的，实际所有账本往同一个列表里塞。这个 bug 的形状和 L01 那道改错题里「模块级 `history` 被多个用户共享」**一模一样**——都是「看起来是每个实例一份，实际是全局一份」。换了语言，坑的形状不变。
+
+</PyMirror>
+
+---
+
+## 七、这节课的纪律
+
+三条，都会一路用到 L19：
+
+1. **每次调用都过账本。** 不记账的调用等于不存在——你没法优化你没测量的东西。
+2. **每条日志带 `id` 和实际 `model`。** 出问题时这两个字段决定你能不能查。
+3. **穷尽处理 `stop_reason`，未知值要出声。** 静默忽略未知状态是最贵的偷懒。
+
+下一节开始写 prompt。你会发现，写好 prompt 的一半功夫其实是这节课的结构设计——**把不变的、可缓存的、可信的部分和它们的反面分开放。**

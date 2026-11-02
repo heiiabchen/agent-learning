@@ -1,0 +1,400 @@
+你会写 React，但 agent 里没有 React。
+
+Agent 开发的九成是后端工程：进程、并发、流、重试、密钥、成本。这不是说前端经验没用——恰恰相反，你在 L16 会发现自己有别人没有的优势。但在那之前，有四个洞必须先填上，因为它们是前端工程师转 agent 时最常掉进去的四个：**把密钥当配置、把并发当免费、把流式当轮询、把错误当意外**。
+
+<Key>
+这节课不是要把你变成后端工程师。它只填那四个洞，然后让你亲手发出人生第一个 LLM 请求。
+</Key>
+
+---
+
+## 一、先认清你要打的这个接口有多反常
+
+你熟悉的 HTTP 接口大致是这样的：几十到几百毫秒返回，返回体结构固定，同样的入参得到同样的出参，失败了重试一次通常就好了，而且不花钱。
+
+LLM 接口在这四条上全部相反。
+
+| | 你熟悉的业务接口 | LLM 接口 |
+|---|---|---|
+| 延迟 | 50–300ms | 2–60 秒，且无法预测 |
+| 计费 | 不计 | 按 token 计，一个 bug 能烧掉几十块 |
+| 确定性 | 同入参同出参 | 同入参不同出参，天然如此 |
+| 重试 | 基本安全 | 可能重复执行副作用，也可能重复付钱 |
+
+这四条差异会渗透到你写的每一行 agent 代码里。举个具体的例子：前端里 `Promise.all` 是你的好朋友，二十个请求并发打出去，快得很。在 agent 里同样写法会让你在三秒内撞上 429 限流，而且因为你没做退避，重试风暴会把这三秒变成三分钟。更糟的是每次重试都在真实扣费。
+
+<CursorHook>
+
+你有没有注意过 Cursor 里 agent 干活时那种「一顿一顿」的节奏——想一会儿、调个工具、再想一会儿？那不是动画效果，那是真实的往返延迟。每一次「想」都是一次几秒级的 API 调用。
+
+也正因为如此，Cursor 花了大量工程量在**掩盖延迟**上：先流式吐出思考过程让你有东西可看，工具调用并行发出，小任务路由给更快的模型。这些手段我们在 L15 和 L16 会逐个实现。你现在只需要记住：**在 agent 产品里，延迟不是性能指标，是产品设计的第一约束。**
+
+</CursorHook>
+
+<Drill title="为什么 LLM 的延迟没法靠加机器解决">
+
+普通接口慢，通常是因为数据库查询慢或者串行调用太多，扩容和优化能解决。LLM 慢的原因是结构性的：它**自回归生成**。
+
+模型每次前向计算只产出一个 token，而下一个 token 的计算需要把刚产出的那个也作为输入。这是严格串行的依赖链——生成 500 个 token 就必须跑 500 次前向计算，无论你有多少张卡。
+
+所以一次 LLM 请求的耗时可以拆成两段：
+
+- **TTFT（time to first token）**：处理你输入的所有 token。这一段是可以并行的，所以相对快，但会随输入长度增长。
+- **TPOT（time per output token）**：之后每个输出 token 的时间。这一段无法并行，只能靠更快的硬件和更小的模型。
+
+这个拆分很重要，因为它告诉你两件事：**输入长度主要影响首字延迟，输出长度主要影响总时长**。所以「让模型少啰嗦」是一个真实的性能优化手段，而不只是审美偏好。这也是为什么后面讲 prompt 时我会反复强调控制输出长度。
+
+L05x 会把这条链路从 attention 一路讲到采样。现在够用了。
+
+</Drill>
+
+---
+
+## 二、密钥：你的第一课是安全课
+
+我要先堵一个前端工程师极容易犯的错：**永远不要在浏览器里放 API key**。
+
+不是"尽量不要"，是绝对不要。而且我要把常见的三种自我说服逐个拆掉：
+
+- 「我用了环境变量」——Vite 的 `import.meta.env.VITE_XXX` 是**编译进产物**的，任何人打开 DevTools 的 Sources 就能搜到。环境变量在前端只是构建期替换，不是运行期机密。
+- 「用户看不到，我藏在混淆代码里」——混淆不是加密。抓包比看代码更省事。
+- 「我配了 CORS 只允许我的域名」——CORS 是**浏览器**的行为约束，不是服务器的鉴权。curl 完全不看 CORS。
+
+泄漏的后果不是"有人用你的额度聊天"这么温和。公开在 GitHub 上的 key 会被扫号机器人在几分钟内捡走，然后拿去跑大规模推理。你第二天看到的是一张四位数的账单。
+
+正确的形状永远是：**浏览器 → 你的服务端 → 模型 API**。你的服务端持有密钥、做鉴权、做限流、记账。这也是为什么 agent 开发绕不开后端。
+
+<CursorHook>
+
+这就是 Cursor 必须有服务端的原因之一。你在 Cursor 里填的那个 key 存在本地，但 Cursor 自己的模型调用是走它的服务端的——它需要在那里做配额、路由、缓存和计费。一个纯客户端的 agent 产品在商业上是不成立的。
+
+</CursorHook>
+
+### 在 Node 里正确读密钥
+
+好消息：Node 22 原生支持 `--env-file`，你不再需要 `dotenv`。
+
+```bash
+node --env-file=.env script.js
+```
+
+配套的三件事必须一起做，缺一件都算没做：
+
+```bash
+# 1. .env 存真实密钥，绝不进 git
+DEEPSEEK_API_KEY=sk-xxxxxxxxxxxx
+
+# 2. .env.example 存结构不存值，进 git，给协作者看
+DEEPSEEK_API_KEY=
+
+# 3. .gitignore 里必须有
+.env
+.env.local
+```
+
+<Pitfall title="已经提交过密钥怎么办">
+
+如果你不小心 commit 了 key，**改 .gitignore 或者删掉再提交都没用**——git 历史里还在，公开仓库的话已经被扫走了。
+
+唯一正确的处置顺序是：先去平台把那个 key 吊销（revoke），再生成新的。清理 git 历史是次要的、可选的，吊销才是止血。记住这个顺序，因为很多人本能地先去改代码，那几分钟足够机器人把 key 用了。
+
+</Pitfall>
+
+---
+
+## 三、并发：从 `Promise.all` 到闸门
+
+前端很少需要认真做并发控制，因为浏览器帮你限流了（同域名连接数上限），而且请求便宜。Agent 里两个前提都不成立。
+
+先把三个 API 的语义分清楚，因为选错的后果在 agent 里被放大得很厉害：
+
+- `Promise.all`：**任一失败就整体 reject**，其余请求依然在跑（你只是不再等它们，钱照付）。适合"缺一不可"的场景。
+- `Promise.allSettled`：全部等完，逐个给结果。Agent 里的批量工具调用几乎总是应该用这个——一个工具失败不该让整批作废，而是应该把失败信息作为结果交回给模型，让它自己决定怎么办。
+- `Promise.race`：谁先完成用谁。主要用来做超时。
+
+但这三个都不解决核心问题：**它们没有上限**。二十个任务就是二十个并发请求。
+
+所以你需要一个并发闸门。这是 agent 代码里出现频率最高的工具函数之一，我要你自己写一遍而不是装 `p-limit`，因为理解它只需要五分钟，而这五分钟能让你在后面读任何 agent 框架的源码时都受益：
+
+```ts
+/** 以最多 limit 路并发跑完所有任务，保持结果顺序。 */
+export async function pooled<T, R>(
+  items: T[],
+  limit: number,
+  worker: (item: T, index: number) => Promise<R>,
+): Promise<PromiseSettledResult<R>[]> {
+  const results: PromiseSettledResult<R>[] = new Array(items.length)
+  let cursor = 0
+
+  async function run() {
+    while (cursor < items.length) {
+      const i = cursor++ // 先取后增，避免两个 runner 抢到同一个下标
+      try {
+        results[i] = { status: 'fulfilled', value: await worker(items[i], i) }
+      } catch (reason) {
+        results[i] = { status: 'rejected', reason }
+      }
+    }
+  }
+
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, run))
+  return results
+}
+```
+
+值得停下来看两处细节。`const i = cursor++` 必须先取后增，否则两个 runner 会处理同一个元素——注意这里没有锁，靠的是 JavaScript 单线程在 `await` 之前不会被打断。另外它返回的是 `PromiseSettledResult`，也就是**不吞错、也不因为一个错而整体崩**，这正是 agent 需要的语义。
+
+### 超时与取消
+
+LLM 请求偶尔会挂住不返回。没有超时的话你的 agent 就永久卡在那里。`AbortController` 是标准解法：
+
+```ts
+export async function withTimeout<R>(ms: number, fn: (signal: AbortSignal) => Promise<R>) {
+  const ctl = new AbortController()
+  const timer = setTimeout(() => ctl.abort(new Error(`超时 ${ms}ms`)), ms)
+  try {
+    return await fn(ctl.signal)
+  } finally {
+    clearTimeout(timer) // 成功时也要清，否则进程会被定时器吊住不退出
+  }
+}
+```
+
+那句 `clearTimeout` 在 `finally` 里不是洁癖。Node 里未清理的定时器会让进程无法自然退出，你的脚本会在打印完结果后诡异地挂住几十秒。
+
+---
+
+## 四、流式：SSE 到底是什么
+
+用户能忍受等待，但不能忍受**没有反馈的等待**。这是流式输出存在的唯一理由——它没让总时间变快，只是把首次反馈从 20 秒提前到 0.5 秒。
+
+### 协议本体比你想的简单
+
+Server-Sent Events 就是一个不结束的 HTTP 响应，服务端持续往里写纯文本，格式是 `data: ` 开头、两个换行结尾：
+
+```text
+event: content_block_delta
+data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"你"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"好"}}
+
+event: message_stop
+data: {"type":"message_stop"}
+```
+
+没有魔法。就是一个慢慢写完的 HTTP 响应体。
+
+### 为什么不能用 `EventSource`
+
+浏览器原生的 `EventSource` 看起来正是为此设计的，但它有个致命限制：**只支持 GET，不能自定义请求体**。而 LLM 请求要发一大坨 JSON，必须用 POST。
+
+所以实际做法是 `fetch` + 手动读 `ReadableStream`：
+
+```ts
+const res = await fetch('/api/chat', {
+  method: 'POST',
+  headers: { 'content-type': 'application/json' },
+  body: JSON.stringify({ messages }),
+})
+
+const reader = res.body!.pipeThrough(new TextDecoderStream()).getReader()
+let buffer = ''
+
+while (true) {
+  const { done, value } = await reader.read()
+  if (done) break
+  buffer += value
+
+  // 关键：一次 read 拿到的不一定是完整的一条事件，
+  // 可能是半条，也可能是三条半。必须按分隔符切，留下残余等下一块。
+  const parts = buffer.split('\n\n')
+  buffer = parts.pop() ?? ''
+
+  for (const part of parts) {
+    const line = part.split('\n').find((l) => l.startsWith('data: '))
+    if (line) onEvent(JSON.parse(line.slice(6)))
+  }
+}
+```
+
+<Pitfall title="缓冲区拼接：新手 90% 会踩的坑">
+
+上面那段代码里唯一真正重要的是 `buffer` 那三行。
+
+TCP 不保证你一次 `read()` 拿到的正好是一条完整事件。它可能给你 `data: {"tex`，剩下的在下一块。如果你天真地对每次 read 的结果做 `JSON.parse`，程序会在随机时刻抛 `Unexpected end of JSON input`——而且往往在本地跑得好好的，一上线遇到真实网络就炸。
+
+所以规则是：**永远维护一个缓冲区，按分隔符切，把最后一段残余留到下次。** 这条规则适用于所有流式协议，不只是 SSE。
+
+好消息是官方 SDK 已经帮你做了这件事，你在 lab 里用的是 `for await`。但你必须知道底下发生了什么，因为总有一天你要自己接一个没有 SDK 的接口，或者要在自己的服务端把流转发给前端——那时你就在写这段代码。
+
+</Pitfall>
+
+<Drill title="SSE 和 WebSocket 该怎么选">
+
+WebSocket 是全双工、二进制友好、需要独立的连接升级和心跳维护。SSE 是单向、纯文本、就是普通 HTTP。
+
+LLM 场景选 SSE 而不是 WebSocket，理由很实际：
+
+- 数据流**天然单向**（服务端往客户端吐 token），用不上全双工。
+- 是普通 HTTP，所以 CDN、反向代理、鉴权中间件、日志全都照常工作。WebSocket 经常要为它们单独配置。
+- 断线重连语义简单，浏览器 `EventSource` 甚至自带重连。
+- 一次对话就是一次请求，请求结束连接就结束，不需要维护长连接状态。
+
+反过来说，如果你要做的是多人协作 agent、或者需要客户端持续推送（比如实时语音），那 WebSocket 才是对的。
+
+这道选择题在面试里出现的频率不低，值得记住理由而不只是结论。
+
+</Drill>
+
+---
+
+## 五、错误处理：乐观主义是要付钱的
+
+前端的错误处理常常可以偷懒——请求失败弹个 toast 让用户重试就行。Agent 里不行，因为一次失败可能发生在一个已经跑了两分钟、烧了五毛钱、执行了三个工具的任务中间。
+
+先把 LLM API 的典型错误分成三类，因为**处置方式完全不同**：
+
+**该重试的（瞬时故障）**
+
+- `429` 限流：一定要重试，但必须退避。优先读响应头里的 `retry-after`。
+- `500 / 502 / 503 / 529`：服务端抖动，重试。
+- 网络超时、连接重置：重试。
+
+**重试纯属浪费钱的（确定性失败）**
+
+- `400` 请求格式错：你的代码有 bug，重试一万次结果一样。
+- `401 / 403`：密钥问题。
+- 上下文超长：得先压缩上下文再来（这是 L06 的主题）。
+- 内容审核拒绝：换个说法可能过，原样重发不会过。
+
+**需要人来看的**
+
+- 模型返回了格式不对的结果（比如你要 JSON 它给了散文）。这不是 HTTP 错误，是**语义错误**，也是 agent 里最难缠的一类。L03 和 L12 专门处理。
+
+### 退避为什么必须加抖动
+
+标准做法是指数退避：失败后等 1 秒、2 秒、4 秒、8 秒。但如果你有二十个并发请求同时撞上 429，它们会**同时**等 1 秒，然后**同时**重试，再次同时被限流。这叫惊群效应。
+
+解法是给等待时间加随机抖动，把它们错开：
+
+```ts
+const RETRIABLE = new Set([408, 409, 429, 500, 502, 503, 504, 529])
+
+export async function withRetry<R>(fn: () => Promise<R>, tries = 4): Promise<R> {
+  let lastErr: unknown
+  for (let attempt = 0; attempt < tries; attempt++) {
+    try {
+      return await fn()
+    } catch (err) {
+      lastErr = err
+      const status = (err as { status?: number }).status
+      // 不可重试的错误立刻抛出，不要浪费时间和钱
+      if (status !== undefined && !RETRIABLE.has(status)) throw err
+      if (attempt === tries - 1) break
+
+      const base = 1000 * 2 ** attempt
+      const jitter = Math.random() * base * 0.3 // 抖动，打散惊群
+      await new Promise((r) => setTimeout(r, base + jitter))
+    }
+  }
+  throw lastErr
+}
+```
+
+<Pitfall title="重试与副作用：一个真实会咬人的场景">
+
+假设你的 agent 调了一个「发邮件」工具，工具执行成功了，但把结果回传给模型的那次请求超时了。你的重试逻辑会重发请求——模型看到的是同样的状态，于是**又一次决定发邮件**。用户收到两封。
+
+这就是为什么 LLM 调用**不是幂等的**：重试的对象不只是网络请求，还包括模型基于当前状态做出的决策。
+
+真正的解法要到 L08（状态与恢复）和 L14（审批流）才完整，但你现在就该把这个意识建立起来：**只要工具会产生外部副作用，重试就必须考虑幂等**。常见手段是给每次工具调用生成幂等键，或者把「已执行」的事实先落盘再执行。
+
+</Pitfall>
+
+---
+
+## 六、把地基变成项目
+
+最后一件事：为什么我们的代码要把模型 ID 和端点抽到配置里，而不是写死。
+
+因为你用的是**兼容端点**。DeepSeek 提供了一个 Anthropic 协议的兼容层，让你能用 Anthropic 官方 SDK 打 DeepSeek 的模型。这对学习是件好事——你学到的是行业标准的 Messages API 心智模型，花的是国内模型的价钱。
+
+但兼容层有两个必须提前知道的性质：
+
+<Pitfall title="兼容不等于等同">
+
+**一，特性会静默缺失。** prompt caching（`cache_control`）、vision、`thinking` 这些高级特性，兼容层可能不支持、可能部分支持、也可能干脆忽略你的参数而不报错。最阴的是「不报错」——你以为开了缓存，其实一直在全价付费。L15 会专门做一次实测来量这个缺口。
+
+**二，模型 ID 变得很勤。** `deepseek-chat` 这个名字在 2026 年 7 月就已经退役了。所有把模型 ID 写死在代码里的人那天集体报错。
+
+这两条合起来就是一个明确的工程要求：**端点、模型 ID、以及"这个 provider 支持哪些特性"都必须是配置，不是常量**。我们从第一行代码就这么写。
+
+</Pitfall>
+
+<Lab title="跑通你的第一个 LLM 请求">
+
+现在离开网页，去 IDE。完整说明在 `labs/README.md`，这里是任务清单。
+
+<Steps>
+<li>去 [platform.deepseek.com](https://platform.deepseek.com/) 注册并创建 API key，充最小额度（十块钱够你学完好几节课）。</li>
+<li>`cd labs && pnpm install`，然后把 `.env.example` 复制成 `.env` 填入你的 key。确认 `.gitignore` 里有 `.env`。</li>
+<li>补完 `00-first-call/hello.ts`：发出第一个请求，把模型的回答打印出来，并打印这次调用消耗的输入/输出 token。</li>
+<li>补完 `00-first-call/stream.ts`：改成流式，让文字一个字一个字出现。感受一下 TTFT 和总时长的差别。</li>
+<li>补完 `00-first-call/resilient.ts`：把 `withRetry`、`withTimeout`、`pooled` 三个工具函数写出来，然后并发问模型五个问题，限制最多两路并发。观察它是不是真的两个两个来。</li>
+<li>做完再看 `solutions/`。先自己写，卡住十分钟以上再看——卡住的那十分钟才是学习发生的地方。</li>
+</Steps>
+
+三个文件都留了 `TODO` 注释标出你要写的部分。跑法：
+
+```bash
+pnpm hello      # 或 pnpm hello:sol 看参考实现
+pnpm stream
+pnpm resilient
+```
+
+</Lab>
+
+<PyMirror>
+
+Python 从 L04 才正式开始对照，但第一个请求提前打个照面，你会发现两边几乎一模一样——这也是为什么我不担心你后面看不懂 Python 代码。
+
+```python
+import os
+from anthropic import Anthropic
+
+client = Anthropic(
+    base_url="https://api.deepseek.com/anthropic",
+    auth_token=os.environ["DEEPSEEK_API_KEY"],  # 注意是 auth_token 不是 api_key
+)
+
+msg = client.messages.create(
+    model="deepseek-chat",
+    max_tokens=1024,
+    messages=[{"role": "user", "content": "用一句话解释什么是 agent"}],
+)
+
+print(msg.content[0].text)
+print(f"in={msg.usage.input_tokens} out={msg.usage.output_tokens}")
+```
+
+差异只在命名习惯：Python 用 snake_case，TS 用 camelCase。`messages.create` 这个调用形状、`max_tokens` 必填、`content` 是数组而不是字符串——这些都是 Messages API 的规定，两边完全一致。
+
+</PyMirror>
+
+---
+
+## 这节课的收尾
+
+回头看，四个洞现在都填上了：
+
+- **密钥**不进浏览器、不进 git，泄漏了先吊销再改代码。
+- **并发**要有闸门，批量任务用 `allSettled` 而不是 `all`。
+- **流式**是一个慢慢写完的 HTTP 响应，读的时候必须维护缓冲区。
+- **错误**要先分类再决定重试，退避必须加抖动，有副作用的操作要考虑幂等。
+
+<Key>
+这四条不是后端知识清单，是你未来每一节课都会用到的地基。后面所有关于 agent 的复杂性，都是搭在这四条上面的。
+</Key>
+
+下一节我们回到你刚才发出的那个请求，把它彻底拆开：那段文字是怎么变成 token 的、context window 到底限制了什么、为什么模型会一本正经地编造事实。答完题就来。

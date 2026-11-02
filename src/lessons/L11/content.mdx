@@ -1,0 +1,744 @@
+L07 讲了五种编排模式，L10 讲了怎么把别人的工具接进来。这一节讲一件所有人都想做、而大多数场合都不该做的事：**开好几个 agent 一起干活。**
+
+先立一个定义，因为这个词被用得太随便了。
+
+<Key>
+**多 agent ≠ 多次模型调用。**
+
+L07 那五种模式全都是多次调用，但它们是**单 agent**——因为只有一个上下文。
+
+多 agent 的定义性特征是**上下文隔离**：每个 agent 有自己的上下文窗口、自己的工具、自己的循环。它们之间只能通过**序列化的文本**互相传话。
+
+这一节剩下的全部内容，都是这一句的后果。
+</Key>
+
+顺着这个定义往下推，两件事立刻成立，而它们决定了这一节的结构：
+
+- sub-agent **看不到**编排者的任何东西。你必须把背景写进一份任务书，而任务书里写漏的部分，它会自己编
+- 编排者**看不到** sub-agent 的任何原始材料。它只拿到一份摘要，所以它没有能力判断那份摘要对不对
+
+---
+
+## 一、15 倍，以及为什么这个数字通常被读错
+
+Anthropic 在他们那篇多 agent 研究系统的复盘里公布了两个数字，现在到处被引用：
+
+<Key>
+**单 agent 约用 4 倍聊天的 token，多 agent 约用 15 倍。**
+</Key>
+
+这两个数字很有用。**围绕它们的那个结论几乎全是错的。**
+
+最常见的读法是"多 agent 的协调开销很大，所以要优化协议、压缩任务书、精简报告"。`labs/l11/compare.ts` 那组实验能一次把这个读法否掉。
+
+先用前面几节的实测参数把这两个倍数**推出来**——工具定义 911 token（L10 实测的十个工具），一次工具返回 1200 token，任务书 180，报告 300：
+
+```text
+分母：一次普通聊天 = 3,750 token
+（6 轮、每轮 250 token 累积。聊天里没有工具定义也没有工具结果，
+  这正是它便宜的原因，也是它能当分母的原因）
+
+  单 agent 跑 5 步            16,555 token     4.4× 聊天   ← 公布值：约 4×
+  3 个 sub-agent 各跑 5 步    60,820 token    16.2× 聊天   ← 公布值：约 15×
+```
+
+对上了。而"5 步"不是挑出来凑答案的——Anthropic 写进 prompt 的投入分级里，"简单事实查找"就是 1 个 agent、3 到 10 次工具调用。
+
+这说明那两个倍数**不是他们那套系统的特性，是这个架构的算术后果**。换句话说，你自己搭的多 agent 也会是这个倍数。
+
+接着把 60,820 拆开看：
+
+```text
+  单 agent（5 步）      共 16,555 token
+    工具定义     4,555   28%
+    上下文增长  12,000   72%
+    协调开销         0    0%
+
+  多 agent（3 个 × 5 步）  共 60,820 token
+    工具定义    18,220   30%
+    上下文增长  39,000   64%
+    协调开销     3,600    6%   ← 就这些
+```
+
+<Key>
+**多 agent / 单 agent = 3.67 倍，而扇出宽度是 3。**
+
+这个倍数**几乎就是扇出宽度本身**。协调开销只占 6%。
+
+所以"多 agent 贵，是因为协调很贵"是个错误诊断。真实情况是：**它贵是因为它做了三倍的工作。**
+</Key>
+
+这个区别不是措辞讲究，它决定你去动哪里：
+
+| 你以为的原因 | 你会去做的事 | 能动的部分 |
+| --- | --- | --- |
+| 协调贵 | 优化任务书格式、压缩报告、改协议 | 6% |
+| 工作量大 | 问"这三路探索里有几路是必要的" | 100% |
+
+而 Anthropic 那句"token 用量本身解释了 80% 的性能差异"说的正是这件事：**多出来的 token 不是浪费，它就是产品。** 你花钱买的是多探索了三个方向。
+
+所以这一节的主结论可以提前说完：
+
+<Key>
+**多 agent 是一种花钱策略，不是一种架构。**
+
+你花钱买的是并行探索的容量。任务里真有三个独立方向时，这笔钱买到了东西；没有的时候，钱照花，东西买不到。
+</Key>
+
+---
+
+## 二、同样的工作量下它反而便宜，而这是个陷阱
+
+上一节比的是"同一个任务、两种拓扑"，多 agent 做了三倍的活。现在把总工作量固定住，只看拓扑效应：
+
+```text
+同样 15 步的工具调用总量：
+
+  单 agent 跑 15 步        139,665 token   ¥0.419
+  3 个 sub-agent × 5 步     60,820 token   ¥0.182
+
+  比值：0.44×
+```
+
+多 agent 便宜了一半多。原因很直接：上下文增长从一个 O(15²) 变成三个 O(5²)，15² = 225 而 3 × 5² = 75。**切碎上下文确实省钱，省的是平方项。**
+
+但省下来的那部分是什么？
+
+<Key>
+**便宜和有损是同一件事的两面。你省下的钱，等于你丢掉的上下文。**
+
+单 agent 第 14 步的时候看得到第 2 步读到的东西。三个 sub-agent 里，没有任何一个看得到别人读到的东西。
+</Key>
+
+于是同一个数字有两种读法，取决于任务：
+
+- 任务真可拆（各路互不相干）→ 丢掉的那部分本来就没用，这笔交易是赚的
+- 任务不可拆 → 你用**更少的钱**买到了一个**更差的结果**，而账单上只看得到"更少的钱"
+
+<Note title="为什么第一节和第二节必须分开看">
+
+同一个问题"多 agent 贵不贵"，两节给出了方向相反的答案。这不是矛盾，是问题问得不一样：
+
+- **同一个任务**（第一节）→ 贵 3.67 倍，因为它做了三倍的活
+- **同样的工作量**（第二节）→ 便宜一半，因为它把平方项切碎了
+
+真实决策里两个都会遇到。判断你在问哪一个，看你的对照组是什么：如果单 agent 版本会做同样多的工具调用，你在问第二个问题；如果单 agent 版本会更早收手，你在问第一个。
+
+</Note>
+
+---
+
+## 三、任务书：sub-agent 唯一能看到的东西
+
+现在进到具体设计。先说派出去之前的事。
+
+sub-agent 是一个**全新的上下文**。编排者知道的一切，它一个字都看不到。Anthropic 踩出来的结论是一份任务书必须有四项：**目标、输出格式、工具与信源指引、任务边界**。
+
+`shared/multi.ts` 里的 `Brief` 就是这四项加一个 agent 名，`checkBrief` 查六件事。其中一件比其他五件都重要：
+
+<Pitfall title="「上面提到的那个文件」是一个空引用，而它不会报错">
+
+这是这一节最值得记住的一条。
+
+编排者写任务书的时候，它的上下文里确实有"上面提到的那个文件"。它写出这句话是完全自然的——它就在那个上下文里。
+
+而 sub-agent 收到这句话的时候，**那个所指不存在**。
+
+如果这时它抛一个异常，这个 bug 五分钟就修完了。但它不会。它会：
+
+1. 编一个所指出来（模型在信息缺失时的默认行为，L01 讲过为什么）
+2. 基于编出来的东西干完整个任务
+3. 交回一份**格式正确、语气自信、内容和你要的毫无关系**的报告
+
+而编排者拿到这份报告的时候，它看不到 sub-agent 的对话历史——它不知道任务书被理解成了什么。它只看到一份看起来挺像样的报告。
+
+所以这条检查必须在**发出之前**做，而且必须是代码，不能靠 review 任务书的人眼力好。
+
+`DANGLING` 那个词表里中英文都有：`上面`、`上述`、`那个文件`、`as mentioned`、`aforementioned`。粗，但漏报的代价远大于误报。
+
+</Pitfall>
+
+另外五件事里，`no_boundaries` 那条值得单独说，因为它是下一节的全部内容。
+
+---
+
+## 四、重复劳动：多 agent 最贵的失效
+
+Anthropic 复盘里有一个具体的故障，值得一字不改地记住：
+
+三个 sub-agent 被派去"研究半导体短缺"。一个查了 2021 年的汽车芯片危机，**另外两个查了同一件事**——当前的供应链。没有分工。
+
+<Key>
+**sub-agent 之间不共享上下文，所以它们没有任何办法发现自己在做重复的活。**
+
+你会付三份钱、拿到三份内容雷同的报告。而唯一的症状是"这次特别贵"。
+</Key>
+
+这件事的可怕之处在于它**只能在派发之前查**。派出去之后，钱已经花了。
+
+`detectOverlap` 做的就是这件事：把每份任务书的 `goal + deliverable` 切成关键词，两两算重叠。三份换词版的任务书跑出来是这样：
+
+```text
+  researcher-1：研究半导体短缺
+  researcher-2：研究半导体供应链现状
+  researcher-3：调查半导体供应链短缺的现状
+
+  researcher-1 × researcher-2  重叠 100%
+  researcher-1 × researcher-3  重叠 100%
+  researcher-2 × researcher-3  重叠  83%
+```
+
+实现上有两个细节，都不是可选的：
+
+<Pitfall title="中文必须切二元组，否则「危机」和「短缺」永远对不上">
+
+按整词匹配的话，"梳理供应链危机的成因"和"梳理供应链短缺的成因"一个共同词都没有——而它们在查同一件事。
+
+切二元组之后，`供应`、`应链`、`链危` / `链短` 里有两个能对上，重叠算出来了。
+
+</Pitfall>
+
+<Pitfall title="分母要用较短那份，不是并集">
+
+考虑这两份任务书：
+
+```text
+  A：统计晶圆厂产能与制程节点与在建产线与投产时间
+  B：统计晶圆厂产能
+```
+
+B 的活**整个被 A 包含**了。这是重复劳动最典型、也最该报出来的形状。
+
+但如果分母用并集，A 的关键词多得多，分数会被摊薄到阈值以下——**最该报的那种反而报不出来**。
+
+用较短那份当分母，B 的重叠率是 100%，一眼就看见。
+
+</Pitfall>
+
+把边界和具体目标写清楚之后，同样三份任务书的重叠是 0 组。这就是 `no_boundaries` 那条检查的价值：**边界是防重复劳动的唯一手段。**
+
+---
+
+## 五、并行 sub-agent 必须是只读的
+
+这是全节最有用的一条经验判据，而它的理由比"并发难写对"更根本。
+
+看两份任务书，它们**都能通过 `checkBrief`**——边界写了、工具限了、目标具体：
+
+```text
+  refactor-a：把 src/api.ts 里的回调改成 async/await
+              边界：只改这一个文件      工具：read_file, edit_file
+
+  refactor-b：给 src/api.ts 里的公开函数补类型标注
+              边界：只改这一个文件      工具：read_file, edit_file
+```
+
+<Pitfall title="后写的覆盖先写的，而两边都报告成功">
+
+`checkWriteConflicts` 会报出 `src/api.ts` 被两个 agent 争。而如果不查这一条，实际发生的是：
+
+1. 两个 agent 各自读了 `src/api.ts`，各自改，各自写
+2. 后写的那个把先写的成果整个覆盖掉
+3. **两份报告都说"已完成"**——因为从它们各自的视角看，确实完成了
+4. 编排者拿到两个成功，合并出"重构完成，类型已补齐"
+5. 而类型没了
+
+原因不是并发难写对。原因是 **sub-agent 看不到彼此的写入**——它们没有共享状态，所以"我的改动被覆盖了"这件事对它们不可观测。
+
+</Pitfall>
+
+<Key>
+Anthropic 的原话值得抄下来：**"大多数编程任务里真正可并行的部分比研究少得多。"**
+
+而这门课的 capstone 就是一个编程 agent。所以这句话不是别人的经验，是**你 L17 到 L19 要面对的约束**。
+</Key>
+
+由此还能推出一条更一般的判据，它在 `planEffort` 里是优先级最高的分支：
+
+<Key>
+**"能拆"和"能并行"是两件事。**
+
+八个模块要重构，听起来非常适合扇出八个 agent。但它要写文件，所以档位是 `single`。
+</Key>
+
+---
+
+## 六、投入分级：为什么这件事必须是代码
+
+Anthropic 早期版本的一个真实故障：**一个简单查询开了 50 个 sub-agent。**
+
+他们的应对不是"把 prompt 写得更清楚"，是把分级规则**写进 prompt 当成硬规则**：简单事实查找 1 个 agent、3 到 10 次工具调用；直接对比 2 到 4 个 agent、每个 10 到 15 次；复杂研究 10 个以上。
+
+<Key>
+**模型判断不了该投入多少。** 这不是提示词写得不好，是这个判断需要的信息（任务价值、你的预算、这个查询在整体流量里的占比）根本不在它的上下文里。
+
+所以这件事在 `planEffort` 里是代码，不是提示词。
+</Key>
+
+跑出来是这样，注意第四行：
+
+```text
+  任务                          档位            agents
+  查一个函数在哪定义             single              1
+  对比三个库的 API 设计          small_fanout        3
+  把这个函数改成异步             single              1
+  重构八个模块（都要改文件）      single              1    ← 八个方向，但要写
+  整理 S&P500 里 IT 公司董事会   large_fanout       10    ← 12 个方向，封顶 10
+```
+
+最后一行也值得看一眼：12 个独立方向也只开 10 个。上限不是为了省钱，是因为**没有上限的东西迟早会遇到一个把它变成 50 的输入**。
+
+---
+
+## 七、四道闸：为什么深度那道要单独算
+
+`fanout` 有四道闸。前三道挡线性增长，第四道挡指数增长——所以它必须单独算一道。
+
+先看没有闸的时候账单长什么样：
+
+```text
+  规规矩矩：3 × 5                    60,820 token    ¥0.18    1.0×
+  模型多开了一倍：6 × 5             122,218 token    ¥0.37    2.0×
+  「简单查询开了 50 个」          1,332,922 token    ¥4.00   21.9×
+  递归一层：每个又开 3 个           186,316 token    ¥0.56    3.1×
+  递归两层                          627,604 token    ¥1.88   10.3×
+```
+
+<Key>
+**这五行里没有一行会报错。**
+
+它们都会成功返回一个质量不错的答案，然后出现在月底的账单上。这是这一节和 L10 共同的那个主题——**这一层的失效不响。**
+</Key>
+
+四道闸各自的判据：
+
+**一 · 深度。** `depth >= maxDepth` 就全部拒掉。sub-agent 开 sub-agent 每加一层乘一次扇出宽度，三层就是 27 个 agent。
+
+**二 · 数量。** 超过 `maxAgents` 的截掉，但**被截掉的必须显式列进 `rejected`**。这一条容易写错：
+
+<Pitfall title="静默截断的症状是「模型没找到」">
+
+截掉第 5 到第 8 个任务书，不留记录，最后的结论就少了四块内容。
+
+而"结论少了四块"看起来完全像**模型能力不足**。你会去调 prompt、换模型、加 few-shot——而真正的原因是四个任务书从来没被派出去过。
+
+</Pitfall>
+
+**三 · 预算。** 这道闸有个位置问题：
+
+<Pitfall title="预算只在开头查一次，等于没查">
+
+开头查一次的写法是这样的：
+
+```ts
+if (spent >= maxYuan) return
+for (const batch of batches) { await runBatch(batch) }
+```
+
+四个 agent 每个花 0.4 元、预算 1 元。开头 `spent` 是 0，闸放行，然后四个全跑完——花掉 1.6 元，**预算的 1.6 倍**。
+
+而多 agent 里"一个 sub-agent 失控吃掉整个预算"是常态而不是意外：它的步数上限是自己的，和别人无关。
+
+所以检查必须在**批之间**：
+
+```ts
+for (const batch of batches) {
+  if (spent >= maxYuan) { reject(rest); break }
+  spent += await runBatch(batch)
+}
+```
+
+`verify.ts` 里有一条专门测这个。把检查挪到开头，只有那一条会红——而它在真实系统里对应的是"这次跑掉了预算的三倍"。
+
+</Pitfall>
+
+**四 · 隔离。** 一个 sub-agent 崩了不该让整批白跑（`allSettled` 语义，L00 那个 `pooled` 在这里第二次用上）。但崩掉的那个必须变成一条显式的 gap，不能消失——理由和第二道闸一样。
+
+<Key>
+**体检结果要返回给调用方，不是打个日志。**
+
+重复劳动和写冲突一旦派出去就无法挽回——钱已经花了、文件已经被覆盖了。而它们在派发前是**完全可以静态查出来的**。
+
+所以 `fanout` 的返回值里有 `preflight`。调用方可以选择无视它，但不能选择看不见它。
+</Key>
+
+---
+
+## 八、合并：编排者没有能力判断哪一份对
+
+这是这一节第二个最重要的地方。
+
+三份报告回来了：
+
+```text
+  researcher-1：2021 年危机峰值：整车厂减产约 1050 万辆
+  researcher-2：2021 年危机峰值：整车厂减产约 770 万辆
+  researcher-3：出口管制清单：2022-10 起扩大到先进制程设备   （reason: step_limit）
+  researcher-4：（失败：子进程超时）
+```
+
+前两份**矛盾**。编排者该怎么办？
+
+它的直觉答案是"综合一下"。而这正是问题所在：
+
+<Key>
+**编排者只看到摘要，看不到任何一份原始材料。它没有能力判断哪个对。**
+
+让它"综合一下"的结果是「减产约 800 至 1000 万辆」这种句子：读起来很顺、有具体数字、而且**两个来源都不支持它**。
+
+这是多 agent 里最难发现的错误，因为输出**看起来质量很高**。
+</Key>
+
+所以 `mergeReports` 最重要的行为是它**不做**的事：它不在 1050 万和 770 万之间挑一个，它把两个都列出来，标明谁说的，交给上层。
+
+`researcher-3` 那条也要注意。它 `ok: true`，但 `reason` 是 `step_limit`：
+
+<Key>
+**被掐断的运行不是做完了的运行。**
+
+L05 讲 `stopReason` 的时候立过这条判据，这里是它第二次用上。撞上步数上限时，模型最后那句话往往很像一个答案——而编排者会拿去用。
+
+它进 `gaps`，不进结论。
+</Key>
+
+`researcher-4` 失败了，同样要变成显式的 gap。静默丢掉的话，症状又是"结论少了一条"，又会被误诊成模型不行。
+
+---
+
+## 九、传话游戏：信息路径上的两次有损压缩
+
+把整条信息路径画出来：
+
+```text
+  原始材料                  32,000 token   100.0%  ████████████████████████████████████████
+  3 份 sub-agent 摘要          900 token     2.8%  █
+  编排者综合                   500 token     1.6%  █
+```
+
+最终结论和原始材料之间隔了**两层转述**，而编排者**没有任何办法回去核对**——它从来没见过原始材料。
+
+单 agent 在这条路径上有几次压缩？**零次。** 它第 14 步引用第 2 步读到的原文时，读的就是原文。
+
+这不是说压缩一定是坏的。检索的本质就是压缩（L09 开头那句），32,000 token 里绝大部分确实是噪声。问题在于**压缩发生在你看不到的地方，而且不可逆**。
+
+<Key>
+Anthropic 的应对值得抄：让 sub-agent 把产物**写到文件**，只把**轻量引用**交回编排者。
+
+把"转述"换成"指针"——编排者要细节的时候可以自己去读。
+</Key>
+
+`shared/multi.ts` 里的 `toArtifactRef` 就是这个：留一行给编排者做路由判断，全文落盘。
+
+顺带一个副作用：这么做之后编排者的上下文小了很多。而**编排者的上下文是整个系统里最不该被撑爆的那一个**——它撑爆了，整次运行的协调能力就没了。
+
+---
+
+## 十、交接：和 sub-agent 完全不同的一件事
+
+最后一件事，也是最容易混的一件。
+
+"交接"（handoff）和"派 sub-agent"经常被当成同一类东西的两种叫法。它们不是。区别不在实现方式，在**信息模型**：
+
+| | sub-agent | 交接 |
+| --- | --- | --- |
+| 上下文 | 隔离 | 共享 |
+| 传信息 | 序列化成任务书和报告 | 不用传，接手的看得到全部历史 |
+| 信息损失 | 两次有损压缩 | 零 |
+| 成本 | 高 | 低 |
+| 并行 | 可以 | **不行** |
+
+<Key>
+判据很干脆：**要并行就 sub-agent，不要并行就交接。**
+
+用 sub-agent 做串行的事，等于白付两次序列化的钱和一次信息损失，什么都没换来。
+</Key>
+
+交接的实现只有十几行，但有一个坑：
+
+<Pitfall title="两个 agent 互相踢皮球，表现是「请求一直不返回」">
+
+客服 agent 判断这是账单问题，交给账单 agent。账单 agent 看了一眼，判断这是技术问题，交回客服 agent。
+
+没有异常。没有错误日志。只有一个不返回的请求。
+
+`maxHops` 能兜住不至于跑到天亮，但它兜不住**诊断**：跑满 8 跳停下来之后，你不知道是"这件事真的需要 8 次交接"还是"两个 agent 在绕圈"。
+
+所以 `handoff` 除了 `maxHops` 还返回 `loop`——环被检测到的时候，你拿到的是具体绕在哪几个 agent 之间。
+
+</Pitfall>
+
+---
+
+## 十一、A2A：对面是别人家的 agent
+
+上一节 Pitfall 的例子是：客服 agent 判断这是账单问题，交给账单 agent。A2A 的官方文档几乎用了同一句话举例——"a customer service agent might delegate an inquiry to a billing agent"。
+
+两个例子长得一样，**却是两件不同的事**。第十节的交接共享上下文，接手的看得到全部历史。A2A 里的「交给」，对方看不到你的任何上下文，只收到一条序列化的消息——按第十节那张表，这**不是交接，是 sub-agent**。
+
+<Key>
+
+**A2A（Agent2Agent）把本课开头那句话从进程内约定升级成了跨组织协议：agent 之间只能通过序列化的文本互相传话**。
+
+A2A 规范的设计原则里有一条几乎同义："Opaque Execution: Agents collaborate based on declared capabilities and exchanged information, without needing to share their internal thoughts, plans, or tool implementations."
+
+</Key>
+
+所以这一节前面讲的上下文隔离的后果，在这里全部成立，而且更糟：第三节那个「上面提到的那个文件」，跨组织时对方连你的仓库都看不到；第十节的踢皮球，你只能在自己这一侧数 `maxHops`。
+
+### 四个对象，你都见过
+
+A2A v1.0.0 于 2026-03-12 发布。规范 §2.2 的核心对象，和这门课已经讲过的东西一一对上：
+
+| A2A 对象 | 规范定义（摘） | 你在哪见过 |
+|---|---|---|
+| Agent Card | "A JSON metadata document ... describing its identity, capabilities, skills, service endpoint, and authentication requirements."，默认放在 `https://{server_domain}/.well-known/agent-card.json` | L10 的 `server/discover`，只不过挂在一个 well-known URL 上 |
+| Message | "A communication turn between a client and a remote agent"，由若干 Part 组成 | 第三节的任务书 |
+| Artifact | "An output ... generated by the agent as a result of a task, composed of `Parts`" | 第九节的 `toArtifactRef`：Part 可以只是一个 `url`，指针而不是转述 |
+| Task | "The fundamental unit of work managed by A2A ... Tasks are stateful and progress through a defined lifecycle." | 没见过：一个**由对方持有**、带状态机的工作单元 |
+
+Message 是过程中的来回，像聊天气泡；Artifact 是交付物。卡片里的 `skills`，proto 注释写的是 "largely a descriptive concept"——**skill 是自我描述，不是能力保证**。这和 L10 第九节「工具描述是模型唯一的判断依据，而它是 server 提供的」同构。
+
+### 和 MCP 怎么分：看谁掌控安全边界
+
+A2A 官方的分法：
+
+> "MCP is vertical. It deepens a single agent." / "A2A is horizontal. It connects agents across that boundary. The other agent may belong to another team, another department, or a partner organization."
+
+更稳的判据来自 Agentic AI Foundation（AAIF）的博客："An MCP tool has a described input and output, and the host controls the connection and the security boundary around it." / "The remote agent decides how to complete the work behind its endpoint." **谁掌控安全边界，比「有没有状态」更稳**。
+
+两条诚实的补充，面试时主动说出来比被追问出来好：
+
+- **这张分工图是 A2A 一方画的**。MCP 官方文档里没有任何一处提到 A2A（在文档索引、规范首页、tasks 扩展页里搜 a2a、agent-to-agent，零处）
+- **「MCP 无状态、A2A 有状态」这条线在变模糊**。MCP 2026-07-28 把长任务做成了官方扩展 `io.modelcontextprotocol/tasks`，server 也能在中途向客户端要输入——这恰恰是 A2A 用来区分自己的特征。两份文档各自为真，「边界变模糊」是推断；AAIF 自己也写了 "AAIF gives maintainers a place to work through overlap with neighboring projects in public."
+
+还有一个设计取舍上的对照。L10 第二节说过，gRPC 要 protobuf 编译链，而 MCP 的目标之一是任何人半天内能写一个 server。A2A v1.0 站在另一边：把 `a2a.proto` 定为规范性来源，三种标准绑定（JSON-RPC、gRPC、HTTP+JSON）要求功能等价。目标用户是企业后端之间的集成，不是半天写一个。
+
+### Task 状态机：终态、中断态
+
+| 状态 | 类型 | 编排者该走的分支 |
+|---|---|---|
+| `TASK_STATE_SUBMITTED` / `TASK_STATE_WORKING` | 进行中 | 等，或订阅 |
+| `TASK_STATE_COMPLETED` | 终态 | 收 artifact |
+| `TASK_STATE_FAILED` | 终态 | 对方做砸了 |
+| `TASK_STATE_REJECTED` | 终态 | 对方**不愿做**（"the agent has decided to not perform the task"） |
+| `TASK_STATE_CANCELED` | 终态 | 被取消 |
+| `TASK_STATE_INPUT_REQUIRED` | 中断 | 对方**在等你**补输入 |
+| `TASK_STATE_AUTH_REQUIRED` | 中断 | 对方在等凭据 |
+
+（另有 `TASK_STATE_UNSPECIFIED`。）`REJECTED`、`FAILED`、`INPUT_REQUIRED` 三条分支各走各的，这是第八节「被掐断的运行不是做完了的运行」的协议版：编排者必须分清「不愿做」「做砸了」「在等你」。`AUTH_REQUIRED` 还有一条 MUST："Agents MUST NOT treat the `TASK_STATE_AUTH_REQUIRED` state transition, by itself, as authorization for any particular operation."
+
+<Pitfall title="`'completed'` 变成了 `'TASK_STATE_COMPLETED'`，而旧代码不会报错">
+
+v1.0 把枚举从 kebab-case 改成了 SCREAMING_SNAKE_CASE（What's new 原文："Breaking: Enum values changed from kebab-case to SCREAMING_SNAKE_CASE for compliance with the ProtoJSON specification"）。照 v0.3 写的等待逻辑：
+
+```ts
+if (t.status.state === 'completed') return collect(t.artifacts)
+if (t.status.state === 'failed') throw new Error('remote failed')
+await sleep(1000)
+return poll(id)
+```
+
+升级之后两个分支都不再命中，落进无限轮询。**远端任务早就完成了，你这边永远不返回，没有任何错误**。
+
+★ 这和 L10 第三节「`-32002` 变成了 `-32602`」是同一种失效：按旧值判断的分支静默地不再命中。修法也一样——**未知状态显式走报错分支，不要落进 sleep 重试**，再加上第七节那种上限。
+
+</Pitfall>
+
+### 流不是任务
+
+A2A 的流断了，任务照跑："The task lifecycle is independent of any individual stream's lifecycle"，重连用 `SubscribeToTask`。MCP 2026-07-28 正好相反："A broken response stream loses the in-flight request"，客户端用新 id 重发。
+
+<Key>
+
+**MCP 把请求当原子，断了就重发；A2A 把任务当实体，流只是观察窗口**。
+
+这是「调用一个工具」和「委托一项任务」的本质差别在协议上的投影。
+
+</Key>
+
+push 通知是**至少一次**："Agents MUST attempt delivery at least once for each configured webhook" / "Clients SHOULD process notifications idempotently, as duplicate deliveries may occur"。所以接收端要按任务和状态去重。而 webhook URL 是你交给对方去请求的，规范要求 "Agents SHOULD validate webhook URLs to prevent SSRF"——和 L10 第十节那条一样：**对方给你一个 URL 让你去请求，这个 URL 就是攻击面**。
+
+### 认证：卡片声明，你执行
+
+卡片里的 `securitySchemes` 只**声明**要什么凭据，怎么拿是带外的（"Credential Acquisition (Out-of-Band)"）。签名卡片（JWS）的承诺范围只有两件事："Signatures allow clients to verify that an Agent Card has not been tampered with and originates from the claimed provider." 授权完全是服务端自己的事："Authorization logic is implementation-specific"。
+
+<Key>
+
+**签名卡片和 HTTPS 证书是同一种东西：它告诉你「你在和 example.com 说话」，不告诉你「example.com 值得信任」，更不告诉你它该被允许做什么**。
+
+前端对这个有现成的直觉：一个证书完全合法的钓鱼站。
+
+</Key>
+
+反过来也成立：你给出去的权限——发给对方 agent 的凭据带什么 scope、允许它回调哪些 webhook——由你这边的策略决定，不由对方卡片上写了什么决定。卡片的 `description` 和 `skills` 是对方写的、会进你编排者 prompt 的文本，L14 那条纪律直接适用：做授权判断的那段代码，绝不能读那段不可信的数据。
+
+链式委托还有一个 L10 读者会立刻认出来的风险。规范 §7.6.3："In-band credential exchange can allow credentials to be passed across chains of multiple A2A agents, exposing those credentials to each agent participating in the chain." 缓解是 "Credentials SHOULD be bound to the agent which originated the request"。**这就是 L10 第十节禁止的 token passthrough，换到了 agent 链上**。注意 A2A 规范没有像 MCP 那样规定受众绑定（RFC 8707），这一层要你自己按 OAuth 的通用做法补上。
+
+### 采用现实：别被支持者名单吓到
+
+A2A 由 Google 在 2025-04 发起、捐给 Linux 基金会，创始组织包括 AWS、Cisco、Google、Microsoft、Salesforce、SAP、ServiceNow。IBM 的 Agent Communication Protocol（ACP，2025-03 为 BeeAI 平台推出）于 2025-08 并入 A2A，原 ACP 团队 "will be winding down active development"。2026 年 8 月，A2A 进入 AAIF，和 MCP、goose、AGENTS.md 成了同一个基金会下的兄弟项目。AAIF 给的分层可以直接当 2026 年开放 agent 栈的地图：指令与上下文是 AGENTS.md，agent 运行时是 goose，agent 到工具是 MCP，流量管控是 agentgateway，agent 到 agent 是 A2A。
+
+支持者名单很长，实际部署是另一回事：
+
+- **SDK 下载量约为 MCP 的 5%**。PyPI 上 `a2a-sdk` 近一个月 11,359,775 次，`mcp` 235,193,557 次（≈4.8%）；npm 同期约 5.5%。下载量含 CI、镜像和传递依赖，而且好几个主流框架把 `a2a-sdk` 当可选 extra 引入
+- **公网上按域名能发现的卡片几乎没有**。一家做 Agent Card 校验服务的厂商（Emissar）2026-09 爬了 Tranco 前一百万个域名：999,550 个里 274 个在 well-known 路径上有卡片（0.027%），前 1,000 名一个都没有；**274 张里没有一张带签名**，194 张不声明任何认证方案；200 张 v1.0 形状的卡片里，113 张还在用 v0.3 的字段名声明绑定。这是厂商自测，方法公开但没有独立复现；它的利益方向是让 A2A 显得值得投入，所以低采用率不太可能是被夸大的
+- **coding agent 里更少**。一份覆盖 11 个生产级 coding harness 的源码研究（arXiv 2609.00006）：Agent Client Protocol 进了 6 个，A2A 只有 1 个（Gemini CLI）。样本是 coding harness，不能外推到所有 agent 产品
+
+**正确的读法是「公开的、按域名发现的 A2A 几乎不存在」，而不是 A2A 没人用**。爬虫只看顶级域名的两个 well-known 路径，原文自己写了 "It does not measure whether a company runs agents"。A2A 按其自述的主战场在企业内网和云平台托管（Google 的 ADK / Agent Engine、Azure AI Foundry、AWS Bedrock AgentCore），这些本来就不在公网路径上。国内最有代表性的例子来自 AAIF 的公告（厂商自述，没有找到华为、腾讯自己的技术文档交叉验证）：华为把 A2A 定为鸿蒙上系统级 AI 助手 Celia 和应用内 agent 之间的协议，微信是最早经 A2A 接入华为等安卓厂商助手的大应用之一。系统助手和第三方 App 里的 agent，天然是不同厂商、不同代码库、不能共享上下文——A2A 的前提全满足。
+
+那 113 张旧字段名的卡片也值得一提：原文提醒，严格的 v1.0 客户端可能直接跳过只写了 `transport` 的接口——不报错。规范附录的迁移指引给的是正确姿势："Implement dual-handling where schemas/types permit" 加上 "Log a warning when receiving legacy-named objects"——**兼容旧名，但要出声**。
+
+### 什么时候真的需要 A2A：三问
+
+A2A 一方自己就把本地 sub-agent 排除在外了，AAIF 的原话是它区别于 "a single function call, long running tool, or local subagent"。把这句和这一节的判据叠起来，是三个问题：
+
+1. **对方的代码你能改吗**？能改，进程内的 sub-agent 或交接就够了；A2A 只多了一层序列化和一个会挂的网络边界
+2. **对方是一个会自己决定怎么做的东西吗**？如果它其实是输入输出都结构化的函数，它该是一个 MCP 工具——A2A 文档自己也说，skill "can be called in a tool-like, stateless way" 时可以包成 MCP
+3. **你需要它的任务状态吗**？要分清「在等我补输入」「拒了」「失败了」，要断线后重连看进度，A2A 的 task 模型才有价值
+
+三个答案是「不能、是、需要」，才上 A2A。
+
+| | 进程内交接 | sub-agent | A2A |
+| --- | --- | --- | --- |
+| 上下文 | 共享 | 隔离 | 隔离，**且对方实现不可见** |
+| 传信息 | 不用传 | 任务书 + 报告 | Message / Part / Artifact |
+| 信任边界 | 同一进程 | 同一进程 | 跨组织：认证、授权、签名卡片 |
+| 失败可见性 | 全部 | 报告 + `reason` | 任务状态，加上你看不到的对方日志 |
+| 防踢皮球 | `maxHops` + `loop` | 深度闸 | 只能管你这一侧的跳数 |
+
+<Key>
+
+**能改对方代码的时候上 A2A，和 L10 第一节说的「把自己的工具包成 MCP server 然后自己连自己」是同一个错误**：除了多一次序列化和一个可能挂的边界，什么都没换来。
+
+这一节的主结论在这里换个说法再成立一次：多 agent 是花钱策略，不是架构；**A2A 解决的是跨组织，不是多 agent**。
+
+</Key>
+
+<Note title="两个 ACP，别混">
+
+**IBM 的 Agent Communication Protocol**：上面说的那个，2025-08 已并入 A2A。
+
+**Zed 提出的 Agent Client Protocol**：完全是另一层。官方定义是 "standardizes communication between code editors/IDEs and coding agents"，类比 LSP；本地 agent 作为编辑器的子进程，"communicating via JSON-RPC over stdio"，远程支持 "a work in progress"。
+
+它的形状和 L10 学的 MCP stdio 几乎一样，**方向却反了**：MCP 里宿主是客户端、工具是服务端；Agent Client Protocol 里编辑器是客户端、agent 是服务端。它还保留了 `initialize`，而 MCP 2026-07-28 刚把握手删掉。上面那份 11 个 harness 的研究自己也专门澄清了这个同名："not IBM's older homonymous Agent Communication Protocol"。
+
+</Note>
+
+---
+
+## 十条要点
+
+1. **多 agent ≠ 多次调用。** 定义性特征是上下文隔离。L07 那五种模式全是单 agent。
+2. **15 倍不是协调开销，是工作量。** 多 agent / 单 agent ≈ 扇出宽度，协调只占 6%。以为是协调贵，你会去优化一个天花板只有 6% 的东西。
+3. **多 agent 是花钱策略，不是架构。** 你买的是并行探索容量。任务里没有并行的时候，钱照花。
+4. **固定工作量时它反而便宜，而便宜和有损是同一件事的两面。** 你省下的平方项，等于 sub-agent 之间看不见的那部分信息。
+5. **任务书里的指代是空引用。** 「上面提到的那个文件」不会报错——sub-agent 会编一个所指，然后交回一份自信而无关的报告。
+6. **边界是防重复劳动的唯一手段。** sub-agent 之间不共享上下文，所以它们发现不了自己在做重复的活。症状只有"这次特别贵"。
+7. **并行 sub-agent 必须只读。** 后写的覆盖先写的，而两边都报告成功。"能拆"和"能并行"是两件事。
+8. **投入分级必须是代码。** 模型判断不了该投入多少——那个判断需要的信息不在它的上下文里。真实故障是一个简单查询开了 50 个 agent。
+9. **四道闸，深度那道单独算。** 前三道挡线性，深度挡指数。被闸拦下的必须显式列出——静默截断的症状是"模型没找到"。
+10. **矛盾不许合并。** 编排者看不到原始材料，它没有能力判断哪个对。糊在一起的结论读起来最顺，也最难发现是错的。
+11. **要并行就 sub-agent，不要并行就交接。** 交接共享上下文，无损、便宜、只能串行。
+12. **A2A 不是多 agent 的默认答案，它解决的是跨组织**。对方代码改不了、对方自己决定怎么做、你需要它的任务状态，三条都成立才值得。签名卡片证明身份，不决定权限。
+
+<Lab title="四道闸、一台计价器，和一次账单推导">
+
+两个任务，一次 API 都不调——多 agent 的全部难点都在校验和会计上，而这两件事都是纯函数。
+
+**任务一：`labs/l11/orchestrate.ts`（或 `.py`）**
+
+八个 TODO。注意它们的分布：**五个是校验和拦截，只有三个算得上"编排"。** 这个比例本身就是这一节的结论。
+
+```bash
+pnpm orchestrate     # 五组观察实验
+pnpm verify:l11      # 46 项测试
+```
+
+**任务二：`labs/l11/compare.ts`**
+
+这个不用写，直接跑。它会把 Anthropic 公布的 4× 和 15× 从实测参数**推导出来**，然后拆开看那 15 倍里是什么。
+
+```bash
+pnpm compare:multi
+```
+
+Python：
+
+```bash
+cd labs
+uv run python -m l11.orchestrate
+uv run python -m l11.compare
+uv run python -m l11.verify     # 47 项，含两条 Python 特有的
+```
+
+写之前先跑 `MULTI_IMPL=shared pnpm verify:l11` 确认测试本身是对的。
+
+带 ★ 的测试每一条对应一个静默失效：空引用、重复劳动、写覆盖、矛盾被糊掉、被掐断的报告当成完成、预算只查一次、递归无上限、交接成环。**它们都不抛异常。**
+
+**两个没有代码的 TODO（都在文件末尾）：**
+
+- **TODO 9**：把 `fanout` 里的预算检查从"批之间"挪到"开头一次"，重跑测试。只有一条会红——而它在真实系统里对应的是"这次跑掉了预算的三倍"
+- **TODO 10**：把 `mergeReports` 改成"矛盾时取第一份报告的值"。所有测试仍然会过，除了专门测 `conflicts` 的那一条。**这是这一节最想让你记住的东西：取第一份在功能上完全说得通，输出也依然通顺——它只是有时候是错的，而你没有任何办法知道是哪一次**
+
+</Lab>
+
+<PyMirror>
+
+Python 版有两处真实差异，都在 `fanout` 的第四道闸里，都不响。
+
+**一 · `asyncio.gather(return_exceptions=True)` 不等于 `Promise.allSettled`。**
+
+它返回的是"值或异常对象"混在一起的列表——**没有 `status` 字段**，你得自己 `isinstance`。
+
+```python
+settled = await asyncio.gather(*(run(b) for b in batch), return_exceptions=True)
+for b, res in zip(batch, settled, strict=True):
+    if isinstance(res, BaseException):
+        reports.append(failed_report(b, res))
+    else:
+        reports.append(res)
+```
+
+漏掉那个 `isinstance`，后面就在拿异常当报告用。而症状是一个 `AttributeError`（`RuntimeError` 没有 `.usage`），**和真正的原因毫无字面联系**。
+
+顺带一提 `strict=True`：Python 3.10 之前 `zip` 长度不等会静默截断。这里两个列表长度必然相等，所以真出现不等就是别处有 bug——让它抛出来。
+
+**二 · `asyncio.CancelledError` 不是 `Exception` 的子类。**
+
+从 Python 3.8 起它直接继承 `BaseException`。所以：
+
+```python
+except Exception              # 抓不到它 —— 这是对的，取消该往上传
+isinstance(x, Exception)      # 也判不出它 —— 这就要出事了
+```
+
+在 `fanout` 里，取消**必须往上抛**。当成"这个 sub-agent 崩了"处理的话，它会变成一条 gap，然后剩下的批次继续跑完——**用户点了取消，钱照花。**
+
+参考实现里是这两行：
+
+```python
+if isinstance(res, asyncio.CancelledError):
+    raise res
+```
+
+试着删掉它们跑一遍：47 项里恰好一项变红，而代码看起来更短更干净。这就是这个坑的全部形状。
+
+TS 那边没有这个问题——`AbortError` 就是个普通 `Error`，`Promise.allSettled` 也给你明确的 `status` 字段。
+
+**三 · 一处顺手的小坑：`dataclass` 的可变默认值。**
+
+`Brief` 有两个 list 字段。写成 `boundaries: list[str] = []` 会直接抛 `ValueError`，必须走 `field(default_factory=list)`。
+
+这个还算好——它响。
+
+</PyMirror>
+
+---
+
+## 接下来
+
+你现在能判断该不该上多 agent，也知道它的钱花在哪里。
+
+- **L11x Python agent 生态**——LangGraph 的状态机和这一节的 `fanout` 是同一件事的两种写法，看完那节你能读懂 GitHub 上的 Python agent 代码
+- **L12 Evals**——多 agent 的成功率怎么测。`reason` 分布在这里格外重要：如果 20% 的 sub-agent 停在 `step_limit`，你的成功率数字全是假的
+- **L13 可观测性**——单 agent 一条 trace，多 agent N + 1 条。这一节留的那个"编排者看不到原始材料"的尾巴在那里收

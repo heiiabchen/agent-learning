@@ -1,0 +1,591 @@
+L17 让一次改动能被判定，L18 让「这版更好」能被证明。这一节把它挂到**别人会打开的入口**上。
+
+前十八节有四个没说出口的默认：一个进程、一个用户、一条连接、一个人在看。上线之后，这四个默认**同时**失效。而每一个失效，都有一条**不抛异常**的路径让系统看起来正常。
+
+<Key>
+这一节的中心论点：**上线不是「把 agent 放到服务器上」，而是把一次对话变成一个有寿命、有主人、有账本、能被杀死的作业（job）。**
+
+上线之后，失败的默认形态是**双份**——双份工具副作用、双份账单、双份「已完成」通知——而不是抛异常。状态机、围栏、幂等键、配额、审批记忆、drain/kill，全是在防同一类事：看起来像成功的重复。
+</Key>
+
+这一节还四张欠条：L16 的「什么该问、问几次、怎么记住」「后台 agent 的界面不是任务列表」「TTFT 基线」，以及 L17 的内容哈希在续跑时谁来校验。
+
+<Note title="怎么读这一节">
+每一小节按同一个顺序走：直觉 → 静默失败 → 不变量 → 哪条断言守着它。
+
+lab 只实现了一部分。没实现的我会标「lab 未实现」并写出生产该怎么做。**不要把 verify 全绿理解成生产可用**——第十节有一张总账。
+</Note>
+
+---
+
+## 一、四个默认，同时失效
+
+| 默认 | 上线之后 | 不抛异常的失败 | 章节 |
+|---|---|---|---|
+| 一个进程 | 发布、OOM、调度器随时杀掉它 | 队列重投，两个 worker 改同一棵工作树 | 二、三 |
+| 一个用户 | 很多租户共享 worker 和额度 | 别人的幂等键拿到你的作业；鲸鱼饿死小鱼 | 四、六 |
+| 一条连接 | 刷新、合盖、代理掐空闲连接 | 重连又 enqueue 一个作业；游标越界返回空数组 | 八 |
+| 一个人在看 | 后台跑，没人点审批 | 「记住允许」变后门；prompt 里的 kill switch 被压缩掉 | 七、九 |
+
+第三列没有一个是异常，**它们全都是「成功」**。监控看错误率，而这些不进错误率。
+
+---
+
+## 二、队列只承诺「至少一次」
+
+### 2.1 重复投递是设计内行为
+
+直觉：「消息队列保证只处理一次。」
+
+实际：标准队列是 **at-least-once**。SQS 标准队列里，消息被取走后在**可见性超时**内对别人不可见，超时前没删掉就重新可见、再被处理一次。Celery 配 Redis 同理（visibility timeout 默认 1 小时）。**「只跑一次」永远是应用层命题**，队列只保证不丢。
+
+### 2.2 静态超时：不重复和快恢复不可兼得
+
+本课调研时做过一个本地模拟：10 000 个任务，时长在 10–120 秒的整数上均匀分布，无心跳，worker 不崩溃，超时即重投。
+
+```text
+可见性超时   被重复执行的任务   每任务额外执行
+   30 s          81.1%            1.63 次
+   60 s          54.2%            0.54 次
+  120 s           0.0%            0
+```
+
+调到不小于最长任务就不重复了——代价是 worker 崩溃后，要等满整个超时才有人接手。coding agent 的时长从十几秒到几十分钟，**没有一个静态数值同时满足两头**。（量级示意，不是 SQS 的精确行为。）
+
+<Drill title="81.1% 是可以手算的">
+
+d 在 10..120 的整数上均匀分布，共 111 个取值。无心跳时，跑 d 秒的任务会被取走 ⌈d/vt⌉ 次。
+
+取 vt = 30：d 在 31..120 的 90 个取值全部重复，90/111 ≈ 81.1%。额外执行是 31..60 多 1 次、61..90 多 2 次、91..120 多 3 次，(30 + 60 + 90)/111 ≈ 1.62——模拟的 1.63 差在抽样。
+
+价值在**形状**：重复率由「时长分布有多少落在超时之外」决定，有长尾就一定重复。切断它只有一个办法：**让超时跟着任务走**——租约加心跳。
+</Drill>
+
+### 2.3 租约的那条缝，和围栏令牌
+
+lab 的模型是租约：`claim` 写入 `leaseUntil`，`heartbeat` 往后推；过期后 `requeue_stale` 才能放回队列（JOB-6、JOB-7）。但看这条时间线：
+
+```text
+t=0   w1 认领 job，租约到 t=5
+t=1   w1 进入长时间 GC 停顿
+t=6   租约过期 → requeue_stale → w1 重启后以同名再次认领
+t=7   旧的 w1 进程醒来，带着 workerId='w1' 发 checkpoint
+```
+
+只校验 `workerId`，第四行会被接受。本课早期草稿就是这样，调研探针实测旧进程的 checkpoint 返回 `ok=true`。
+
+现在的 `shared/ops.ts` 有一个**每次认领加一**的 `epoch`：
+
+```ts
+function fence(job: Job, workerId: string, epoch: number, now: number): string | null {
+  if (job.workerId !== workerId) return 'worker 不匹配'
+  if (job.epoch !== epoch) return 'epoch 不匹配'
+  if (job.leaseUntil !== undefined && now > job.leaseUntil) return '租约已过期'
+  return null
+}
+```
+
+`heartbeat`、`checkpoint`、`request_approval` 过这道门；`succeed` / `fail` 校验 workerId 与 epoch。`pnpm ops` 实验一：
+
+```text
+续跑 worker           w2 epoch=2
+保留 checkpoint.seq   2
+旧 epoch 写入         DENY
+```
+
+<Key>
+**workerId 回答「你是谁」，epoch 回答「你是第几次被授权」。** 重启、同名、GC 后醒来——「你是谁」不变，「第几次」变了。只有后者拦得住僵尸（JOB-11）。
+</Key>
+
+第三行防另一种僵尸：租约过期、还没人来抢，旧 worker 自己发心跳续命。
+
+一处不对称：`succeed` / `fail` **不看租约**。租约过期但没人认领时，原 worker 交差会被接受——epoch 没变就没有第二个人被授权，租约只是「何时允许别人来抢」的时钟。
+
+<Drill title="围栏为什么必须由存储层比较">
+
+`fence()` 拿到的是**某一时刻读出来的** job。A 读到 epoch=1、判定通过、再写回，而在读写之间 B 已经把 epoch 推到 2——A 的判定基于过期快照，照样通过。
+
+所以围栏真正生效的位置是写入条件：
+
+```sql
+UPDATE jobs SET checkpoint = $1
+ WHERE id = $2 AND worker_id = $3 AND epoch = $4 AND lease_until >= $5
+```
+
+受影响 0 行，就是被拒了。这在分布式锁的讨论里通常叫 fencing token，要点是：**令牌单调，由被保护的资源检查，不靠持锁者自觉。**
+</Drill>
+
+### 2.4 毒丸：lab 未实现
+
+能让 worker 崩溃的作业，每次重投都再杀一个 worker。SQS 的做法是 `maxReceiveCount` 加死信队列。
+
+本课对当前实现跑过：`claim → requeue_stale` 循环 1000 次，作业仍是 `queued`，epoch 停在 1000。**epoch 其实已经在数认领次数了**——生产要补的只是一次比较和一个 `dead` 终态。lab 没有。
+
+### 2.5 原子认领归存储层
+
+单机时，L08 那种 JSONL 日志加单 worker 能演示几乎全部状态机。多机时需要外部原子认领：PostgreSQL 文档说 `SELECT … FOR UPDATE SKIP LOCKED` 适合「队列式的表」，并提醒它给出的是**不一致的视图**，不适合通用查询。围栏、幂等、配额同理——判定在 lab 里，原子性在存储的条件写里。
+
+<Pitfall title="verify 全绿不等于分布式正确">
+51 条断言测的都是「给一个快照，放行还是拒绝」。写对全部 TODO、再用「先 SELECT 后 UPDATE」两条语句实现认领，verify 照样全绿，上线照样双份。
+</Pitfall>
+
+---
+
+## 三、状态机：终态、取消、等人
+
+### 3.1 最便宜的不变量
+
+终态（succeeded / failed / cancelled / timed_out）不可再 claim（JOB-9）；checkpoint.seq 严格递增，同 seq 的写入被拒而不是覆盖（JOB-4）；requeue 保留 checkpoint（JOB-6）。非法转移返回 `ok:false` 且**不改原 job**——同一串事件喂两遍，结果一样。
+
+持久化频率是在选丢失窗口。LangGraph 的 `durability` 有 `sync`、`async`（可能丢最后一步）、`exit`（只在退出时写）三档；Claude Agent SDK 的 `SessionStore` **只持久化 transcript**，且是尽力而为的镜像。coding agent 里合理的是 `edit` 之后同步落盘。
+
+### 3.2 transcript 不等于工作区：L17 的欠条
+
+会话恢复还原的是**对话**。L17 `Workspace` 里那些读后写哈希和回滚快照全在内存里，进程一死就没了。lab 的 `Checkpoint` 有一个字段：
+
+```ts
+/** 工作区内容哈希（接 L17 contentHash）——续跑前必须对上。 */
+workspaceHash: string
+```
+
+<Pitfall title="注释说「必须对上」，代码里没有人对">
+`applyTransition` 从头到尾不读 `workspaceHash`。新 worker 对着一个可能被改过的工作区继续 `edit`，状态机毫无反应。
+
+生产里续跑前要有 `resumeCheck(checkpoint, 当前哈希)`：不一致就拒绝静默续跑，转问人或回滚快照。它和 L17 的读后写校验是同一个不变量，尺度从一次 edit 放大到一次续跑。**lab 未实现。**
+</Pitfall>
+
+更难的一层：checkpoint 之后、崩溃之前，副作用已经发出去了呢？L08 的 intent / outcome 精确刻画了它——**有 intent 没 outcome，等于副作用可能已发生**。`planResume` 对 `pure` 和 `idempotent` 重做，对 `once`（git push、开 PR）问人。作业级续跑应该消费这套：`redo` 映射成重新入队，`ask` 映射成等审批。lab 没有接上。
+
+### 3.3 取消不等于已取消
+
+lab 的 `cancel` 直接置 `cancelled`。本课跑过：`workerId` 仍挂着，worker 直到下一次心跳被拒才知道——而之前发出的 `git push` 不会因为一个字段变了而撤回。
+
+生产要有中间态：`cancel_requested → cancelling → cancelled`，worker 在安全点确认才进终态；超期强制终止并标「副作用未知」。**lab 未实现。**
+
+Vercel AI SDK 的可恢复流把同一件事放在协议层：**停止是独立端点**，客户端 abort 反而破坏续传。这是 L16 `StopPolicy` 的后端对偶——**断线不是取消，取消必须是一次显式请求。**
+
+### 3.4 等人的时候，作业应该停靠
+
+lab 里 `waiting_approval` 允许心跳续租，worker 和租约都挂着。更糟的是 `requeue_stale` 接受从它出发。本课跑过：
+
+```text
+claim → request_approval → worker 死了，租约过期 → requeue_stale → queued
+用户这时点「允许」→ approve 返回 ok:false（approve 仅 waiting_approval）
+```
+
+**用户那次点击丢了**，没有任何报错。等人可能是小时级，而云端 agent 会话和 Cloud Run 请求都有硬时长上限（数值以各自文档为准）。
+
+生产里等审批应该**停靠**：落 checkpoint、释放租约、不计入运行数；批准事件把作业重新入队。**lab 未实现。**
+
+---
+
+## 四、幂等：三层 key
+
+### 4.1 key 从哪来
+
+L08 的 `idemKey(sessionId, tool, input)` 是内容哈希，模型**合法地**对同一文件做两次相同 `edit` 会撞同一个 key。AWS Builders' Library 讲幂等 API 用的是**调用方提供的请求标识**。于是上线后有三层：
+
+| 层 | key 来源 | 防什么 | lab 对应 |
+|---|---|---|---|
+| 作业级 | 客户端生成的意图 ID | 重连、双击造出第二个作业 | `startJob` 的 `idempotencyKey` |
+| 调用级 | 模型给的 tool_use id | 续跑时一次调用执行两次 | L08 的 intent / outcome |
+| 外部副作用级 | 作业 id 加调用 id 派生 | push、发消息双发 | `checkIdempotency` |
+
+### 4.2 四种判定，以及 Stripe 的语义
+
+实验二：
+
+```text
+首次写                      execute
+同 key 重试                 replay:ok
+同 key 不同载荷             conflict
+unsafe 无 key               reject
+```
+
+**同 key 不同 `payloadHash` 是冲突**，不是覆盖、不是重放——重放上一次结果给一个不同的请求，等于告诉用户「你要的已经做好了」，做的却是上一次的。`read` 无 key 照常执行，两种写无 key 都拒。
+
+失败要不要重放？Stripe 的语义是：同 key **首次**请求的结果——**包括 500**——被保存并原样重放；验证失败和并发冲突不保存；要重试失败的请求，**换新 key**。同 key 不同参数报错，key 作用域是账号，至少保留 24 小时。
+
+lab 的 `startJob` 对终态一律重放（包括 `failed`），方向一致，但没给「换 key」提示。
+
+### 4.3 租户命名空间
+
+这是调研里唯一**直接泄露数据**的缺陷：早期草稿只比较 key，`bob` 用 `alice` 用过的 key，拿到了她的整份作业。现在：
+
+```ts
+// ★ 租户隔离：跨 user 的同 key 当作「没有 prior」——不泄露作业存在与否
+if (input.priorJob.userId === input.usage.userId) { /* …比较 key、payload、终态 */ }
+```
+
+START-4 断言 `bob` 拿到 `start`。
+
+<Drill title="为什么不报「key 已被占用」">
+
+那个错误本身是**存在性预言机**：枚举 key，就能从错误类型得知别人用过它。
+
+但「当作没有」对存储有要求：主键若只是 `key`，`bob` 插入时会撞上 `alice` 那一行——要么失败（又泄露），要么覆盖（更糟）。真正的修法是**主键为租户加 key**。lab 只在判定层模拟；调用方若按全局 key 查 `priorJob`，这一行判定就是唯一防线。
+</Drill>
+
+<Pitfall title="可选的指纹 = 可选的冲突检测">
+`startJob` 只在**两边都有** `payloadHash` 时才比较。本课跑过：调用方不传、prior 有旧指纹，结果 `replay`——新 prompt 拿到旧 prompt 的作业。START-5 测的是两边都传。生产里指纹应该必填。
+</Pitfall>
+
+TTL 也是窗口。IETF 有一份 `Idempotency-Key` 头的草案（已过期，**不是标准**）把过期时间作为服务端策略。TTL 过后同 key 就是新请求；客户端重试窗口比 TTL 长，过期后那次重试就是真的双花。lab 的 `EffectRecord` 有 `at`，但判定不看时间——**TTL 未实现**。
+
+---
+
+## 五、重试：分类、预算、注入的随机
+
+### 5.1 无 key 的不安全写，不自动重试
+
+L15 说过失败的请求也要钱。上线后还有一句：**失败的写，重试可能改两次世界。**
+
+`shouldRetryEffect` 的顺序：达到 `maxAttempts` → 不重试；permanent → 不重试；`unsafe_write` 无 key → 不重试；`unsafe_write` 加 unknown → 不重试；其余重试。TIMEOUT 是 transient，但**transient 不能压过「无幂等键的写」**——超时的意思是「不知道做没做」，不是「没做」。
+
+它只对 `unsafe_write` 查 key。`idempotent_write` 无 key 早在 `checkIdempotency` 就被拒了，两个函数串起来才完整。
+
+### 5.2 429 不是一类
+
+L15 第六节讲透了：速率限制的 429 带 `retry-after`；强制花费上限的 429 **不带**，重试在额度恢复前一直失败。lab 的 `classifyError`：
+
+| 错误码 | 分类 |
+|---|---|
+| `429_RATE`、`TIMEOUT`、`500` `502` `503` `504` `529` | transient |
+| `429_SPEND`、裸 `429`、`409`、`CONFLICT`、`400` `401` `403` | permanent |
+| 其他 | unknown，对 `unsafe_write` 禁止重试 |
+
+裸 429 为什么判 permanent？代价不对称：速率限制误判成永久，丢一次自动恢复；花费上限误判成瞬时，在一个永远不会成功的请求上退避到超时，期间占着 worker。**分不清就按贵的处理，逼调用方去拆**（RETRY-6/7/8）。
+
+<Pitfall title="同一个仓库里，两张表结论相反">
+`shared/resilience.ts` 是 L00 的单次 HTTP 重试：`RETRIABLE_STATUS` 含 409 和 429，抖动用 `Math.random`，不读 `Retry-After`。放在 L00 合理；拿它包作业级副作用，花费上限会被无限退避、冲突会被反复重放。作业层用作业层的分类。
+</Pitfall>
+
+还有一种失败在 200 之后：Anthropic 的流可能在中途发 `error` 事件（如 `overloaded_error`）。已收到的半条消息**不能提交**，重试粒度是一次模型调用。这只有真实流能验证，归 `runner`。
+
+### 5.3 重试放大是乘法，延迟要能断言
+
+Google SRE 讲过载：单个请求最多尝试 3 次；客户端的**重试预算**不超过请求数的 10%——因为每层都重试 3 次，最底层收到 3ⁿ 倍。agent 的链很深：模型 API × 工具 × 作业 × 用户点重试，四层各 3 次，最坏 81 倍，每一次模型调用都计费。
+
+lab 只有 `attempt < maxAttempts`，**没有预算，也不给延迟**。生产里应返回 `delayMs`：`429_RATE` 不小于 `retry-after`，抖动用注入的随机源（如 L15 的 `backoffMs`），verify 才能断言延迟序列。
+
+---
+
+## 六、配额与公平：条数公平不是成本公平
+
+### 6.1 入队前拒，比跑到一半杀便宜
+
+`admitJob` 依次查并发、排队数、日成本、日 token（QUOTA-1 到 4）。跑到一半被杀的作业，花掉的 token 收不回来。实验三：
+
+```text
+whale 再入队：DENY:concurrent 配额已满
+minnow 入队：ALLOW
+公平下一票：m-a
+```
+
+<PyMirror>
+
+`0.1 + 0.2 > 0.3` 在 TS 和 Python 里都是 `true`。本课跑过：已用 0.1 美元、估算 0.2、日上限 0.3，`admitJob` 返回 `dailyCost 超限`。
+
+两边都是 IEEE-754，结论一模一样——所以这**不是**跨语言字节差异，是**语义错误**：刚好用到上限的作业被拒。L15 用整数 `Picofen` 记账就是为此；lab 的 `QuotaPolicy` 仍是浮点美元，这是简化。配额口径必须和账本一致：都是整数。
+</PyMirror>
+
+成本只有跑完才知道。AWS Builders' Library 讲多租户公平的思路是**先放行、事后扣账、允许余额暂时为负**。Claude Code 的 CLI 文档也说 `--max-budget-usd` 对照的是**客户端估算**，可能超出，要留余量。lab **没有结算**。
+
+### 6.2 FIFO、按条数轮转、按成本轮转
+
+按 `createdAt` 排，鲸鱼永远在前。lab 的 `fairNext` 按 `lastServed` 轮转（FAIR-1）——这是**条数公平**。本课调研时的本地模拟：4 个 worker；whale 先提交 100 个 600 秒作业，minnow 提交 100 个 10 秒作业。
+
+| 策略 | 前 1000 秒起跑的 worker 秒数 whale / minnow | minnow 全部完工 |
+|---|---|---|
+| FIFO | 100% / 0% | 15 250 s |
+| 按条数轮转（`fairNext` 同类） | 98% / 2% | 14 670 s |
+| 按累计已付成本轮转 | 75% / 25% | 400 s |
+
+<Drill title="为什么轮转救不了小作业">
+
+t=0 时两个用户交替各拿两个 worker。10 秒后 minnow 的作业结束、空出两个 worker，而 whale 的要跑 600 秒。空出来的 worker 继续交替分配，每轮到 whale 一次就锁死 600 秒。几轮之后四个 worker 全被 whale 占住。
+
+**轮转公平的是次数，worker 时间按次数乘时长消耗。** 时长差 60 倍，公平就差 60 倍。
+
+修法是排序键换成**累计已付成本**。这是 VTC（Sheng 等，*Fairness in Serving Large Language Models*，OSDI '24）的核心思想：按实际 token 成本记账的虚拟计数器。两点说清楚：上表的「按成本轮转」是本课的**作业级类比**，不是 VTC 原始算法；75/25 不是 50/50，是因为作业不可抢占。**结论是排序和量级，不是比例。**
+</Drill>
+
+**按成本轮转、老化（等太久的提权）未实现。**
+
+### 6.3 认领时还要再查一次
+
+`fairNext` 不看并发。本课跑过：whale 已有一个运行中、上限为 1，但 `lastServed` 更旧——照样选中 whale。配额只在入队查，认领不复核。Anthropic 宣布周限额的理由之一是极少数用户 24/7 跑 Claude Code——配额还要有多个时间尺度。lab 只有「今日」，**两者都未实现**。
+
+---
+
+## 七、审批记忆：兑付 L16 的欠条
+
+### 7.1 「每次都问」是审批失效的方式
+
+Anthropic 公布过两个批准率，**出处和口径不同，不能混用**：
+
+- *Claude Code auto mode* 工程文章：用户批准了 **93%** 的权限提示；auto mode 分类器在「真实的过度主动动作」上漏报 **17%**；人工拦截率随会话变长而下降。
+- Anthropic 沙箱工程博客：**97%**；对**计划**的拒绝率 39%，对**单个权限请求**仅 3%。
+
+我的读法（推断，不是原话）：人在计划层还会判断，在单个请求层已经条件反射。高批准率更像疲劳信号，不是流程健康。
+
+<Key>
+「每次都问」会失效，「永远记住加前缀匹配」是后门。**中间态才是产品**：谁、对什么、多久、能不能被否决。
+</Key>
+
+Claude Code 的权限文档里寿命按工具定：Bash 的「不再询问」按**项目目录加命令**永久记住；文件编辑**到会话结束**；WebFetch 按**域名**。lab 收成三种 mode——`once` 用过即焚、`session` 绑会话、`ttl` 到期失效——没有 permanent，scope 一律按路径处理。
+
+### 7.2 scope 是路径段边界
+
+两个直觉都错。**精确匹配**：记住 `/repo` 后 `/repo/a.ts` 不命中，「记住目录」对文件无效，疲劳原样回来——早期草稿就是这样。**前缀匹配**：`/repo-evil` 以 `/repo` 开头——L17 那个 `startsWith(root)` 在 `ws-evil` 上放行的同一个洞。
+
+```ts
+export function scopeCovers(granted: string, requested: string): boolean {
+  const g = normalizeScopePath(granted)
+  const r = normalizeScopePath(requested)
+  if (g === null || r === null) return false
+  if (g === r) return true
+  if (g === '/') return r.startsWith('/')
+  return r.startsWith(g + '/')
+}
+```
+
+规整只用 `/` 分段，丢空段和 `.`，`..` 弹出上一段，越过根返回 `null`。本课跑过：
+
+```text
+授权 /repo   请求 /repo/a.ts                 覆盖
+授权 /repo   请求 /repo/                     覆盖
+授权 /repo   请求 /repo-evil                 不覆盖
+授权 /repo   请求 /repo/a/../../repo-evil    不覆盖
+授权 /repo   请求 repo/a.ts（相对）           不覆盖
+```
+
+<Pitfall title="scopeCovers 是纯词法的">
+它不碰文件系统。`/repo/link` 若是指向 `/etc` 的符号链接，`/repo/link/passwd` 在词法上被覆盖。这归 L17 的路径层（`realpath` 之后落在 root 外就拒，`SBX-7`）。**审批记忆问「用户允许过这块地方吗」，路径层问「这个路径真在这块地方里吗」**——两层都要，路径层在前。
+</Pitfall>
+
+### 7.3 deny 优先，以及复合命令
+
+Claude Code 的评估顺序是 deny → ask → allow。`recallApproval` 扫一遍，分别记第一个 deny 和第一个 allow，返回 `denyHit ?? allowHit`，与数组顺序无关（MEM-7）。实验四：
+
+```text
+/repo/a.ts            ALLOW
+/repo-evil            DENY     ← 没命中任何记忆；实验印成 DENY，生产里的含义是「要问」
+/repo/secret/x        DENY     ← /repo 的 allow 与 /repo/secret 的 deny 同时命中
+once 第二次           DENY     ← consumeOnce 删掉了
+```
+
+一个细节：`rememberApproval` 按用户、工具、scope 覆盖旧条目，**不看 mode**。对同一 scope 先记 session 级 deny、再记一条 once 级 allow，deny 就没了。生产里你可能希望 deny 只能被显式撤销。
+
+复合命令 **lab 未实现**。Claude Code 的文档写明：Bash 复合命令按 `&&`、`||`、`;` 和管道拆开，**每一段**都要匹配；`timeout`、`nice` 这类包装器先剥掉。lab 把 bash scope 也当路径：`npm test` 不覆盖 `npm test && curl x` 只是**碰巧**（不相等、也不是段前缀）；反过来 `git` 在词法上覆盖 `git/push`。生产里命令的记忆键应是**规范化后的命令段集合**。
+
+### 7.4 什么该问、问几次、怎么记住
+
+欠条的答案是一张按**风险类别**（L14 `classifyRisk`）而不是按工具的表：
+
+| 风险类别 | 问不问 | 记多久 | scope |
+|---|---|---|---|
+| 只读 | 不问 | — | — |
+| 工作区内编辑 | 首次问 | `session` | 路径段边界 |
+| 跑测试或构建 | 首次问 | `ttl` | 规范化命令段集合 |
+| 联网 | 首次问 | `session` | 域名，不含子域 |
+| 高风险（删除、push、改 CI、写 secrets） | **每次问** | 只 `once` | 具体参数 |
+| 无人值守 | 不问 | 作业生命周期 | 启动前预授权，其余默认拒绝 |
+
+这是设计，**不是 lab 的行为**：`rememberApproval` 不看风险，什么 mode 都收。
+
+### 7.5 拒绝之后，作业继续
+
+auto mode 的设计：分类器拒绝后，拒绝**作为 tool result 回给模型**，提示它换一条更安全的路、不要绕开边界；累计 **3 次连续或 20 次总拒绝**才停下升级给人（文档说阈值不可配置）。headless 没有人可问，进程终止。CLI 的 `--permission-prompts none` 写得很直白：
+
+> "Pass `none` when nobody can answer, and Claude Code denies them instead"
+
+lab 落实了第一步：**`deny` 把作业拉回 `running`，不是整单 `cancelled`**（JOB-12）。整单取消会逼用户永远点允许——点拒绝的代价是丢掉整个任务。
+
+<Pitfall title="deny 回 running 之后，agent 知道为什么被拒吗">
+`deny` 转移带了 `reason`，状态机**不存它**。把理由作为 tool result 回写给 agent 是调用方的事；拒绝计数与升级也**未实现**。lab 的 deny 是「不杀作业」，还不是「让 agent 换路」。
+</Pitfall>
+
+---
+
+## 八、断线续传与后台界面
+
+### 8.1 连接只是作业日志的一个读者
+
+错误实现：连接断开 → 重连 → **再 enqueue 一个作业**。三家的协议同构：SSE 重连带 `Last-Event-ID`（前提是收到过 `id:`，WHATWG 规定；L16 的 `wire.ts` 实现了这一半）；OpenAI 后台模式的流事件带 `sequence_number`，重连用 `starting_after`；Vercel 可恢复流用 `activeStreamId`。共同点：**生成不依赖连接**，读者从 0 到 N 都合法。lab 的原语是 `eventsAfter(events, lastSeen)`：只要 `seq > lastSeen`，按 seq 排序（JOB-10）。
+
+<Pitfall title="重放 seq ≤ lastSeen 不只是 UI 闪一下">
+后端工具若不幂等，UI「再显示一次」会变成仓库里真的再执行一次。`eventsAfter` 和 idempotency key 是同一条防线的两端。
+</Pitfall>
+
+### 8.2 游标越界返回空数组
+
+本课跑过：`eventsAfter(seq 1..3, 99)` 返回 `[]`。游标超过日志末尾——来自另一个作业、旧 epoch、或被篡改——被静默当成「已追平」。
+
+反方向同样危险：日志裁剪过，返回「剩下的」就是静默空洞。而日志一定会被裁剪——Temporal 对单个执行的事件历史有硬上限，出路是 Continue-As-New；Socket.IO 的连接状态恢复也明说**不保证成功**。
+
+生产里续传要返回三选一：事件列表、`ahead`、`expired`，后两种让客户端回退到全量快照。**lab 未实现。**
+
+还有一个混淆：`Checkpoint.seq` 的注释说「客户端用它做 resume cursor」。但 checkpoint 是作业级恢复点，流事件（token 增量、工具开始结束）密得多。生产要分成两个序号空间。**lab 混在一个 seq 里**，实验一里两者恰好对齐，所以看不出来。
+
+### 8.3 后台 agent 的界面：L16 的欠条
+
+后台 agent 没人盯着流。UI 要的不是更好看的任务列表，而是**作业状态机的投影**：
+
+| UI 状态 | 作业状态 | 用户能做什么 |
+|---|---|---|
+| 排队中 | `queued` | 取消 |
+| 运行中 | `running` | 取消、看实时流 |
+| 等你确认 | `waiting_approval` | 批准、拒绝（回给 agent 换路） |
+| 正在取消 | `cancelling`（lab 无） | 等待 |
+| 已完成 | `succeeded` | 看 diff、开 PR |
+| 失败 / 超时 / 死信 | `failed`、`timed_out`、`dead`（lab 无） | 用**新 key** 重试 |
+
+两条规则：**「重试」必须生成新 key**——按 Stripe 语义，旧 key 只会拿回上次的失败。**「你不在时发生了什么」是折叠，不是重放**——对 `eventsAfter(lastSeen)` 按类型数：调了几次工具、改了几个文件、被拒几次。
+
+### 8.4 TTFT 基线：L16 的欠条
+
+后台作业里，用户感知的首字时间是三段：
+
+```text
+queue_wait      认领时刻 − createdAt     等 worker
+start_latency   认领 → 工作区就绪         冷启动
+model_ttft      首个模型 token           模型本身
+```
+
+前两段能从注入时钟下的作业事件推导，第三段只有真实调用才有（lab 没有计算函数）。**基线是三段各自的分布，不是一个数**——只看 `model_ttft`，你会在排队把首字推到半分钟的那天看着一个达标的指标。
+
+---
+
+## 九、部署：drain、kill、健康检查
+
+### 9.1 drain 拒新，kill 拒一切
+
+| 模式 | 新任务 | 续跑 | 副作用 |
+|---|---|---|---|
+| open | 允许 | 允许 | 允许 |
+| drain | **拒绝** | 允许 | 允许 |
+| kill | 拒绝 | 拒绝 | **拒绝** |
+
+`startJob` 的顺序是**部署闸 → 幂等 → 配额**（START-1 到 5）。两个后果：重放排在配额前，超额用户仍能拿回已完成作业的结果，对；部署闸排在重放前，drain 期间连重放都被拒——重放本质是读，生产里应该放行，这是 lab 的粗糙处。
+
+### 9.2 滚动发布只给你 30 秒
+
+K8s 终止 Pod 先发 SIGTERM，等 `terminationGracePeriodSeconds`（默认 30 秒），然后 SIGKILL。agent 作业不可能 30 秒跑完，所以**优雅关闭的含义是「30 秒内落 checkpoint、释放租约」**，不是等任务完成。lab 的 drain 只拒新，**没有这一步**。
+
+### 9.3 kill switch 必须在模型之外
+
+Replit 事件的公开报道里，agent 违反了明确的代码冻结指令（多家转述）。Anthropic 的 auto mode 文章把「边界在上下文压缩中丢失」列为一类风险。**写在 prompt 里的约束受压缩、注入和遗忘影响。** kill 是部署状态，由编排层在每次副作用前检查，不经过模型（DEP-4）。
+
+### 9.4 kill 不应该变成宕机
+
+lab 的 `admitUnderDeploy` 只有 `new_job`、`resume`、`effect` 三种，kill 下全拒——**没有 `cancel` 和 `read`**，用户既不能取消也不能看状态。`healthCheck` 还把 kill 判成 `ok:false`（DEP-6）。
+
+<Pitfall title="把 healthCheck 接到存活探针上，kill 就是宕机">
+K8s 探针：liveness 失败重启容器，readiness 失败摘流。接到 liveness，按下 kill 那一刻所有实例开始重启；接到 readiness，所有实例被摘，状态页都打不开。**你想停新副作用，结果停了整个服务。**
+
+生产要拆开：liveness 只问进程活着没有；readiness 看能不能接新活，kill 只影响其中「新作业」一项；kill 下仍允许 cancel 与 read。**lab 未拆分。**
+</Pitfall>
+
+云端 coding agent 通常没有逐步审批，防线前移到部署形态：Claude Code 网页版的 git 凭据**不进沙箱**，由沙箱外的代理认证；Codex cloud 的 secrets 只在 setup 阶段可用——
+
+> "Secrets configured for cloud environments are available only during setup and are removed before the agent phase starts"
+
+作业以**发起者**的身份和配额运行，后来追加指令的人不叠加权限。
+
+### 9.5 健康检查里的三位小数
+
+<PyMirror>
+
+```text
+          TS toFixed(3)   Python f"{x:.3f}"   fmtFixed3（向零截断）
+0.0625       "0.063"          "0.062"             "0.062"
+1.005        "1.005"          "1.005"             "1.004"
+```
+
+`0.0625` 在二进制里精确可表示，正好落在两个三位小数中间。JS 的 `toFixed` 平局取较大者，Python 按「五成双」取偶数。同一份逻辑，两份字节。lab 两边都向零截断，DEP-7 断言 `"0.062"`。
+
+第二行是代价，本课本地跑过：`1.005` 的二进制值略小于 1.005，乘 1000 得 `1004.9999999999999`，截断成 `"1.004"`。**两边一致，但都不是你以为的数。** 一致可验证，精确不可。根治是源头用整数（错误数和请求数直接算整数千分比），lab 停在「一致」。
+</PyMirror>
+
+<TsMirror>
+
+部署是这门课第一次让 TS 在非开发机上冷启动。本课调研时用 Node v22.19 的原生类型剥离加载 `labs/shared/` 的每个模块：33 个里 16 个抛 `ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX`，典型是参数属性 `constructor(public readonly root: string)`。`ops.ts` 能加载，`coding.ts`、`budget.ts` 不能（写稿时复测过）。
+
+要么生产命令明写 `tsx`、接受冷启动变慢，要么把部署路径守在可剥离子集并加源码扫描断言。lab 没有这条断言——**`ops.ts` 在子集内是碰巧，不是被守着。**
+</TsMirror>
+
+---
+
+## 十、lab 做了什么，生产还差什么
+
+| 主题 | lab 里有（verify 守着） | 生产还要（lab 未实现） |
+|---|---|---|
+| 认领 | epoch 围栏；租约过期拒写 | 存储层条件写；认领上限加死信 |
+| 取消 / 等审批 | 直达 `cancelled`；占着租约等 | `cancelling` 中间态；停靠 |
+| 续跑 | 保留 checkpoint；`eventsAfter` | 校验工作区哈希；接 `planResume`；游标越界报错 |
+| 幂等 | 四种判定；租户隔离；载荷冲突 | 租户加 key 主键；TTL；指纹必填 |
+| 重试 | 429 拆开；无 key 不安全写不重试 | 延迟与 `retry-after`；重试预算 |
+| 配额 / 公平 | 四道闸；`lastServed` 轮转 | 整数金额；结算；按成本轮转；认领复核 |
+| 审批 | 三种 mode；段边界；deny 优先 | 复合命令拆段；按风险定 mode；拒绝计数 |
+| 部署 | open / drain / kill；健康检查 | kill 下许 cancel 与 read；探针拆分；SIGTERM 落盘 |
+
+右列每一条，你都应该能说出：**不做它，会在哪一种「看起来像成功」的情况下双份。**
+
+---
+
+## 十一、动手
+
+<Lab title="l19/ops：六个 TODO，每一条对应一种上线后的双份">
+
+```bash
+cd labs
+pnpm ops                                    # 五个观察实验，零模型
+OPS_IMPL=shared pnpm verify:l19             # 51 项，先确认测试本身是对的
+pnpm verify:l19                             # 测你的实现
+
+uv run python -m l19.ops
+OPS_IMPL=shared uv run python -m l19.verify     # 同样 51 项
+```
+
+<Steps>
+<li>先跑 `pnpm ops`，什么都不写。重点看实验一（旧 epoch 被拒）和实验四（段边界与 deny 优先）。</li>
+<li>按下表实现 `l19/ops.ts` 下半部分的六个 TODO。每个都有一条「看起来对但是错」的断言，先想清楚它。</li>
+<li>全绿之后回到第十节，挑右列一条自己补上。</li>
+</Steps>
+
+| TODO | 学什么 | 最容易写错的断言 |
+|---|---|---|
+| 1 `applyTransition` ★★ | seq 严格递增；claim 加 epoch；deny 回 running | JOB-11 同名 worker 旧 epoch；JOB-12 |
+| 2 `checkIdempotency` ★ | execute / replay / conflict / reject | IDEM-3 同 key 不同载荷 |
+| 3 `shouldRetryEffect` ★ | 无 key 不安全写不重试；429 拆开 | RETRY-1 TIMEOUT；RETRY-8 裸 429 |
+| 4 `admitJob` ★ | 并发 / 排队 / 日成本 / 日 token | QUOTA-3 已用 0.95 加 0.1 超限 |
+| 5 `fairNext` ★ | lastServed 轮转，平局 createdAt 再 id 码点 | FAIR-1 晚提交但久未服务者先走 |
+| 6 `startJob` ★★ | 部署闸、幂等、配额总判 | START-4 跨租户；START-5 载荷冲突 |
+
+审批记忆和健康检查不是 TODO，但 verify 会测（MEM-2、MEM-2b、MEM-7、DEP-7）。参考实现在 `shared/ops.ts` / `ops.py`；`l19/runner.ts` 不进 CI。
+</Lab>
+
+---
+
+## 十二、收尾
+
+三句该记住的话：
+
+1. **续的是 checkpoint，不是新作业；拦僵尸的是 epoch，不是 workerId。**
+2. **无幂等键的写不自动重试；幂等键按租户隔离；429 分清花不花钱。**
+3. **drain 拒新，kill 拒一切新副作用；审批 scope 按路径段覆盖、deny 优先，拒绝回给 agent 而不是杀掉作业。**
+
+欠条：审批 UX 在第七节，后台界面在 8.3，TTFT 在 8.4，L17 的内容哈希在 3.2——`resumeCheck` 是你要补的那一刀。
+
+<Key>
+这一节所有机制都在回答同一个问题：**一件事发生了两次，系统能不能分辨出来？**
+
+队列重投、同名僵尸、重连、重试、跨租户的同一个字符串、记住过的允许——都是「两次」的不同伪装。上线的工程，就是给每一种伪装配一个能分辨它的令牌。
+</Key>
+
+给 L19x（选修）：这些机制你都是手写的。换成主流 TS agent 框架之后，幂等键是它们那一行全空的地方，恢复审批时副作用会不会再执行一次也要你自己查。那一节把你手写过的每个部件对到框架里，看默认值和你的不变量差在哪。
+
+给 L20：那一节没有 lab，要你把 L00 到 L19 收成一个经得起追问的故事——可判定的编辑、可证明的改进、可上线的寿命。这一节是第三段的素材，第十节右列每一条「未实现」，都是你该讲清楚理由和代价的设计决定。
+
+给 L21：上线之后，死信深度、拒绝计数、幂等冲突率会比论文更早告诉你哪里错了。L21 的知识地图要同时挂这两种证据——而这一节留下的「按风险定默认 mode」，正是那里的一道练习。

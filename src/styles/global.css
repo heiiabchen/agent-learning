@@ -1,0 +1,285 @@
+/* ==========================================================================
+   Agent 学院 · 设计系统
+   方向：阅读向极简。首页与导航用系统无衬线，讲义正文用衬线。
+   近白底、近黑字、一种暗蓝作强调。代码块是浅灰底、细边。
+   ========================================================================== */
+
+:root {
+  --bg: #fbfbfd;
+  --surface: #ffffff;
+  --sunken: #f5f5f7;
+
+  --ink: #1d1d1f;
+  --ink-2: #424245;
+  --muted: #6e6e73;
+  --faint: #86868b;
+
+  --line: rgba(0, 0, 0, 0.08);
+  --line-strong: rgba(0, 0, 0, 0.12);
+
+  --accent: #1a3a6b;
+  --accent-wash: rgba(26, 58, 107, 0.06);
+  --good: #1c7a45;
+  --good-wash: rgba(28, 122, 69, 0.08);
+  --bad: #b42318;
+  --bad-wash: rgba(180, 35, 24, 0.07);
+
+  --font-ui: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'SF Pro SC', 'PingFang SC',
+    'Hiragino Sans GB', 'Noto Sans SC', 'Helvetica Neue', sans-serif;
+  --font-display: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'SF Pro SC', 'PingFang SC',
+    'Hiragino Sans GB', 'Noto Sans SC', 'Helvetica Neue', sans-serif;
+  --font-reading: 'Source Serif 4', 'Noto Serif SC', 'Songti SC', 'STSong', serif;
+  --font-mono: 'SF Mono', ui-monospace, 'IBM Plex Mono', Menlo, Consolas, monospace;
+
+  --measure: 66ch;
+  --spine-w: 248px;
+
+  color-scheme: light;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  scroll-behavior: smooth;
+  background: var(--bg);
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--font-ui);
+  font-size: 17px;
+  line-height: 1.5;
+  font-weight: 400;
+  letter-spacing: -0.011em;
+  text-rendering: optimizeLegibility;
+}
+
+::selection {
+  background: rgba(26, 58, 107, 0.16);
+  color: var(--ink);
+}
+
+a {
+  color: var(--accent);
+  text-decoration-color: rgba(26, 58, 107, 0.28);
+  text-underline-offset: 3px;
+  transition: color 0.18s ease;
+}
+a:hover {
+  color: #102848;
+}
+
+h1,
+h2,
+h3,
+h4 {
+  font-family: var(--font-display);
+  font-weight: 600;
+  line-height: 1.15;
+  letter-spacing: -0.022em;
+  text-wrap: balance;
+}
+
+.prose {
+  max-width: var(--measure);
+  font-family: var(--font-reading);
+  font-size: 1.075rem;
+  line-height: 1.9;
+  letter-spacing: 0.005em;
+  color: var(--ink);
+  font-optical-sizing: auto;
+}
+
+.prose > * + * {
+  margin-block-start: 1.15em;
+}
+
+.prose h2 {
+  scroll-margin-top: 2.2rem;
+  margin-block: 3.4rem 1rem;
+  font-family: var(--font-display);
+  font-size: 1.45rem;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  line-height: 1.25;
+  color: var(--ink);
+}
+
+.prose h3 {
+  margin-block: 2.4rem 0.65rem;
+  font-family: var(--font-display);
+  font-size: 1.12rem;
+  font-weight: 600;
+  letter-spacing: -0.016em;
+  color: var(--ink);
+}
+
+.prose h4 {
+  margin-block: 1.8rem 0.45rem;
+  font-family: var(--font-ui);
+  font-size: 0.95rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: var(--ink-2);
+}
+
+:where(.prose) :where(p) {
+  margin: 0;
+}
+
+.prose strong {
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.prose em {
+  font-style: italic;
+  color: var(--ink-2);
+}
+
+.prose ul,
+.prose ol {
+  padding-inline-start: 1.3rem;
+  margin-block: 0.9em;
+}
+
+.prose li + li {
+  margin-block-start: 0.45em;
+}
+
+.prose li::marker {
+  color: var(--faint);
+  font-family: var(--font-ui);
+  font-size: 0.85em;
+}
+
+.prose blockquote {
+  margin: 1.7em 0;
+  padding: 0.15rem 0 0.15rem 1.15rem;
+  border-inline-start: 2px solid var(--line-strong);
+  color: var(--ink-2);
+  font-style: italic;
+}
+
+.prose hr {
+  margin-block: 3rem;
+  border: 0;
+  height: 1px;
+  background: var(--line);
+}
+
+.prose :not(pre) > code {
+  font-family: var(--font-mono);
+  font-size: 0.84em;
+  letter-spacing: 0;
+  padding: 0.12em 0.38em;
+  border-radius: 6px;
+  background: var(--sunken);
+  border: 1px solid var(--line);
+  color: var(--ink);
+  white-space: nowrap;
+}
+
+.prose pre {
+  margin-block: 1.6em;
+  padding: 1.05rem 1.15rem;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  overflow-x: auto;
+  font-size: 13px;
+  line-height: 1.65;
+  letter-spacing: 0;
+  background: var(--sunken) !important;
+  position: relative;
+}
+
+.prose pre code {
+  font-family: var(--font-mono);
+  font-variant-ligatures: none;
+  display: block;
+}
+
+.prose table {
+  width: 100%;
+  margin-block: 1.7em;
+  border-collapse: collapse;
+  font-family: var(--font-ui);
+  font-size: 0.92rem;
+  letter-spacing: -0.01em;
+  line-height: 1.55;
+}
+
+.prose thead th {
+  text-align: start;
+  font-family: var(--font-ui);
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  color: var(--muted);
+  padding: 0 0.85rem 0.55rem;
+  border-block-end: 1px solid var(--line-strong);
+}
+
+.prose tbody td {
+  padding: 0.7rem 0.85rem;
+  border-block-end: 1px solid var(--line);
+  vertical-align: top;
+}
+
+.prose tbody tr:hover td {
+  background: rgba(0, 0, 0, 0.02);
+}
+
+.eyebrow {
+  font-family: var(--font-ui);
+  font-size: 0.75rem;
+  font-weight: 500;
+  letter-spacing: 0.01em;
+  color: var(--muted);
+}
+
+.numeral {
+  font-family: var(--font-ui);
+  font-weight: 500;
+  font-variant-numeric: lining-nums tabular-nums;
+  letter-spacing: 0;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+}
+
+::-webkit-scrollbar {
+  width: 11px;
+  height: 11px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(0, 0, 0, 0.18);
+  border: 3px solid var(--bg);
+  border-radius: 99px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(0, 0, 0, 0.28);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}

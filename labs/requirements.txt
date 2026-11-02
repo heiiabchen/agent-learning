@@ -1,0 +1,7 @@
+# 给不用 uv 的情况留的退路。推荐还是 `uv sync`，它会锁版本。
+#
+#   python3 -m venv .venv && source .venv/bin/activate
+#   pip install -r requirements.txt
+#
+anthropic>=1.0,<2
+python-dotenv>=1.0

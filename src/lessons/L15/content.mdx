@@ -1,0 +1,909 @@
+L14 结束时，你手上有了一个策略决策点：它能在不读那段不可信数据的前提下，决定一个动作能不能做。
+
+这一节换一个问题：**这套东西要花多少钱，以及你怎么知道。**
+
+第二个半句才是重点。如果这节课只是"缓存能省 90%、路由能省一半"，那它不值一小时——那些话在任何一篇博客里都能读到，而且**大部分是错的，或者是在一个你没注意到的前提下才对**。
+
+<Key>
+缓存、路由、批处理这三件事有一个共同的结构：**它们失败的时候不报错。**
+
+前缀太短不报错（Anthropic 官方原话：`no error is returned`）。兼容层丢掉 `cache_control` 不报错（DeepSeek 兼容表里四次写着 `Ignored`）。路由器把难题送给弱模型不报错。`speed: "fast"` 在 Claude Opus 4.6 上不报错，它静默跑标准速度。
+
+所以这一节真正要交付的不是"省钱的技巧"，是**一个判定器**：给定一份 `usage`，回答"这一步到底省没省，以及我能不能证明"。
+</Key>
+
+而"能不能证明"这件事会逼出一个你可能没预料到的状态。先把它放在这儿，第一节就会用到：**"没省到"和"我看不出来省没省"是两个不同的答案，把它们合并会让你去优化一个你观测不到的东西。**
+
+---
+
+## 一、唯一的信号在 `usage` 里
+
+先确立方法论。这一节所有的判断都建立在一句厂商原文上：
+
+> "Shorter prompts cannot be cached, even if marked with `cache_control`. Any requests to cache fewer than this number of tokens will be processed without caching, and **no error is returned**. To verify whether a prompt was cached, check the response usage fields."
+>
+> —— Anthropic, *Prompt caching § Cache limitations*
+
+注意后半句：官方给的验证方法是**读字段**。不是看响应时间，不是看日志。AWS 把同一件事说得更绝：
+
+> "Support for prompt caching doesn't guarantee a cache hit for any request. Check the cache usage fields in the model response to determine whether tokens were read from or written to cache."
+
+<Pitfall title="别用延迟判断缓存命中">
+这是最常见的错误做法，而且它错得很隐蔽：TTFT 确实会因为缓存命中而下降，所以这个方法**看起来能用**。
+
+它的问题有两层。近的一层是噪声——同一时段的负载、并发邻居、路由到哪台机器，这些的方差比缓存带来的差异更大，于是你早上测出"缓存有效"，晚上测出"缓存失效了"。
+
+远的一层更要紧：**"通过响应时间反推某段内容是否被缓存过"就是一条侧信道。** 这不是我的推断，是 OpenAI 在自己的性能文档里承认的攻击面，第八节会把原文摊开。你不该把自己的监控建在一条你同时要防御的信道上。
+</Pitfall>
+
+### 1.1 第一个反转：`input_tokens` 不是总输入
+
+这是本节最容易写错的一行账，而且它错的方向特别坑。
+
+> "`input_tokens`: Number of input tokens which were not read from or used to create a cache (that is, tokens after the last cache breakpoint)."
+>
+> "Important: `input_tokens` does NOT represent all input tokens — only the portion after your last cache breakpoint."
+>
+> "`total_input_tokens = cache_read_input_tokens + cache_creation_input_tokens + input_tokens`"
+
+官方给的例子：一份 200k 的文档命中缓存，加 50 token 的提问，你会拿到 `cache_read_input_tokens: 200000`、`cache_creation_input_tokens: 0`、`input_tokens: 50`。
+
+<Drill title="算一下这个 bug 的方向">
+假设你的成本监控只读 `input_tokens`。在缓存开始工作的那一天，面板上的输入 token 数会从 200,050 掉到 50。
+
+**显示的降幅是 99.97%。真实降幅是 90%**（200,000 个 token 从 1 倍变成 0.1 倍）。
+
+方向很重要：**它让你以为缓存比实际更有效。** 于是你会把"再优化一下缓存"从待办里划掉，而真实情况是还有 10 倍的空间没动。
+
+一个偏乐观的监控比没有监控更危险，因为它会让你停止查。
+</Drill>
+
+顺便，Anthropic 的这个口径不是通用的。OpenAI 的 `input_tokens` **已经包含**缓存部分，再加一次就会翻倍。所以"总输入"这个概念在两家的字段上是两套算法——这也是为什么下面的判定器必须先做归一化。
+
+### 1.2 四个状态，其中一个是"不知道"
+
+按一手来源，三家给了三条判定规则：
+
+| 端点 | 官方判定法 |
+|---|---|
+| Anthropic | `cache_creation_input_tokens` 和 `cache_read_input_tokens` 都是 0 → 没缓存 |
+| OpenAI / Bedrock | `cached_tokens > 0` 且 `cache_write_tokens == 0` → 完全命中 |
+| Anthropic fast mode | 读 `usage.speed`，它会告诉你实际跑的是 `fast` 还是 `standard` |
+
+拼起来就是判定器的规格：
+
+| 归一化后的 `usage` | 判定 |
+|---|---|
+| 有缓存字段，`read > 0` | `HIT` |
+| 有缓存字段，`read == 0`，`write > 0` | `WRITE_ONLY` |
+| 有缓存字段，两者都是 0，且前缀低于门槛 | `BELOW_MINIMUM` |
+| 有缓存字段，两者都是 0，前缀够长 | `MISS` |
+| **缓存字段缺失或恒为空** | **`UNDETERMINABLE`** |
+
+前四个状态大概在你预期之内。第五个是这一节的主角。
+
+<Note title="为什么必须有 UNDETERMINABLE">
+Anthropic 有一条 OpenAI 兼容端点。它的文档里有一句总纲：
+
+> "**Most unsupported fields are silently ignored rather than producing errors.**"
+> "Prompt caching is not supported, but it is supported in the Anthropic SDKs"
+
+而响应字段表里，关于 `usage` 的那两行是这么写的：
+
+| 字段 | 行为 |
+|---|---|
+| `usage.prompt_tokens_details` | **Always empty** |
+| `usage.completion_tokens_details` | **Always empty** |
+
+`prompt_tokens_details` 恒为空，意味着 `cached_tokens` 这个**唯一的信号**被抹掉了。
+
+于是在这条端点上，"缓存生效了吗"这个问题**在响应里没有答案**。缓存可能正在工作，也可能没有，而你拿到的字节是一样的。
+
+这时候你有三个选择，其中两个是错的：
+
+- 当成 `MISS`：你会去优化一个你观测不到的东西，而且会报出一个偏悲观的省钱比例。
+- 当成 `HIT`：你会报出一个编出来的省钱比例。
+- 当成 `UNDETERMINABLE`：**这一段账拒绝结论。**
+
+第三个才对，而它的代价是你的报告里会出现"这部分证明不了"。这个代价必须付——一个成本审计工具的价值，全在于它报出来的数字能不能被反驳。
+</Note>
+
+lab 的实验四把这件事摆在一起看：同一次请求、同一个缓存状态，五种端点的 `usage`。
+
+```
+anthropic                 HIT             {"cache_read_input_tokens":673,"input_tokens":3,...}
+openai-responses          HIT             {"input_tokens":676,"input_tokens_details":{"cached_tokens":673,...}}
+azure-chat                HIT             {"prompt_tokens":676,"prompt_tokens_details":{"cached_tokens":673,...}}
+deepseek                  HIT             {"prompt_cache_hit_tokens":673,"prompt_cache_miss_tokens":3}
+anthropic-openai-compat   UNDETERMINABLE  {"completion_tokens":50,"prompt_tokens":676}
+```
+
+前四行的字段名字全不一样，判定结果一样。最后一行没有缓存字段可读。
+
+<Drill title="DeepSeek 那行有个陷阱">
+DeepSeek 只有 `prompt_cache_hit_tokens`，**没有写入字段**。
+
+那它该判 `UNDETERMINABLE` 吗？
+
+不该。它的读字段是有的，能判。`write == 0` 在这里不是"数据缺失"——DeepSeek 的缓存是默认开启的，它的计费模型里压根没有"写入阶段"这个概念。
+
+这个区分很细但很重要：`UNDETERMINABLE` 的含义是"**我看不见**"，不是"**这个概念不存在**"。把"没有这个概念"判成"看不见"，你的审计报告会把一个完全可以证明的省钱比例标成不可证明。
+
+判定器的 `reason` 字段在这里要说清楚"该 provider 不区分写入"，否则读报告的人会以为 `write: 0` 是个 bug。
+</Drill>
+
+---
+
+## 二、断点不是"标记你想缓存的东西"
+
+这一节的标题就是那个误解。
+
+真实语义比这个窄得多，而且窄的方式很反直觉。Anthropic 专门写了一节叫 "Common mistake"，三条规则值得逐条读：
+
+> "1. Cache writes happen only at your breakpoint. Marking a block with `cache_control` writes exactly one cache entry: a hash of the prefix ending at that block. **The system does not write entries for any earlier position.**"
+>
+> "2. Cache reads look backward for entries that prior requests wrote. … **It is looking for prior writes, not for stable content.**"
+>
+> "3. The lookback window is 20 blocks. The system checks at most 20 positions per breakpoint, counting the breakpoint itself as the first."
+
+第二条是关键。**往回找的是"之前写过的条目"，不是"看起来稳定的内容"。**
+
+### 2.1 一个字的差别，+25%
+
+官方给的失败案例，改写成你会真的写出来的代码：一个 system prompt，前面是稳定的项目背景，最后挂一个当前时间。
+
+```ts
+system: [
+  { type: 'text', text: 项目背景 },
+  { type: 'text', text: `当前时间 ${now()}`, cacheControl: {} },  // ← 断点在这
+]
+```
+
+看起来很合理：断点放在最后，把前面所有东西都盖住。
+
+实际发生的事，官方原文：
+
+> "Request 1: Cache write at block 6. The hash includes the timestamp.
+> Request 2: The timestamp differs, so the prefix hash at block 6 differs. The lookback walks through blocks 5, 4, 3, 2, and 1, but **the system never wrote an entry at any of those positions**. No cache hit. **You pay for a fresh cache write on every request and never get a read.**"
+
+lab 的实验二把这两种写法跑在一起，唯一的区别是 `cacheControl` 挂在哪一块上：
+
+```
+断点在时间戳上          0.005225 元
+  五次的判定：WRITE_ONLY · WRITE_ONLY · WRITE_ONLY · WRITE_ONLY · WRITE_ONLY
+
+断点在稳定内容上        0.002125 元
+  五次的判定：WRITE_ONLY · HIT · HIT · HIT · HIT
+```
+
+<Key>
+连续五次 `WRITE_ONLY`。每次付 1.25 倍写入费，一次读都没拿到。
+
+这不是"缓存还没热"。**它永远不会热**，因为断点后面那块每次都变。
+
+而净效果是 **+25%**：比不开缓存还贵。日志上六次请求全部 200。
+</Key>
+
+这就是为什么判定器里 `WRITE_ONLY` 的 `reason` 必须提到"连续两次就是 bug"。单独一次 `WRITE_ONLY` 是正常的冷启动；连续两次意味着你的断点挂在一个每次都变的块后面。**这个区别只能靠跨请求的状态判断，不能靠单次响应。**
+
+<Note title="自动缓存也掉进同一个坑">
+你可能会想：那我用自动缓存好了，让系统自己选断点。
+
+官方明确说了不行：
+
+> "Automatic caching hits the same trap: it places the breakpoint on the last cacheable block, which in this structure is the one that changes every request, so use an explicit breakpoint on block 5 instead."
+
+自动缓存的策略是"挂在最后一个可缓存的块上"，而在上面那个结构里，最后一块正是时间戳。**它会精确地做出那个错误的选择。**
+</Note>
+
+### 2.2 "分歧很小"不等于"损失很小"
+
+这是交付物里我最想让你注意的一处，因为它的两个数字看起来自相矛盾。
+
+审计报告的第一节说某一步写入了 575 token、读到 0。第二节说这一步的分歧只有 64 token。
+
+```
+第 2 步 读文件后      WRITE_ONLY            0    575     631   0.001194
+...
+第 2 步 读文件后      system_changed    白付 64 token
+```
+
+64 和 575 差了将近十倍。哪个错了？
+
+都没错。**这个缺口就是 lookback 的真实语义。**
+
+分歧点之前那 567 个 token 逐字节相同。按"缓存应该能复用相同前缀"的直觉，这部分应该命中。但系统不会——写入只发生在断点上，断点在那个会变的块上，**所以更早的位置从来没有被写过**，往回找也找不到东西。
+
+于是每次请求都在全额重写 575 token，按 1.25 倍计费，一次读都没拿到。
+
+<Drill title="这条推论值得单独记住">
+**"我只改了一个字节"是一句关于分歧的陈述，不是一句关于损失的陈述。**
+
+损失的大小取决于断点在哪、之前写过什么，跟你改了多少内容没有直接关系。
+
+所以定位工具报"分歧在第 1 块、64 token"是有用的（告诉你去改哪里），但**不能拿它当损失估算**。审计报告必须分别报这两个数，而且要说明它们为什么不一致——否则读的人会以为工具算错了。
+</Drill>
+
+### 2.3 20 格窗口，和差一格
+
+第三条规则（lookback 窗口 20 格）有一个官方的三轮例子，好用到可以直接当测试规格。lab 的实验三就是它：
+
+```
+10 个位置，断点在 10    未命中       窗口内（位置 1–10）没有之前写过的条目
+15 个位置，断点在 15    命中于 10    命中于位置 10，只需新算 5 个位置
+35 个位置，断点在 35    未命中       窗口内（位置 16–35）没有之前写过的条目
+```
+
+第三轮的原因很刺眼。官方原话：
+
+> "The turn-2 entry at block 15 is one position outside the window, so there is no cache hit."
+
+第二轮的条目写在位置 15，第三轮的窗口是 35 往回 20 格，也就是 16 到 35。**差一格。**
+
+这意味着"一轮里塞很多 block"会静默地把上一轮的缓存挤出窗口。官方对此有一条缓解措施，而它正好解释了为什么并行工具调用是安全的：
+
+> "a run of consecutive `tool_use` blocks counts as one position, and so does a run of consecutive `tool_result` blocks, so a turn with many parallel tool calls doesn't push the previous request's entry out of the window on its own."
+
+所以 L07 那节讲的并行工具调用，在缓存这一层是被厂商特意照顾过的：八个并行调用算两个位置，不是十六个。
+
+### 2.4 门槛：便宜的模型门槛更高
+
+最低可缓存长度这件事有两个反转，都在官方那份清单里：
+
+| 模型 | 最低可缓存 token |
+|---|---|
+| Claude Opus 5 | 512 |
+| Claude Sonnet 5 | 1,024 |
+| Claude Opus 4.7 | 2,048 |
+| Claude Opus 4.6 / 4.5 | 4,096 |
+| **Claude Haiku 4.5** | **4,096** |
+
+第一个反转：**不随模型大小单调。** 最贵的 Opus 5 门槛最低（512），便宜的 Haiku 4.5 门槛最高（4096）——高八倍。
+
+第二个反转：**不随版本单调。** Opus 4.5 和 4.6 是 4096，4.7 降到 2048，4.8 降到 1024，Opus 5 降到 512。你没法从型号推出门槛，只能查。
+
+lab 的实验五拿一段 1500 token 的 system prompt 去试：
+
+```
+claude-opus-5            512  进得去
+claude-sonnet-5         1024  进得去
+claude-opus-4-7         2048  进不去，且不报错
+claude-haiku-4-5        4096  进不去，且不报错
+claude-opus-4-6         4096  进不去，且不报错
+```
+
+<Key>
+这是路由和缓存打架的第一个具体形式：
+
+你把简单任务路由到 Haiku 省单价，结果那段 1,500 token 的 system prompt 在 Haiku 上**根本进不了缓存**，每次全价。而在 Opus 5 上它是命中的，按 0.1 倍计费。
+
+**省下的单价差，可能小于丢掉的缓存。** 第五节会把这笔账真的算出来。
+</Key>
+
+---
+
+## 三、失效定位：只报最早的那一处
+
+知道"没命中"之后，下一个问题是"该怪谁"。Anthropic 的 cache diagnostics 给了这个问题最完整的一手框架，而它的核心是一张 2×2 表：
+
+> `diagnostics` 回答 "did my request change?"，`usage.cache_read_input_tokens` 回答 "did the cache hit?"。
+
+| 诊断结果 | 缓存读 | 解释 |
+|---|---|---|
+| `null` | 高 | 正常工作 |
+| `null` | 低或 0 | 请求没变，但缓存条目没了 → **改 TTL 或改节奏** |
+| `*_changed` | 低或 0 | **你的 bug** → 按 `type` 去改代码 |
+| `*_changed` | 高 | 罕见。改动发生在靠后的位置，但更早的断点还命中了 |
+
+<Key>
+这张表的价值在于它把"缓存没命中"拆成了两种**要采取不同行动**的情况：
+
+- "你的代码变了" → 改代码
+- "缓存过期了" → 改 TTL 或改请求节奏
+
+**把这两类混成一句"缓存命中率低"，是缓存调优最常见的浪费时间方式。**
+</Key>
+
+`cache_miss_reason.type` 的完整取值是六个：`model_changed`、`system_changed`、`tools_changed`、`messages_changed`、`previous_message_not_found`、`unavailable`。交付物里的 `firstDivergence` 就是在本地复现前五个。
+
+### 3.1 层级：改上游会连带下游
+
+前缀的构造顺序是固定的，而且这个顺序有后果：
+
+> "Cache prefixes are created in the following order: `tools`, `system`, then `messages`. This order forms a hierarchy where each level builds upon the previous ones."
+>
+> "**Changes at each level invalidate that level and all subsequent levels.**"
+
+所以定位的规则是：**只报最早的那一处。** 换了模型就不用再看 tools 了——模型变了，后面全都没意义。tools 变了就不用报 messages 了，报它没有信息量。
+
+<Pitfall title="我在这里写出了一个 bug，值得说一下">
+实现 `firstDivergence` 的时候，我把"在数组末尾追加"当成了良性变化——毕竟追加不改变已有内容的哈希，缓存应该还能命中。
+
+这个判断对 `messages` 是对的，对 `tools` 和 `system` 是**错的**。
+
+原因就是上面那条层级规则。`tools` 排在 `system` 和 `messages` 前面，**给工具清单加一个工具，会把后面所有内容的位置全部位移**，于是那两层的断点哈希全变。
+
+我的 bug 表现为：加一个工具，`firstDivergence` 返回 `null`——"一切正常"。而真实后果是整个缓存失效。
+
+**"追加是安全的"只在最后一层成立。** 修法是给内部的比较函数加一个参数，只有 `messages` 层允许把追加当良性。verify 里有两条测试专门盯这个。
+</Pitfall>
+
+另一个方向的错误同样致命：
+
+<Drill title="截断和追加是相反的事">
+上下文压缩（L06 那节）会**截断** `messages`。
+
+如果你的实现用"逐个比较到较短的那个长度为止，没差异就返回 null"这种写法，那么截断和追加都会返回 `null`。
+
+但它们对缓存的后果完全相反：追加保留前缀，截断改变了前缀的结束位置。**一个把两者等同处理的定位工具，会把每次上下文压缩都报成"一切正常"。**
+
+而上下文压缩恰好是 agent 里最频繁的结构性变化。
+</Drill>
+
+### 3.2 序列化：Swift 和 Go 会随机化键序
+
+这条陷阱是官方明说的，而且它会让你怀疑自己的眼睛——代码没改，缓存就是不命中。
+
+> "Verify that the keys in your `tool_use` content blocks have **stable ordering as some languages (for example, Swift, Go) randomize key order during JSON conversion, breaking caches**."
+
+`tools_changed` 的官方说明里也点了这件事：
+
+> "tools were added, removed, or reordered between turns, or tool `input_schema` JSON was **serialized non-deterministically**."
+
+命中判定是**逐 token 的密码学哈希**：
+
+> "**Exact matching**: Cache hits require 100% identical prompt segments."
+> "Cache keys are generated using a cryptographic hash of the prompts up to the cache control point."
+
+所以 `{"a":1,"b":2}` 和 `{"b":2,"a":1}` 是两个不同的前缀，尽管它们是同一个对象。
+
+这就是交付物里 `canonicalJson` 存在的理由，而它的要求比"排个序"多几条：
+
+- 键排序，嵌套对象也要排
+- 分隔符不带空格（Python 的 `json.dumps` 默认带空格，直接用它两边就不一致）
+- 非 ASCII 不转义（`json.dumps` 默认会转成 `\uXXXX`，TS 那边不转）
+- 数组**不**排序，顺序是语义的一部分
+- 拒绝非整数——同一个浮点在两种语言里印出的字符串可能不同
+
+<Note title="最后一条是双语言课程的税，但它同时是个真实约束">
+"拒绝浮点"听起来像是为了让 TS 和 Python 输出一致而加的洁癖。
+
+但它对着的是一个真实问题：**如果你的缓存键里有浮点，那么"同一个请求"在不同语言、不同版本的运行时下会产生不同的字节串。** 一个 Python 服务写入的缓存，Node 服务读不到，而两边的日志都显示"请求是一样的"。
+
+这一节所有的金额也遵守同一条纪律，理由在第四节。
+</Note>
+
+---
+
+## 四、金额不碰浮点
+
+这一节的交付物是一个审计工具，它的输出要能被拿去和账单对账。所以有一条硬纪律：**所有金额用整数定点算，一次浮点都不碰。**
+
+三个理由，从弱到强。
+
+**第一，两种语言的舍入方向不一样。** Python 的 `round()` 是银行家舍入（`round(0.5)` 得 0，`round(1.5)` 得 2），JS 的 `Math.round` 是四舍五入。同一行代码、同一个输入，两个答案。所以格式化只能**截断**。
+
+**第二，倍率的除法必须留到最后。** 缓存读是 0.1 倍，5 分钟写是 1.25 倍。如果你先乘 `num` 再除 `den`，每一笔都引入一次舍入；累加一万笔之后，两种语言的舍入误差足够让它们分道扬镳。所以 `charge` 的签名是把倍率作为分数传进去，除法在最后一步：
+
+```ts
+export function charge(tokens: number, price: bigint, mult: Mult = { num: 1n, den: 1n }): Picofen {
+  if (!Number.isInteger(tokens) || tokens < 0) {
+    throw new Error(`token 数必须是非负整数，收到 ${tokens}`)
+  }
+  return (BigInt(tokens) * price * mult.num) / mult.den
+}
+```
+
+**第三，也是真正的理由：一个报不出可对账数字的成本工具没有意义。** 如果你的审计说"省了 37.2%"而账单说 36.8%，那么这个工具的每一个结论都会被质疑，包括对的那些。
+
+### 4.1 盈亏平衡在第二次
+
+价格倍率是官方数字：5 分钟写入 1.25 倍、1 小时写入 2 倍、读取 0.1 倍。也就是**未命中比命中是 10 比 1**。
+
+OpenAI 给了一笔可以直接验算的算术：
+
+> "Writing a prefix once and fully reusing it once costs 1.35× its ordinary input cost, compared with 2× for processing it twice without caching. The savings grow with each additional cache read: across ten requests, one write and nine full reads cost 2.15×, compared with 10× without caching."
+
+lab 的实验一就是复算这笔账：
+
+```
+N        不开缓存      开缓存    倍率      省
+1        0.004000    0.005000   1.25x  -25.0%
+2        0.008000    0.005400   1.35x   32.5%
+3        0.012000    0.005800   1.45x   51.6%
+10       0.040000    0.008600   2.15x   78.5%
+20       0.080000    0.012600   3.15x   84.2%
+```
+
+倍率那一列和官方原文对得上：N=1 是 1.25、N=2 是 1.35、N=10 是 2.15。这不是巧合，是在确认你的计价模型和厂商口径一致——**后面所有结论都站在这个地基上**，所以值得先对一次。
+
+<Drill title="N=1 那一行">
+一次性的 prompt 开缓存是**亏的**：1.25 倍 vs 1 倍。
+
+所以"要不要开缓存"这个问题等价于"**这段前缀会不会被复用第二次**"。N=2 就回本了，门槛非常低——但不是零。
+
+批处理里有个对应的坑，官方明说：`max_tokens: 0` 的缓存预热在 batch 内部不支持，因为"an ephemeral cache entry written during batch processing would likely expire before the follow-up request runs"。写了读不到，就是纯亏 25%。
+</Drill>
+
+### 4.2 混合 TTL 的三点式公式
+
+你可以在一个请求里同时用 1 小时和 5 分钟缓存，但有个约束：
+
+> "**Cache entries with longer TTL must appear before shorter TTLs.**"
+
+计费公式官方给得很精确，三个位置：
+
+> "1. Position `A`: The token count at the highest cache hit (or 0 if no hits).
+> 2. Position `B`: The token count at the highest 1-hour `cache_control` block after `A` (or equals `A` if none exist).
+> 3. Position `C`: The token count at the last `cache_control` block.
+>
+> You'll be charged for: cache read tokens for `A`; 1-hour cache write tokens for `(B - A)`; 5-minute cache write tokens for `(C - B)`."
+
+交付物里 `mixedTtlBill` 实现的就是这个。注意 `A ≤ B ≤ C` 这个约束要**抛错**而不是静默返回一个数——顺序反了这个账根本算不出来，静默给个数字比抛错危险得多。
+
+### 4.3 TTL 从请求**开始**计时
+
+最后一个容易搞错的地方，它对 agent 特别要紧：
+
+> "The lifetime is measured from **the start of the request** that writes or reads the cache entry, not from the end of its response. Time spent generating a response counts against the lifetime: if a response takes 4 minutes to stream, a follow-up request that reuses the same cached prefix must start within about 1 minute of that response completing."
+
+agent 的一步经常是"长 thinking + 长输出 + 工具往返"。一个流式输出跑四分钟的步骤，下一步只剩大约一分钟的窗口。
+
+**这才是"长输出的 agent 需要 1 小时缓存"的真正理由**——不是"用户回复慢"。
+
+---
+
+## 五、路由：随机是基线
+
+现在换到第二个话题，而它有一个更大的认知陷阱。
+
+"模型路由能省 2 倍成本"这句话的源头通常是 RouteLLM 这篇论文。论文摘要确实这么写：
+
+> "Our evaluation on widely-recognized benchmarks shows that our approach significantly reduces costs — by over 2 times **in certain cases** — without compromising the quality of responses."
+
+注意 "in certain cases" 这三个字。摘要里就有限定词，而引用它的人经常删掉。
+
+限定词有多重要，看论文自己的 Table 3（GSM8K，只用 Arena 数据训练）：
+
+| 方法 | APGR | 相对随机基线 |
+|---|---|---|
+| Random（基线） | 0.497 | +0% |
+| BERT | 0.438 | **−11.8%** |
+| Causal LLM | 0.461 | **−7.3%** |
+| Matrix Factorization | 0.4746 | **−4.5%** |
+| SW Ranking | 0.4753 | **−4.3%** |
+
+<Key>
+**四个路由器全部比抛硬币差。**
+
+论文自己的结论：在 MMLU 上 "all routers perform poorly at the level of the random router when trained only on Arena dataset"。
+</Key>
+
+### 5.1 基线是随机，不是"全用便宜的"
+
+这是第二个反转，而它决定了你怎么评价自己做的路由器。
+
+> "Neither of the above metrics alone is sufficient to capture the quality-cost trade-off in routing. For example, a trivial router that always sends queries to the strong model achieves a perfect PGR = 1 but with no cost savings."
+
+随机路由的 APGR 恰好是 0.5，而这是一个**比大多数人想象中强得多的基线**。
+
+<Drill title='"我做了个路由器，省了 40%"这句话的信息量'>
+是零。
+
+把全部请求扔给便宜模型能省 90%，而且不需要路由器。
+
+**没有质量轴的成本数字不能用来评价路由。** 而 APGR 低于 0.5 意味着路由器提供了**负信息量**——它系统性地把难题送给弱模型、把易题送给强模型。
+
+这就是为什么交付物的路由表里有一行叫"反着判"。它不是为了搞笑，是为了让"路由器可以是负价值的"这件事有一个具体的数字。
+</Drill>
+
+还有第三个反转，关于"不牺牲质量"这个说法。论文里它的定义是 CPT(50%)，也就是恢复了强弱模型差距的 50%。论文自己把这个翻译成绝对分数：
+
+| 基准 | CPT(50%) 的绝对分 | 占强模型 |
+|---|---|---|
+| MT Bench | 8.8 / 9.3 | 95% |
+| MMLU | 75 / 81 | 92% |
+| GSM8K | 75 / 86 | **87%** |
+
+同一个"50% PGR"，在三个基准上对应 95% / 92% / 87%。在 GSM8K 上是掉了 13 个百分点。
+
+**"不牺牲质量"是一个相对指标的名字，不是一个事实陈述。**
+
+### 5.2 重试要算钱
+
+路由省钱的直觉是"便宜模型单价低"。但路由器会错分，而错分的代价是**一次白跑的弱模型调用加一次强模型调用**。
+
+最小的例子：一个必然被错分的难任务。弱模型跑一次（失败）+ 强模型跑一次 = 比直接用强模型更贵。
+
+所以路由省钱的前提是**错分率足够低**，不是"便宜模型单价低"。
+
+这笔账可以纯代数地推。设 `r` 是强弱模型的成本比、`p` 是弱模型单次成功率、`k` 是最多重试次数，那么"先弱后强"更优的条件是：
+
+```
+(1 − (1−p)^k) / p + (1−p)^k · r < r
+```
+
+代入 `r = 3.3`（DeepSeek 官方定价里 v4-pro 和 flash 的输出价比）：
+
+| `p` | `k` | 弱侧期望 | 总计 | 结论 |
+|---|---|---|---|---|
+| 0.9 | 3 | 1.11 | 1.11 | 划算 |
+| 0.5 | 3 | 1.75 | 2.16 | 仍划算 |
+| 0.3 | 2 | 1.30 | 2.92 | 勉强 |
+| 0.2 | 2 | 1.20 | **3.31** | **翻车** |
+
+**在 3.3 倍的价差下，弱模型成功率跌到 20% 左右就到了盈亏平衡点。** 价差越小平衡点越高——当 `r < 2` 时，即使 `p = 0.5` 也几乎不划算。
+
+<Note title="这条不是一手来源，是算术">
+我没有找到任何厂商文档或论文直接测量"便宜模型 k 次重试 vs 贵模型一次"。
+
+所以上面这张表的地位要说清楚：**输入（价格比）是一手的，推导是算术，结论不是实测。** 你可以拿它做决策，但别把它当成"有人测过"。
+
+这种区分在这门课里会反复出现。一个能说清"这条是引用、这条是推断、这条是我算的"的工程师，和一个所有结论都用同一种语气讲出来的工程师，差别在于前者的结论可以被检验。
+</Note>
+
+### 5.3 agent 里的账：步数翻倍，token 翻四倍
+
+路由到弱模型经常意味着**多走几步**。这笔账有两个乘数，不是一个。
+
+第 `i` 步的输入是前 `i−1` 步的累积，所以 n 步的总输入是：
+
+```
+总输入(n 步，每步新增 d token，基础前缀 B)
+  = Σ (B + (i−1)·d)
+  = n·B + d·n(n−1)/2
+```
+
+这是 `O(n²)`。代入 `B = 5000`、`d = 500`：
+
+- `n = 10` → 72,500 token
+- `n = 20` → 195,000 token
+
+**步数翻倍，token 数变成 2.7 倍，不是 2 倍。**
+
+而叠上缓存之后，结论翻转：如果前缀稳定、缓存命中，每步只有**新增**部分全价，累积部分按 0.1 倍计。同样 `n = 20` 的场景，195,000 token 的等效成本降到约 35,700——**18%**。
+
+<Key>
+**"步数翻倍"的惩罚是超线性的，而缓存恰好把超线性的那一部分打到 0.1 倍。**
+
+所以"用便宜模型多走几步"这个策略，**在缓存生效时可行，在缓存失效时是灾难**。
+
+而模型路由恰恰是打掉缓存的头号原因——cache diagnostics 里有一个专门的类型叫 `model_changed`，官方解释只有一句："The cache is per-model."
+</Key>
+
+### 5.4 把两件事放在一张表里
+
+上面这些拼起来，就是交付物第四节的那两张表。同一批 100 个任务（其中 53 个真的难），四种路由器，两种决策粒度。
+
+先看**没有共享前缀**的情况——这也是大多数"路由省 N 倍"的文章算的账：
+
+```
+路由器                       花费   占全强  重试
+完美路由（每请求）       0.288400    68.6%     0
+随机（基线）（每请求）   0.382200    91.0%    23
+反着判（每请求）         0.494200   117.6%    53
+全用便宜的（每请求）     0.362600    86.3%    53
+全用强模型（基线）       0.420000   100.0%     0
+```
+
+这张表基本符合直觉：路由器越准越省，"反着判"比全用强模型还贵。另外注意：**"全用便宜的"（86.3%）比"随机路由"（91.0%）更省**——路由器不比随机强，就不如不路由。
+
+再看有 8,000 token 共享前缀的情况：
+
+```
+路由器                       花费   占全强  重试  前缀命中  打断
+完美路由（每请求）       1.483600   215.7%     0        44    55
+随机（基线）（每请求）   1.989800   289.3%    23        48    74
+反着判（每请求）         2.754600   400.6%    53        46   106
+全用便宜的（每请求）     2.520200   366.5%    53        47   105
+··············· 同一批路由器，只改决策粒度 ···············
+完美路由（每 10 个）     1.431600   208.2%    22        76    45
+随机（基线）（每 10 个） 1.632800   237.4%    26        71    54
+反着判（每 10 个）       1.813000   263.6%    31        68    62
+全用强模型（基线）       0.687600   100.0%     0        99     0
+```
+
+<Key>
+**四种路由器全部输给基线，而且不是输一点。**
+
+原因不在路由决策的质量上。前缀是任务本身的 8 倍，而基线全程不换模型，它的前缀写一次读九十九次；**任何切模型的策略每切一次就重写一遍整段前缀。** 这笔钱盖过了单价差。
+</Key>
+
+决策粒度那部分值得单独看。从"每请求"改到"每 10 个请求"，打断次数从 55 降到 45、前缀命中从 44 升到 76，账从 215.7% 改善到 208.2%——**明显有效，但没有把差距补平。**
+
+而在第一张表里，同样的改动让账**变差**了（68.6% → 88.6%）。因为粘性路由是拿准确率换缓存命中：块内那些和块首难度不同的任务会被放到错的模型上。没有前缀可缓存的时候，这笔交易是纯亏。
+
+<Drill title="所以结论是什么">
+不是"路由能省 N 倍"，也不是"路由没用"。是：
+
+**先量一下前缀和任务的比例，再决定要不要路由、在什么粒度上路由。**
+
+这个比例是你自己系统的数，不是文章里的数。而它恰好是你能测的——第一节那个判定器就是用来测它的。
+
+顺带，厂商也承认这个矛盾。Microsoft Foundry 的 model router 文档里写着："caching benefits apply only when the same model handles consecutive requests with overlapping prompt prefixes"，并提供了 session affinity 作为缓解，同时明确说它"doesn't inspect cache state, guarantee a cache hit, or adaptively switch models based on cache savings"。
+
+**这正是"决策粒度"这个旋钮在厂商产品里的样子。**
+</Drill>
+
+---
+
+## 六、限流与重试：失败的请求也要钱
+
+这一节收 L13 留下的一条尾巴。
+
+### 6.1 重试不是免费的
+
+> "Note that unsuccessful requests contribute to your per-minute limit, so continuously resending a request won't work."
+
+**失败的请求也计入限额。** 所以盲目重试会加深限流，而不是绕过它。
+
+更麻烦的是，OpenAI 明确区分了两种 429，其中一种和你的用量无关：
+
+> "A `slow_down` error can occur even when your traffic is within its requests-per-minute and tokens-per-minute limits. **It reflects how quickly traffic increased, not whether you exhausted those limits.**"
+>
+> "As a rule of thumb, once your traffic reaches 1 million input tokens per minute (TPM), **increase it by no more than 50% every 15 minutes.**"
+
+Anthropic 有对应的概念，叫 acceleration limit。
+
+<Key>
+这意味着"指数退避"不够。你需要的是**限速器（限制发出速率）+ 退避**，而且扩容要有斜率上限。
+
+**一个只有退避没有限速的客户端，在 acceleration limit 面前会永远退避下去。**
+</Key>
+
+### 6.2 三种"超限"，只有一种该重试
+
+> "The error type is `rate_limit_error`, the same as for a rate limit, but **the response has no `retry-after` header. Retrying, including the SDKs' automatic retries, fails until access resumes.**"
+>
+> "On the Messages API, `error.details.error_code` is `enforced_spend_limit_reached`. Use it to tell this response apart from a rate limit."
+
+而你自己设的上限走的又是另一条路：
+
+> "When usage reaches a spend limit you set, requests return **HTTP 400** with error type `invalid_request_error`."
+
+三种情况在 HTTP 层面长得不一样：
+
+| 情况 | 状态码 | `retry-after` | 该重试吗 |
+|---|---|---|---|
+| 真的限流 | 429 | 有 | **该** |
+| 触发强制花费上限 | 429 | **没有** | 不该 |
+| 触发你自己设的上限 | 400 | — | 不该 |
+
+**对一个"花费上限已到"的错误做指数退避，你会在那里转到超时。它永远不会成功。**
+
+### 6.3 token bucket，不是固定窗口
+
+限速器的实现有个坑，官方提示得很明确：
+
+> "a rate of 60 RPM might be enforced as **1 request per second**"
+
+<Pitfall title="60 RPM 不等于「这一分钟里随便发 60 个」">
+一个按固定窗口实现的客户端限速器，会在每分钟开头突发 60 个请求，然后吃一串 429——**而它自己的计数器显示"没超"。**
+
+正确的模型是 token bucket：连续补充，容量有上限。交付物里的 `Limiter` 用的是注入的单调时钟，所以它可以在 verify 里被确定性地测试（1 秒内 60 次只放行 1 个、按 1 秒 1 个的节奏发全部放行、时钟倒流抛错）。
+
+一个细节：桶里的令牌数对外报成定点字符串而不是浮点，理由和第四节一样——浮点在两种语言里印出的位数不同。
+</Pitfall>
+
+### 6.4 请求太快也会打掉缓存
+
+最后一个反转，方向和直觉相反：
+
+> "**Cached states live on individual machines, where traffic above 15 requests per minute can lead to overflow routing.** A request can reuse a cached prefix only if it reaches a machine holding a matching entry that has not expired."
+
+Azure 独立复述了同一个阈值。
+
+**这是"扩容会让单位成本变高"的一个真实机制。** 压测的时候把 QPS 拉到 50，缓存命中率会掉，而你会以为是代码问题。
+
+顺带纠正一个关于 `prompt_cache_key` 的过期说法。它以前的用途是提高命中率；在 GPT-5.6 及以后：
+
+> "On GPT-5.6 and later, OpenAI handles cache routing automatically; **the key is not needed to optimize caching.** You can use separate keys to maintain separate cache accounting for customers or users within your application."
+
+它的主要用途变成了分账和——下一节的主题——防探测。
+
+---
+
+## 七、什么不该承诺
+
+这一节在课程大纲里原本的 outcome 是"把延迟砍一半、成本砍一个数量级"。调研做完之后我把前半句删了，理由值得讲，因为它本身就是这节课的方法。
+
+### 7.1 fast mode 不改善 TTFT
+
+Anthropic 的 Priority Tier 已经停售。取而代之的 fast mode，官方对它的描述是：
+
+> "- Up to 2.5x higher output tokens per second compared to standard speed
+> - **Speed benefits are focused on output tokens per second (OTPS), not time to first token (TTFT)**
+> - Same model weights and behavior (not a different model)"
+
+一步的耗时大约是 `排队 + TTFT + 输出token数 / OTPS`。**fast mode 只动分母。**
+
+对于"想一下、调个工具、再想一下"这种短输出多往返的 agent 形态，收益很小而价格翻倍。而且它**会打掉缓存**——`speed` 是官方失效表里的一行：切换 `speed: "fast"` 和标准速度会让 system 和 messages 缓存失效。
+
+### 7.2 并发翻倍不等于吞吐翻倍
+
+> "batching boosts decode throughput almost linearly but **has a marginal effect on prefill throughput**."
+>
+> "Takeaway-1: The two phases of LLM inference – prefill and decode – demonstrate contrasting behaviors wherein batching boosts decode phase throughput immensely but has little effect on prefill throughput."
+
+agent 的负载是 **prefill 重的**（长上下文、短输出）。
+
+**把并发从 N 提到 2N，在一个 prefill-bound 的 agent 负载上，接近于什么都没做，但把 P99 拉高了。** 论文把这个现象叫 generation stalls。
+
+<Drill title="一个特别好用的直觉锚点">
+> "Due to the low arithmetic intensity in decode batches, **the cost of linear operation for 1 decode token is nearly same as 128 prefill tokens.**"
+
+**1 个输出 token 的计算量 ≈ 128 个输入 token。**
+
+这同时解释了一件看起来矛盾的事：输出 token 的**价格**只比输入贵 5–10 倍，而**计算量**差 128 倍。
+
+差额去哪了？被缓存吃掉了一部分，被 batching 吃掉了一部分。**价格和计算量不是一回事**，所以从价格反推物理、或者从物理反推价格，都会得到错的结论。
+</Drill>
+
+### 7.3 所以 outcome 改成了什么
+
+原来的 outcome 承诺"把延迟砍一半"。查完发现：
+
+- fast mode 官方明说不改善 TTFT
+- 并发在 prefill-bound 负载上几乎不改善吞吐
+- 缓存确实会降低 TTFT，但**没有任何厂商给出可引用的幅度**
+
+也就是说，这个承诺我没有一手来源可以支撑，而且这一节的实验（一次模型都不调）结构上也测不出延迟。
+
+<Key>
+新的 outcome 是：**把账算到能反驳别人。**
+
+缓存是否真的生效、未命中该怪谁、路由到底省没省。
+
+一个讲义敢不敢把自己的承诺改小，和它敢不敢让审计工具输出"这部分证明不了"，是同一件事。
+</Key>
+
+---
+
+## 八、这一节切的是 L14 的边界
+
+最后一节，把这一节和上一节接起来。它不是牵强的呼应——是厂商自己写在文档里的。
+
+### 8.1 缓存是一条可探测信道
+
+上面引过的那句话，完整版是这样的：
+
+> "Using separate keys can make cached token usage and billing easier to explain for each customer or user. For example, **separate keys help prevent cache-hit probing across users: submitting candidate prompts and observing cache hits to learn whether matching content was previously cached.**"
+
+<Key>
+**OpenAI 在自己的性能文档里，把缓存探测攻击写成了一个需要防御的已知风险，并给出了防御手段。**
+
+攻击的形状很简单：提交候选 prompt，观察是否命中，从而推断"这段内容之前有没有被缓存过"——也就是**有没有别人提交过类似的内容**。
+
+DeepSeek 把这件事做得更直白：它的 `user_id` 参数，官方列出的作用之一直接叫 `KVCache Isolation`。
+</Key>
+
+这也是第一节那条建议（别用延迟判断缓存命中）的另一半理由。**你的监控手段和攻击者的探测手段是同一个东西。**
+
+### 8.2 隔离边界的名字是你的，不是厂商的
+
+隔离粒度这件事，**在同一家厂商内部都不统一**：
+
+| 平台 | 隔离边界 |
+|---|---|
+| Claude API 直连 | **workspace** |
+| Claude Platform on AWS | workspace |
+| Microsoft Foundry（Claude） | workspace |
+| Amazon Bedrock（Claude） | **organization** |
+| Google Cloud / Vertex（Claude） | organization |
+| OpenAI 直连 | organization，且不跨 region |
+| Azure OpenAI | **subscription** |
+| DeepSeek | 账号级，可用 `user_id` 手动细分 |
+
+Anthropic 自己提示了这个差异：
+
+> "Prompt caching uses workspace-level isolation. … **Bedrock and Google Cloud maintain organization-level cache isolation.** If you use multiple workspaces, review your caching strategy to account for this difference."
+
+<Pitfall title="如果你做的是多租户 SaaS">
+"组织级隔离"意味着**你的所有租户共用一个缓存池。**
+
+厂商保证的是"别的公司看不到"，不是"你的客户 A 看不到客户 B"。
+
+把一份客户 A 的文档放进共享前缀，客户 B 就可以通过探测知道它存在过。**这条边界的名字是你的，不是厂商的**——而唯一的工具是 `prompt_cache_key` / `user_id` 这类手动分区。
+
+这就是 L14 那句"做授权判断的那段代码，绝不能读那段不可信的数据"在成本层的镜像：**做缓存分区的那个键，绝不能跨越你自己的租户边界**，哪怕跨过去能省钱。这是这一节唯一一处"不要为了省钱而……"的地方。
+</Pitfall>
+
+### 8.3 兼容层是一个计费开关
+
+最后一个，它同时是这一节和 L14 的公共结论。
+
+DeepSeek 的 Anthropic 兼容端点对未知模型名做**静默映射**：
+
+> "**Note: When you pass an unsupported model name to DeepSeek's Anthropic API, the API backend will automatically map it to the `deepseek-flash` model.**"
+>
+> "Models starting with claude-opus are mapped to `deepseek-v4-pro`. … **The claude-opus mapping points to `deepseek-v4-pro`, which is billed at the V4 Pro price.**"
+
+按官方定价，`deepseek-v4-pro` 的未命中输入是 `deepseek-flash` 的 **4.4 倍**，输出是 **3.3 倍**。
+
+<Key>
+一个从教程里抄来的 `model: "claude-opus-4-5"`，在这条端点上**不会报错、不会警告，只会把你的单价乘以 4.4**。
+
+而 `model: "claude-3-5-sonnet-20241022"` 会被映射到 flash。
+
+**模型 ID 在兼容层上是一个计费开关，不是一个标识符。**
+</Key>
+
+同一个形状的还有 Claude Opus 4.6 的 fast mode：不报错、不加速、按标准价计费，而 `usage.speed` 会诚实地告诉你它跑的是 `standard`。相邻的 Opus 4.7 则**会**报错。
+
+**同一个参数，相邻两个版本，三种行为。**
+
+这是整节课方法论最干净的范例：厂商自己承认了静默降级，同时给了一个可以读回来的字段用于检测。**你的工作不是记住哪个版本怎么样，是写一个每次都去读那个字段的判定器。**
+
+---
+
+## 九、动手
+
+<Lab title="l15：从判定器到成本审计">
+两个文件，和前面几节一样的结构。
+
+**先跑观察实验**（不用写代码）：
+
+```bash
+cd labs
+pnpm cache          # 或 uv run python -m l15.cache
+```
+
+五个实验，对应上面五个反转。重点看实验二那组连续五次 `WRITE_ONLY`——**六次请求全部成功，没有一行红字。**
+
+**然后实现七个 TODO**：
+
+| 函数 | 它回答什么问题 |
+|---|---|
+| `canonicalJson` | 怎么让语义相同的东西产生相同的字节 |
+| `firstDivergence` | 前缀在哪一层、哪个位置开始分歧 |
+| `cacheVerdict` | 这一步命中了吗，还是我根本判不出来 |
+| `simulateTurn` | 20 格窗口里能不能找到之前写过的条目 |
+| `mixedTtlBill` | 混合 TTL 的三段各按什么倍率计费 |
+| `Limiter` | 连续补充的桶，不是固定窗口 |
+| `routeOutcome` | 算上重试和缓存打断，这个路由器到底省没省 |
+
+```bash
+pnpm verify:l15
+BUDGET_IMPL=shared pnpm verify:l15   # 先确认测试本身是对的
+```
+
+96 项测试，**一次模型都不调**。带 ★ 的那些是这一节真正要教的东西：它们全都不抛异常，所以你的实现漏了它们的时候，日志上看起来是绿的。
+
+**最后看交付物**：
+
+```bash
+pnpm audit          # 或 uv run python -m l15.route
+```
+
+一份成本审计报告。它会逐步判定、给未命中归因、把实付和两个基线对比、跑两张路由表——并且在有步骤走了兼容端点的时候，**拒绝报出省钱比例**。
+</Lab>
+
+<Note title="为什么这一节的 verify 一次模型都不调">
+不是为了省钱，也不是为了快。是因为**这一节要测的东西恰好全是结构性的**：
+
+缓存命中是前缀哈希相等（字符串比较），计费是 token 数乘单价倍率（整数算术），限流是 token bucket（状态机），路由成本是概率乘单价的加权和（整数算术）。
+
+反过来说更重要：**真去调模型会让这些结论变得不可复现。** 时段、负载、并发邻居的方差大于你想测的效应，于是一个同学在晚上测出"缓存让延迟降了 40%"，另一个在早上测出"降了 5%"，两个人都以为对方错了。
+
+这和第七节删掉"把延迟砍一半"是同一个判断：**能确定性验证的东西才值得写进测试，剩下的只能写进监控。**
+</Note>
+
+<CursorHook>
+把这一节的判定器用在你自己的 Cursor 用量上。
+
+Cursor 的用量面板会显示 token 数，但它不会告诉你"这些 token 里有多少是因为你改了一个字节而白付的"。你现在有工具回答这个问题了。
+
+一个具体的练习：在一个长会话里，观察你自己的行为如何打掉缓存。改一个文件（`messages` 追加，良性）、切一次模型（`model_changed`，全失效）、让它重读一遍项目结构（可能是 `system_changed`）。
+
+**第三种是最贵的，而它在界面上和第一种长得一模一样。**
+</CursorHook>
+
+---
+
+## 这一节的欠条
+
+三条，都记在明面上：
+
+1. **延迟这条轴基本没碰。** 上面给了几条一手的"不该期待什么"，但没有给"该怎么优化"。诚实的原因是这一节的实验结构（零模型调用）测不出延迟，而我不想在讲义里写没测过的东西。
+2. **批处理只提了和缓存的冲突。** Anthropic 支持两者叠加（实测命中率 30%–98%），Bedrock 明确不支持，Gemini 支持但不叠加折扣。这三种情况对 agent 的影响值得单独讲一次，但它不在这一节的主线上。
+3. **`temperature` 会不会打掉缓存，查不到一手来源。** 官方失效表里列了 `tool_choice`、images、thinking 配置、effort、speed、web search、citations——**采样参数不在其中**。合理的推断是缓存的是 prefill 阶段的 KV 而采样发生在 decode 阶段，DeepSeek 的文档也有侧面佐证。**但这是推断，不是引用**，所以它只能出现在欠条里。

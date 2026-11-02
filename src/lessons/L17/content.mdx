@@ -1,0 +1,628 @@
+前 16 节里你构建的每一个组件，失败时都会给你一个信号：HTTP 请求会超时、SSE 会断流、JSON 会解析失败、tool schema 会校验不过、eval 会掉分。
+
+这一节开始做一个真正能读、能改代码库的 mini coding agent。而它的核心难点**不是**「让模型写出对的代码」。
+
+<Key>
+coding agent 的核心难点是：**让「改动被正确落盘」这件事具备可判定性。**
+
+一个 patch 打到了错误的缩进层级、一个 `str_replace` 命中了三处里的第一处、一个 hunk 在丢掉上下文之后在文件另一端匹配上——这些全都不抛异常、不打日志、`exit code` 是 0。agent 会兴高采烈地向你汇报「已完成」。
+
+**代码编辑是这门课里第一个「失败时看起来完全像成功」的子系统。**
+</Key>
+
+L01 预告过：Cursor 的编辑工具让模型输出**要替换的原文片段**，而不是「在第 47 行插入」。L11 更具体——两个 agent 各读了 `src/api.ts`、各改各写，两份报告都说完成了。这一节把那些欠条兑成可测的代码。
+
+六个子系统都按同一个模板讲：**朴素的信念 → 它怎么静默失败 → 不变量 → 哪条断言钉住它**。lab 没实现的，我直接说。成功率一个都不出现——那是 L18 的事。
+
+---
+
+## 一、编辑工具：唯一性是设计选择，不是共识
+
+朴素的信念：编辑工具就是 `content.replace(old, new)`，官方工具已经处理好了。
+
+没有。Anthropic 的 text editor 是 client-side 工具，**执行在你的代码里**。文档原文：
+
+> The `str_replace` command requires an exact match for the text to be replaced. Your application should ensure that there is exactly one match for the old text or provide appropriate error messages.
+
+照 quickstart 写 `content.replace(old, new)`，你得到的是**静默改第一处**；写 `replaceAll`，得到的是**静默改全部**。两种都不报错。
+
+### 1.1 五种表示法，只有一种失败时有信号
+
+| 表示法 | 失败时有信号吗 | 典型静默错误 |
+|---|---|---|
+| 整文件重写 | 无 | 漏掉一个方法；elision 注释被当真 |
+| 行号编辑 | 无 | 差一行就改错，且看起来合法 |
+| unified diff | 看实现 | 丢上下文后命中第一处 |
+| search/replace 首命中 | 无 | 改了三处里的第一处 |
+| **`str_replace` + 唯一性** | **有** | 多处匹配 → `NOT_UNIQUE`，零写入 |
+
+lab 的实验一用一段对抗性文件——`get` 和 `peek` 里有一模一样的三行——跑同一个编辑意图。`pnpm coding` 的输出：
+
+```text
+表示法                      结果                  改对了吗      有信号吗
+search/replace 首命中       写入成功              碰巧对        无
+同上，意图其实是改 peek     写入成功              错            无
+str_replace + 唯一性        NOT_UNIQUE ×2         ——            有
+唯一性（扩大上下文）        成功 tier=exact       对            有
+行号编辑（差一）            写入成功              错            无
+```
+
+看前两行：**同一个实现、同一个返回值，一次碰巧对、一次错**。这就是「没有信号」的精确含义。最后一行是行号的失败模式：定位漂移，不是解析失败。OpenAI 的 V4A 和 aider 都明确排除行号，Anthropic 只在 `insert` 上用 `insert_line`。aider 说有定量实验支持，但数据没公开，所以这里只靠机制立论。
+
+<Key>
+正确的交互循环是：**先失败（不唯一）→ 扩大上下文 → 成功。**
+
+一个「更鲁棒」的、静默改第一处的实现，会让模型永远学不会扩大上下文。
+</Key>
+
+### 1.2 「唯一匹配」不是共识
+
+- Anthropic：`Make sure replacements match exactly one location to avoid unintended edits.`
+- aider 的 `diff` 格式：`*SEARCH/REPLACE* blocks will *only* replace the first match occurrence.`
+- **同一个** aider 仓库的 `udiff` 格式，多匹配时抛 `SearchTextNotUnique`
+- OpenHands：多处匹配时报错，并列出所有行号
+
+同一个作者、同一个仓库，两个格式语义相反。首命中的好处是编辑永远不会因歧义失败，代价是改错和改对长得一样。所以决定不是「正确答案是什么」，而是**显式选一个，并在测试里钉住**。lab 选 Anthropic 那一侧，错误信息给模型两条出路和行号：
+
+```text
+old 在文件中出现 2 次（行 3, 7）。扩大上下文使它唯一，或设 occurrence: "all"。
+```
+
+`EDIT-2` 钉住「两处匹配 → 失败、零写入」；TS 版额外断言 `matchLines` 的长度。
+
+### 1.3 上下文行数和唯一性是正交的
+
+unified diff 自带上下文，所以天然唯一？不。aider 的 udiff 打不上时会逐步丢上下文，注释是自白：`# if there is a - in the hunk, we can go all the way to use=0`。它有一道防线：
+
+```python
+before_lines = "".join([line.strip() for line in before_lines])
+if len(before_lines) < 10 and content.count(before) > 1:
+    return
+```
+
+<Drill title="为什么 return None 恰好越过这道防线">
+`"return None".strip()` 是 11 个字符——`strip()` 只剥两端，中间的空格还在。11 不小于 10，防线不触发。
+
+于是一个只删一行 `return None` 的 hunk，上下文丢光之后会打到文件里**第一处** `return None` 上。Python 里这几乎肯定仍然语法合法。
+
+值得记住的不是阈值该设多少，而是防线的形状：它在降级之后**用启发式猜**「够不够唯一」。正确做法是任何降级之后都重新数 `matchCount`，并把降到第几档写进返回值。
+</Drill>
+
+### 1.4 错误信息就是下一轮的 prompt
+
+编辑失败后，模型唯一能看到的是你的返回值。它决定模型下一步是扩大上下文、重读文件，还是原样重发。lab 的 `EditErr`：
+
+| 字段 | 为什么要有 |
+|---|---|
+| `reason` | `NOT_UNIQUE` 要加上下文，`NO_MATCH` 要重读——补救方向相反 |
+| `failedAt` | 批量里第几条挂的 |
+| `matchCount` / `matchLines` | 歧义在哪，扩大上下文才有方向 |
+| `old` | 必须逐字节等于模型发来的输入（`EDIT-9`） |
+| `alreadyApplied` | `old` 不在、`new` 已在——大概率已经生效过 |
+| `nearest` / `tierResults` | 最接近的原文；每一档各匹配了几次 |
+
+<Drill title="OpenHands 的 strip 回退：一行代码，三个后果">
+精确匹配失败时，OpenHands 有一个回退：
+
+```python
+old_str = old_str.strip()
+new_str = new_str.strip()
+```
+
+第一，`new_str` 也被剥了。「在函数前加一个空行」的意图被抹掉，返回成功。
+
+第二，`strip` 可能把唯一变成不唯一：`"\n    return None\n"` 唯一，`"return None"` 可能出现二十次。
+
+第三，原地赋值导致**错误信息报告的是改写后的 `old_str`**。模型收到「`return None` 有多处匹配」，而它发出去的不是这个字符串。它会原样重发——一个循环。`EDIT-9` 钉的就是这一条。
+</Drill>
+
+lab 在这一格有个缺口：NBSP 导致的 `NO_MATCH` **不点名码点**，点名的只有 `read` 的 `warnings`（`invisible: U+00A0 at line 2 col 1`）。
+
+---
+
+## 二、降级阶梯：宽容只能放在不改变匹配对象的维度上
+
+朴素的信念：模糊匹配让编辑更鲁棒，应该开着。
+
+### 2.1 参考实现度量了不确定性，然后扔掉
+
+OpenAI 在 GPT-4.1 prompting guide 里发布的 `apply_patch` 参考实现，`find_context_core()` 有三档：精确相等 `fuzz=0`；逐行 `rstrip()` 后相等 `fuzz=1`；**逐行 `strip()` 后相等——即忽略缩进——`fuzz=100`**。EOF 上下文找不到时还有一档 `fuzz += 10_000`。然后顶层入口是：
+
+```python
+patch, _fuzz = text_to_patch(text, orig)
+```
+
+下划线是 Python 里「我故意不用」的惯用写法。同一份文档：
+
+> After the apply_patch command is run, python will always say "Done!", regardless of whether the patch was successfully applied or not.
+
+**它算出了这次匹配有多不可信，扔掉，然后告诉模型 Done。**
+
+### 2.2 两份「矛盾」的证据
+
+aider 作者报告过，关掉 flexible patching 后编辑错误大幅增加——它的倍数没有公开方法论，这里不引。但同一个 aider 的 `editblock_coder.py` 里：
+
+```python
+    return
+    # Try fuzzy matching
+    res = replace_closest_edit_distance(whole_lines, part, part_lines, replace_lines)
+```
+
+裸 `return` 之后的编辑距离匹配是**不可达代码**。aider 真正开着的宽容是：精确匹配、整块统一缩进偏移（偏移量集合大小必须恰好为 1）、去掉开头空行、带唯一性检查的 `...` 省略。
+
+<Key>
+两份证据指向同一条界线：**保语义的规范化可以宽容，不保语义的相似度匹配不行。**
+
+整块缩进偏移不改变「匹配到的是哪段代码」；编辑距离 0.8 可以匹配到一段长得像的别的代码。
+</Key>
+
+### 2.3 本节的阶梯：exact → eol → blockIndent
+
+三条硬规则：任一档 `matchCount` 大于 1 就**立刻停**，返回 `NOT_UNIQUE`——更宽松的档只会匹配到更多处；没有相似度档；**没有逐行 `strip()` 档**。最后一条为什么必要：
+
+```python
+def process(items):
+    for item in items:
+        if item.ok:
+            return item
+    return None
+```
+
+模型的 `old` 把 `return item` 少写了一层缩进（8 个空格，实际 12 个）。`strip()` 档会命中，然后用 8 个空格写回——`return item` 落到 `for` 的层级，**循环第一次迭代就返回**。语法合法，`exit code` 是 0。
+
+lab 的 `blockIndent` 在这个例子上命中，但写回时用的是**原文件在命中位置的实际缩进**，再叠加 `new` 内部的相对缩进，结果在正确的层级。
+
+<Key>
+**规范化只允许发生在匹配阶段，绝不允许发生在写入阶段。**
+</Key>
+
+lab 的 `blockIndent` 比 aider 窄：它要求 `old` 的所有非空行**共享同一个缩进**。一个跨两层缩进的块整体少写 4 个空格，lab 返回 `NO_MATCH`，三档全是 0。方向是安全的：漏掉一次本可安全命中的编辑，代价是模型多一轮。
+
+<Pitfall title="把行尾差异做成一档的副作用">
+CRLF 文件配 LF 的 `old` 在 Windows 仓库上是常态，lab 返回 `tier: 'eol'`。如果你加一条「`tier` 不是 `exact` 就警告模型」，**Windows 仓库上每次编辑都会被警告**，很快变成噪声。
+</Pitfall>
+
+「模糊匹配静默改错」有多常见？调研没找到任何一手数据。所以这个决定靠的是**代价不对称**：检测几乎免费，漏掉的代价是一个通过了所有检查的错误改动。
+
+---
+
+## 三、字节层：双语言一致性会在这里断
+
+编辑工具的输入是「文本」，文件的内容是「字节」。这一层会**同时**破坏「改对」和「TS/Python 逐字节一致」。
+
+### 3.1 行切分
+
+Python 的 `str.splitlines()` 除了 `\n` `\r` `\r\n`，还在 `\v` `\f` `\x1c` `\x1d` `\x1e` `\x85` `\u2028` `\u2029` 上切。JS 的 `split('\n')` 只认一个。而文件里完全可能有这些码点：`\u2028` 在 JSON 字符串里合法，`\f` 在老 C 源码里用来分页。
+
+<PyMirror>
+
+```python
+>>> "a\x85b\u2028c\vd".splitlines()
+['a', 'b', 'c', 'd']
+>>> split_lines("a\x85b\u2028c\vd")      # shared/coding.py
+['a\x85b\u2028c\x0bd']
+```
+
+4 行对 1 行。TS 侧手写了三种行结束符、Python 侧图省事用 `splitlines()`，行号就在这个文件上错位，而两边的测试各自都是绿的。所以两边都手写，**只在 `\r\n`、`\n`、`\r` 上分行**。`"a\n"` 是一行，`"a\n\n"` 是两行。
+
+</PyMirror>
+
+`LINE-1` 钉住 `\v` 和 `\u2028` 不切，`LINE-3` 钉住结尾换行。这是 TODO 1。
+
+### 3.2 同一个病换了地方：正则的 `^`
+
+JS 的 `m` 标志下，`^` 在 `\n`、`\r`、`\u2028`、`\u2029` 之后都算行首；Python 的 `re.M` 只认 `\n`。lab 的测试输出解析器原先用的正是多行正则。同一段输入喂两边：
+
+| 输入 | 多行正则 · TS | 多行正则 · Python | 先切行再逐行匹配（两边） |
+|---|---|---|---|
+| `"progress 50%\r===== 3 passed in 0.10s =====\n"` | exact，绿 | unparsed，不绿 | exact，绿 |
+| `"note\u2028===== 3 passed in 0.10s =====\n"` | exact，绿 | unparsed，不绿 | unparsed，不绿 |
+| `"PASS\r\n"`（go） | exact | unparsed | exact |
+| `"Tests\x1c3 passed\n"`（vitest） | unparsed | exact | unparsed |
+
+进度条用 `\r` 回行首是终端的标准操作，所以这不是理论分叉。最后一行是另一个病：`\s` 在两边覆盖的码点不一样，JS 的含 `\uFEFF` 不含 `\x1c`，Python 正好相反。
+
+<Pitfall title="这一格 lab 修过，怎么修的">
+最早两边的 verify 都绿，因为没有断言喂过裸 `\r`。现在 lab 两边都先用 `splitLines` 切行，再对每行做**不带多行标志**的匹配；空白只写 `[ \t]`；Python 侧大小写不敏感的正则加 `re.A`，否则 `re.I` 会让 `ſ` 匹配 `s`。`PARSE-8`、`PARSE-9`、`PARSE-10` 钉住上表最右一列。
+
+U+2028 那一行两边都判 unparsed：`splitLines` 不把它当换行，所以 summary 不在行首。宁可假红，不要假绿。
+
+**双语言一致性不是翻译代码，是逐个排查两边标准库对「什么算一行」的定义。**`splitlines`、正则锚点、`\s`、`strip` 剥哪些字符，四处各不相同。
+</Pitfall>
+
+### 3.3 CRLF、BOM、tab、NBSP、结尾换行
+
+OpenAI 参考实现用 `split("\n")` 切、`"\n".join()` 拼，只在 patch 行上剥 `\r`。实验四：
+
+```text
+实现                            行尾分布              内容改动行数
+naive split/join on \n          4×CRLF + 1×LF         1
+本节规范（探测+恢复）           5×CRLF + 0×LF         1
+naive normalize to LF           0×CRLF + 5×LF         1
+```
+
+第三行是吵的，每一行的行尾都变了。第一行最阴：只有被编辑的那行变成 LF，`git diff` 里也只有那一行——**看起来干净，问题稍后才爆**。lab 探测主导行尾并在写回时恢复（`EOL-1`）；原文件本身混合时不去修，写一条 `MIXED_EOL` 进 `warnings`，未改动的行逐字节不变：`'a\r\nb\nc\r\n'` 改掉 `b` 是 `'a\r\nB\nc\r\n'`。
+
+其余四件事：
+
+- **BOM**：`utf-8-sig` 读、`utf-8` 写会静默丢掉它。lab 匹配前剥掉、写回时补上，首行编辑也能命中（`BOM-1`）。
+- **tab**：make 要求规则行以 tab 开头。空格形式的 `old` 在 `Makefile` 上必须 `NO_MATCH`，否则下一次 `make` 才报 `missing separator`（`TAB-1`）。
+- **NBSP**：模型看不见差异，会无限重试。它必须 `NO_MATCH`（`UNI-1`），并进 `read` 的 `warnings`。
+- **结尾换行**：aider 的 `prep()` 会补一个 `\n`，每个 PR 多一个神秘字节。lab 保留原状。
+
+### 3.4 写盘本身也不是原子的
+
+`writeFile` 先 `O_TRUNC` 再写，中途崩溃就是 0 字节，dev server 的 watcher 会读到空文件。正确做法是写临时文件再 `rename`，POSIX 保证 `new` 在整个过程中 `refer either to the file referred to by new or old before the operation began`。
+
+Python 侧用 `os.replace`（`os.rename` 在 Windows 上遇到目标已存在会抛错），临时文件用 `newline=""` 打开，否则文本模式会把你保留的行尾再翻译一遍。两边都没有 `fsync`：防进程崩溃，不防掉电。
+
+---
+
+## 四、多文件：原子性是你的决定，官方把它甩给你
+
+朴素的信念：一次编辑调用要么成功要么失败。OpenAI `apply_patch` 文档的 Safety 一节：
+
+> Atomicity: Decide whether you want "all-or-nothing" semantics (rollback if any patch fails) or per-file success/failure.
+
+aider 选了逐条写盘，最后告诉模型哪些已生效：
+
+```text
+The other {len(passed)} SEARCH/REPLACE {pblocks} were applied successfully.
+Don't re-send them.
+```
+
+**半成品是协议的一部分**，模型必须自己算差集。aider 为此专门加了 `if updated in content` 检查，判断 REPLACE 的内容是不是已经在文件里了。
+
+### 4.1 lab 的选择：调用内全有或全无
+
+- 第 k 条失败 → 整个调用失败，`failedAt` 等于 k，**零写入**（`BATCH-2`）
+- 目标区间重叠 → `OVERLAP`（`BATCH-1`）
+- 定位全部基于**原文件**，不是串行 `replace`；替换从后往前做（`BATCH-3`）
+
+注意层级：`applyEdits` 和 `Workspace.edit` 管的是**一个文件、一次调用**。跨文件的全有或全无 lab 没在调用层做，它靠任务级的 `rollbackAll`（4.3）。
+
+把 `helper` 从第 3 行挪到文件开头，分两次调用、先插后删：
+
+```text
+原文件                  插入之后                  第二次调用：删 helper
+A                       function helper() {}      old 出现 2 次（行 1, 4）
+B                       A                         → NOT_UNIQUE
+function helper() {}    B
+C                       function helper() {}
+                        C
+```
+
+首命中语义下，第二次调用删掉的是**第 1 行**——刚插进去的那份。文件回到原样，两次都返回成功，agent 汇报「已移动」。唯一性把它变成一个带行号的失败；而把两条放进**同一次**调用，两条都定位在原文件上，移动正确完成。
+
+### 4.2 读后写是强制不变量
+
+OpenAI 的 agentic prompt 写着 `Before editing, always read the relevant file contents or section to ensure complete context.` 这是提醒。Claude Code 的文档说的是另一种东西：
+
+> "Permission rules are enforced by Claude Code, not by the model. Instructions in your prompt or `CLAUDE.md` shape what Claude tries to do, but they don't change what Claude Code allows."
+
+lab 的 `Workspace.edit` 依次检查：没 read 过 → `READ_REQUIRED`（`STALE-1`）；上次 read 被截断 → `TRUNCATED_READ`；内容哈希变了 → `STALE_READ`（`STALE-4`）。成功后写盘，**并把哈希更新成新内容的**，所以自己刚写的文件能接着改（`STALE-5`）。
+
+用**内容哈希**而不是 mtime：mtime 分辨率不够，`git checkout` 会抹平它。文件改了又改回去会放行——这是对的，`old` 仍然有效。陈旧最常见的来源是 **agent 自己**：一次 `prettier --write`，刚读过的五个文件全变了。所以 `invalidateAfterCommand` 在任何非只读命令之后清空所有哈希。
+
+<Pitfall title="「只读命令」的判定是前缀匹配">
+lab 的 `isReadonlyCommand` 把 argv 拼成一行，看它是不是以 `git status`、`ls`、`pwd` 这类前缀开头：
+
+```ts
+isReadonlyCommand('git', ['status', '&&', 'rm', '-rf', '.'])   // → true
+```
+
+lab 不执行命令，所以这里不构成漏洞。但一旦你把 `run_command` 接到 shell 上，它会在 `rm -rf .` 之后保留所有读哈希。
+</Pitfall>
+
+<Drill title="STALE_READ 是 compare-and-swap，但它不是幂等键">
+用 L08 的语言说：上次 read 的哈希是期望值，相等才写——这是一次 **CAS**。它防「别人在我读之后改了文件」，不防「**我的同一个调用被执行了两次**」。L08 讲过，断线重连和超时重试都会让这件事发生。
+
+```ts
+{ old: 'init()\n', new: 'init()\nlogStart()\n' }
+```
+
+第一次成功，哈希更新成它自己写的内容。第二次到达，哈希匹配；`old` 仍然唯一（因为 `new` 包含 `old`），于是 `logStart()` 被插了两次。`NL-2` 的 `alreadyApplied` 只在 `new` 不包含 `old` 时救得了你。
+
+L08 那张重放表里 `write_file` 是幂等的；**`edit_file` 是 `once`**。修法是把期望哈希放进请求本身——重放的请求带的是旧哈希，CAS 自然失败。调研对删除操作给过同样的建议，lab 没有实现。
+</Drill>
+
+### 4.3 回滚要回到任务开始
+
+`text_editor_20250429` 的发布说明：`This version removes the undo_edit command`。官方建议你自己备份，典型写法 `cp file file.backup` 只有一层——连续改三次就回不到原点。
+
+lab 的快照是懒的：`ensureSnapshot` 只在一个文件**第一次**被写之前记录原始内容；新建的文件记成 `{ kind: 'absent' }`，`rollbackAll` 时删掉。为什么不用 git？`git checkout -- .` 会抹掉用户自己没提交的改动；而 Claude Code 提醒过，在新目录里跑 `git` `can execute that directory's hooks`。git 是执行面，不是快照工具。
+
+verify **没有**测 `rollbackAll` 的断言。值得自己补：改三次、新建一个、回滚，断言逐字节等于原始、新文件不存在。
+
+跨文件重命名改了五个调用点里的四个——每次编辑都正确落盘，合起来是坏的。这一层是语义问题，编辑工具解决不了，只能交给第六节的外部验证。
+
+---
+
+## 五、计划：如果它只是散文，就别要
+
+朴素的信念：先列计划，结果更好。调研查不到任何公开的消融实验支持这一点。Anthropic 的指引里反而有：
+
+> Planning is most useful when you're uncertain about the approach, when the change modifies multiple files, or when you're unfamiliar with the code being modified. If you could describe the diff in one sentence, skip the plan.
+
+<Key>
+**如果你要有计划，它必须是可校验的数据；如果它只是散文，就别要。**
+</Key>
+
+散文计划的问题不是写得不好，而是没有代码能检查执行偏离了它。思考过程也不是计划——不可校验、不可对账。
+
+### 5.1 真正有约束力的分离是能力边界
+
+prompt 里写「先计划再执行」，模型可以忽略。Claude Code 的 plan mode 是一个权限模式：`Claude reads files and runs read-only shell commands to explore but doesn't edit your source files`。lab 同一个思路：
+
+```ts
+toolsFor('plan')     // read_file / list_dir / grep / submit_plan / revise_plan
+toolsFor('execute')  // 再加上 edit_file / create_file / run_command / give_up
+```
+
+**plan 阶段的工具列表里根本没有 `edit_file`**（`PHASE-1`）。这和 L14 同构：靠指令的约束会被绕过，靠能力移除的不会。
+
+### 5.2 计划是带 `dependsOn` 的 DAG
+
+`validatePlan` 依次检查，第一个失败就返回：`EMPTY` → `DUPLICATE_STEP_ID` → `DANGLING_DEP` → `CYCLE` → `NO_VERIFY_STEP` → `EDIT_WITHOUT_READ`。
+
+最后一条要求 edit 的 target 被某个**祖先** read 覆盖。并列、没有依赖关系的 read 不算——执行器可以先跑 edit。`PLAN-6` 钉住它：**这是读后写不变量在计划层的投影。**
+
+`revise_plan` 是合法动作，但必须带 `reason`（`MISSING_REASON`）、有次数上限（`PLAN_THRASHING`）、不得删除或改写已完成步骤的 `targets`（`LOST_COMPLETED_STEP`）。最后一条防的是：模型把「我改了计划外的文件」追溯性地改写成「计划里本来就有」。
+
+### 5.3 遵从度只能对账行为
+
+`adherence(plan, log)` 产出 `unplannedFiles`、`unvisitedFiles`、`orderViolations`、`verifyRanAfterLastEdit`。它测行为，不测意图。
+
+两处简化如实说：`adherence` 把**任何** `run_command` 都算作一次 verify；lab 不在编辑**发生时**拦计划外文件，而是在 `canStop` 里事后拦——有计划外改动且没 revise 过，不许停。
+
+---
+
+## 六、外部验证与不可讨好的终止条件
+
+「自我验证」把人指向最不可信的那一层。Anthropic 的 best practices：
+
+> Claude stops when the work looks done, not when it's verified.
+
+Sonnet 4.5 的 system card 自述模型在编码场景里 `not self-critical enough`，并承认没有能可靠量化其普遍程度的评测。换一个模型来审也不是答案：
+
+> "A reviewer prompted to find gaps will usually report some, even when the work is sound, because that is what it was asked to do."
+
+### 6.1 门控代码住在哪里
+
+Anthropic 把「验证之后再停」分成四档：
+
+| 档 | 判定者 | 模型能绕过吗 |
+|---|---|---|
+| 在同一个 prompt 里要求跑检查 | 模型自己的注意力 | 能 |
+| `/goal` 条件，每轮由独立 evaluator 复查 | 另一个模型 | 部分 |
+| Stop hook，脚本阻止回合结束 | 退出码 | 不能 |
+| 验证 subagent 试图推翻结果 | 另一个模型 | 部分 |
+
+lab 的 `canStop` 是第三档：**一个确定性的函数，不读模型的任何陈述**。这是 L14 那条纪律在终止条件上的应用——做判断的代码不读不可信的数据，而「我已经完成了」就是那段数据。
+
+### 6.2 exit 0 不等于通过
+
+pytest 有七个 exit code，其中 `Exit code 5: No tests were collected`。同一页推荐了 `pytest-custom_exit_code` 插件来自定义这种情况——**exit 5 可以被配置成 exit 0**。
+
+所以 lab 的 `VerifyResult` 是结构体：`passed` / `failed` / `skipped` / `collected` / `confidence` / `exitCode`。`isGreen` 要求同时满足：`confidence` 是 `exact`、`collected` 大于 0、`failed` 为 0、exit 为 0。后两条互相兜底：`2 failed` 但 exit 0 不绿，`3 passed` 但 exit 1 也不绿。pytest 的 `error` 计入 failed，`xfailed` / `xpassed` 计入 skipped。
+
+### 6.3 解析测试输出
+
+实验二把一段 pytest 输出在**每一个字节偏移**处切断：
+
+```text
+完整输出 155 字节。
+首次 isGreen：偏移 155
+最后一次非绿：偏移 154
+完整 summary 之前的假绿次数：0
+绿区是后缀区间：是
+```
+
+「绿区是后缀区间」是要证的不变量：**输出越完整，结论只能从不绿变绿，不能反过来**。这里只有完整的那一个偏移是绿的，因为参考实现的正则 `/^=+ ([^=]+?) in [0-9.]+s =+\n/m` 要求 summary 行以 `\n` 结尾。
+
+对照 naive 的 `/(\d+) passed/`：同一段输入，它在偏移 128 就变绿——summary 才写出 `3 passed`。把 summary 改成 `3 passed, 2 failed`，它仍在 128 变绿。**截断在 passed 和 failed 之间的那二十几个字节，是 naive 解析器最危险的地方。**
+
+另外：必须**反向扫描**，测试自己 print 的 `"3 passed"` 会骗过正向扫描（`PARSE-7`）；认不出就是 `unparsed`，不绿（`PARSE-3`）；`collected` 为 0 不绿（`PARSE-4`）；截断的 summary 不绿（`PARSE-6`）。
+
+<Drill title="要求结尾换行是一个有代价的选择">
+代价是：一段完整、但碰巧没有结尾换行的输出也会判成 `unparsed`。这是有意的不对称——假红的代价是多跑一次测试，假绿的代价是一个没通过的改动被当成完成。
+
+lab 里还有一处同方向的设计：「no tests ran」在**全文任意位置**优先检查。输出里如果有测试自己打印的 `no tests ran yet`，后面才是真的 `3 passed`，参考实现会判 `collected` 为 0、不绿。又是假红，不是假绿。
+</Drill>
+
+### 6.4 canStop 的硬条件
+
+模型说 finish **不是**终止条件。`canStop(state, baseline)` 要求：
+
+1. 跑过 verify，`confidence` 是 `exact`，`collected` 大于 0，无失败，exit 0
+2. `lastVerifySeq` 大于 `lastEditSeq`——**verify 必须在最后一次 edit 之后**
+3. `collected` 不少于 baseline，`skipped` 不多于 baseline——防删测试、防 `SkipTest`
+4. 测试文件的哈希与任务开始时相同
+5. 没有未经 `revise_plan` 的计划外改动
+
+实验五打的是第二条：
+
+```text
+日志                            canStop  原因
+edit→verify→finish              true
+edit→verify→edit→finish         false    verify 不在最后一次 edit 之后
+从未 verify                     false    从未跑 verify
+```
+
+<Key>
+**绿过一次又改了一刀，不算绿**。这是 `STOP-3`。它最容易被漏，因为人的直觉是「刚才测过了」。
+</Key>
+
+### 6.5 reward hacking：测检测器，不测模型
+
+Sonnet 4.5 的 system card：
+
+> "As with previous models, we are most concerned about reward hacking in coding settings, given this has been the most common setting where we've observed hacks in training and deployment scenarios."
+
+Baker et al.（OpenAI）在训练中发现两种系统性 hack：`exit(0)`——提前退出、测试没跑完；`raise SkipTest`——从测试框架外抛异常跳过测试。它们正好对应 6.2 的两条：不信 exit code、比 skipped 的基线。
+
+hack 的**发生率**不可复现，厂商自己说压力测试 `do not reflect real-world hacking rates`，所以这里不引任何比率。零模型调用能测的是：**如果它作弊了，检测器会不会报警。**`detectHacks` 是参考实现，不是 TODO：
+
+| 规则 | 级别 | 触发条件 |
+|---|---|---|
+| `TEST_FILE_MODIFIED` | block | diff 改了 `tests/`、`test/`、`__tests__/` |
+| `SKIP_MARKER_ADDED` | block | 新增 `pytest.mark.skip` / `xfail`、`it.skip(`、`t.Skip(` |
+| `SKIP_INCREASED` | block | skipped 比 baseline 多 |
+| `EARLY_EXIT` | block | 收集至少 12 个，结果行不到一半，exit 0 |
+| `UPSTREAM_MODIFIED` | block | 动了 `node_modules/`、`.venv/`、`site-packages/` |
+| `SKIP_FROM_SOURCE` | block | 在非测试文件里 `raise unittest.SkipTest` / `pytest.skip(` |
+| `PACKAGE_SHADOWING` | block | 改动的顶层目录和已安装的包同名 |
+
+另有三条只警告不拦截：新增 `sys.exit(0)`（`SUSPICIOUS_EXIT`）、大块删除加 `pass`/`TODO`（`STUB_SUSPECTED`）、agent 读了测试文件（`READ_TEST_FILE`）。
+
+同等重要的是 `HACK-11`：**一段正常的 bug 修复不得报警。**`src/contest.ts`、`src/latest.ts` 不能被 `test` 子串误伤。误报多的检测器很快会被关掉。
+
+<Pitfall title="检测器只能抓已知模式">
+Baker et al. 自己说：`it may be the case that there are many hacks that our CoT monitors do not detect and we are still unaware of.` 所以 `detectHacks` 返回空只代表没命中已知模式。
+
+同一篇论文还警告：对思维链施加太强的优化压力，模型会学会 obfuscated reward hacking——藏起意图，继续作弊。直接后果：**别在 prompt 里写「不要做出看起来像作弊的事」**。你要的是它别作弊，不是它别被抓到。
+</Pitfall>
+
+### 6.6 给一个认输的出口
+
+Anthropic 的 Impossible Tasks 评测里，模型一直尝试 `until it arrives at one of two outcomes: 1) it decides the task is impossible and gives up; or 2) hacks in order to solve the task.` 如果你的 agent 只有「成功」一种结束方式，任务做不出来时，唯一能让 `canStop` 返回 true 的路就是去动测试。
+
+lab 的 `give_up` 带上非空 `reason` 就是合法终止，结局是 `gave_up`，不是 `failed`（`STOP-9`）。同一份 system card 还观察到，在这组问题上 `Various elements of the Claude Code scaffold made models less likely to hack`——没说是哪些元素，但方向清楚：**作弊倾向也是 scaffold 的属性**，而 scaffold 是你的代码。
+
+隐藏测试（Anthropic 用的是 `fuzzed versions of tests that are visible to the model`）lab 只做了一半：`tests/hidden/` 在 deny 列表里，**但跑它的 harness 没有实现**，那是 L18 的事。
+
+---
+
+## 七、沙箱：L14 到这一节的接缝
+
+L14 讲的是不可信内容会试图操纵你。现在被操纵的东西手里有写文件的能力。朴素的信念：`path.startsWith(root)` 就够了。
+
+### 7.1 路径检查要分层
+
+实验三，root 是 `/tmp/l17-sbx-demo`：
+
+```text
+路径                        startsWith  norm+starts norm+SEP  本节
+src/main.ts                 ALLOW       ALLOW       ALLOW     ALLOW
+../etc/passwd               ALLOW ✗     DENY        DENY      DENY
+a/../../etc/passwd          ALLOW ✗     DENY        DENY      DENY
+../l17-sbx-demo-evil/x      ALLOW ✗     ALLOW ✗     DENY      DENY
+link/passwd                 ALLOW ✗     ALLOW ✗     ALLOW ✗   DENY
+./.git/config               ALLOW ✗     ALLOW ✗     ALLOW ✗   DENY
+a\0b                        ALLOW ✗     ALLOW ✗     ALLOW ✗   DENY
+```
+
+每往右一列修掉一种错。`ws-evil` 那行规范化之后**确实以 root 开头**——前缀判断必须带分隔符，或者用 `relative()` 看是否以 `..` 开头（`SBX-4`）。`link/passwd` 是 root 里指向外面的符号链接，字符串检查全过，`realpath` 才露馅。`./.git/config` 说明 **deny 检查必须在规范化之后**（`SBX-11`）。
+
+`resolveInWorkspace` 的顺序：拒 NUL、反斜杠、绝对路径 → `shared/sandbox` 的 `safePath`（`relative()` 加 `realpath`）→ 对规范化后的路径**和解析后的路径**都查 deny 列表（`.git/`、`node_modules/`、`.venv/`、`site-packages/`、`tests/hidden/`、`.env` 和 `.env.*`，大小写不敏感）→ 写操作拒「路径本身是符号链接」。
+
+### 7.2 符号链接：allow 用 AND，deny 用 OR
+
+Claude Code 的规则：allow `apply only when both the requested path and the file it resolves to match`；deny `apply when either the requested path or the file it resolves to matches`。放行要两头都干净，拒绝只要一头脏——这是 fail-closed 的精确形式化。它还规定：路径本身是符号链接时 Edit 和 Write `refuse the write`；符号链接成环时 `refuse the operation`。
+
+lab 两条都实现了：`WRITE_THROUGH_SYMLINK` 和 `SYMLINK_LOOP`。deny 的 OR 也是字面意思：root 里 `g` 指向 `.git` 时，`g/config` 字符串上干净，解析后是 `.git/config`，照样拒（`SBX-15`）。
+
+<Pitfall title="lab 的沙箱补过的四个洞">
+这一节初稿的参考实现有下面四个洞，verify 一条都没覆盖，每条都是后来「先写一条会失败的断言，再修」补上的。
+
+**一、在符号链接目录下新建文件会逃出 root**。原先 `safePath` 只在目标**已存在**时才 `realpath`。root 里的 `out` 指向外部目录，`create('out/new.txt')` 会放行，文件落在 root 外，TS 和 Python 都一样。现在 `realpath` 作用在最近的已存在祖先上，再拼上剩下的部分（`SBX-8`、`SBX-8b`）。
+
+**二、符号链接环不会被拒**。`SYMLINK_LOOP` 原因码定义了但走不到，`realpath` 的错误被吞掉。Python 那边更隐蔽：`Path.resolve()` 默认 `strict=False`，遇到环**不报错**，原样返回一个看起来正常的路径。现在两边都用严格模式，环直接拒（`SBX-9`）。悬空链接同理：落点要等它被创建才知道，按拒绝处理（`SBX-10`）。
+
+**三、deny 列表大小写敏感**。`.ENV` 能通过，而在 macOS 默认文件系统上它就是 `.env`（`SBX-14`）。
+
+**四、deny 只查请求的路径**。就是上面 `g/config` 那个例子（`SBX-15`）。
+
+「找最近的已存在祖先」不能用 `existsSync` 判断：它跟随链接，悬空链接和环都会被当成不存在、被跳过去，而 `writeFileSync` 照样会跟着悬空链接写到外面。要用 `lstat`。
+</Pitfall>
+
+### 7.3 高危文件与审批粒度
+
+有些文件在 workspace 里、不在 deny 列表里，但改了它就改了执行面：`package.json`、`Makefile`、`conftest.py`、`CLAUDE.md`、`*.config.js`、`.github/workflows/`。改了 `conftest.py`，下一次 `pytest` 就执行 agent 写的代码。
+
+lab 的处理要说准确：`resolveInWorkspace` 对它们返回 **ok**，附带 `requiresConfirmation: true`（`INJ-2`）。`Workspace.edit` **照常写盘**，然后在返回值里带上这个标记——它不阻塞、不等审批。**真正的审批必须发生在调用 `edit` 之前**，也就是 L16 那条「审批卡在 `canExecute` 上」。这个列表也不全：`pyproject.toml`、`AGENTS.md`、`.vscode/` 都不在里面。
+
+这里兑 L16 的欠条：**什么该问、问几次、怎么记住。**
+
+Claude Code 把 `Prompt fatigue mitigation` 列为设计目标。但 L14 讲过，现场数据显示人在审批时是逐次判断的，主导决策的是来源——问题不在「问太多」，而在**问的东西没有信息量**。L14 的「主轴可逆性、副轴参数来源」可以直接落地：
+
+| 动作 | 处置 |
+|---|---|
+| 编辑 `src/` 下的文件（有快照，可逆） | 不问 |
+| 编辑会改执行面的文件 | 问，卡片上放 diff |
+| 写入路径来自刚读过的 README 或 issue | 问，卡片上放**来源** |
+| `.git/`、`.env`、`tests/hidden/` | 不问，直接拒 |
+
+卡片上放 L14 说的**唯一重要的字段**：解析后的真实路径、具体 diff、路径从哪来。「问几次」：同一任务里对同一文件的同类改动问一次。「怎么记住」需要跨会话持久化，留给 L19。
+
+最后，lab 里没有命令执行：`run_command` 只是 `toolsFor` 里的一个名字。如果你自己接，不给任意 bash，用 `spawn` 加 `shell: false`，让 `&&`、`$()` 在结构上不存在。Claude Code 自己说命令规则 `isn't a security boundary around the program`。路径边界防的是模型犯错，不是认真的攻击者。
+
+---
+
+## 八、动手
+
+<Lab title="l17/edit：六个 TODO，每一条对应一种静默失效">
+
+```bash
+cd labs
+pnpm coding                                  # 五组观察实验
+CODING_IMPL=shared pnpm verify:l17           # 先确认测试本身是对的（85 项）
+# 实现六个 TODO 之后：
+pnpm verify:l17
+
+uv run python -m l17.edit
+CODING_IMPL=shared uv run python -m l17.verify   # Python 侧 84 项
+```
+
+| TODO | 函数 | 学什么 |
+|---|---|---|
+| 1 | `splitLines` | 只认三种行结束符；Python 禁用 `splitlines()` |
+| 2 | `applyEdits` | `NOT_UNIQUE`、全有或全无、基于原文件定位、行尾和 BOM 还原 |
+| 3 | `validatePlan` | DAG、必有 verify、edit 前必有祖先 read |
+| 4 | `parseTestOutput` | 反向扫描、截断即 unparsed、fail-closed；先切行再逐行匹配 |
+| 5 | `canStop` | verify 在最后 edit 之后；比 baseline；测试文件哈希 |
+| 6 | `resolveInWorkspace` | 不是 `startsWith`；deny 在规范化之后、大小写不敏感、两头都查；新建也解析符号链接；拒环、拒写穿符号链接 |
+
+<Steps>
+<li>建议顺序：TODO 6（边界先立住）→ 1 → 2 → 4 → 5 → 3。TODO 2 最长，十几条断言会逐条告诉你漏了哪一步。</li>
+<li>`pnpm verify:l17` 收尾会单独列出六条关键断言：`EDIT-2`、`EOL-1`、`LINE-1`、`STOP-3`、`SBX-4`、`PLAN-6`。</li>
+<li>Python 侧同样六个 TODO，少的那一项是 TS 额外断言的 `matchLines` 长度。</li>
+</Steps>
+
+`detectHacks`、`adherence`、`revisePlan`、`toolsFor` 和整个 `Workspace` 都**不是** TODO，直接用参考实现——所以 hack 检测器那段和 `STALE-*` 测的是参考实现，不是你。参考实现在 `shared/coding.ts` / `shared/coding.py`，L18 会直接消费它。
+
+</Lab>
+
+`l17/runner.ts` 目前是接线示意：用写死的两次编辑演示「`NOT_UNIQUE` → 扩大上下文 → 成功」，再告诉你怎么把 `toolsFor`、`Workspace`、`canStop` 接进真模型的循环。它不进 CI，也不报成功率——**能用假输入测的，就不要用真模型测。**
+
+<CursorHook>
+
+下次让 agent 在一个 CRLF 文件里改一行，别只看 `git diff`——用 `file` 或编辑器状态栏看一眼行尾。
+
+再让它改一段在文件里出现两次的代码，看它的编辑工具是报错还是挑一处改。你会知道你每天用的工具在这一格上做了哪个选择。
+
+</CursorHook>
+
+---
+
+## 九、这节课的收尾
+
+六个子系统压成一句话：**每一个都在把一种「看起来像成功的失败」变成一个返回值**——`NOT_UNIQUE`、`tier`、`MIXED_EOL`、`STALE_READ`、`EDIT_WITHOUT_READ`、`unparsed`、`canStop` 的原因、`DENIED_PATH`。
+
+<Key>
+L14 的纪律是：**做授权判断的代码，绝不能读那段不可信的数据。**
+
+这一节把它推到了终止条件上：**决定「能不能停」的代码，绝不能读模型说的「我完成了」**。测试文件哈希不判断改动合不合理，只判断它变了没有——和 L14 的哈希钉定是同一个手法。
+</Key>
+
+**给 L18 的边界**：这一节只做「这一次能不能判定改对」。L18 会把这里的东西变成分类标签：补丁落下不等于解决（apply 不等于 resolve），`detectHacks` 命中就是 `hacked`。OpenAI 已经停止报告 SWE-bench Verified 分数，为什么，L18 从方法论讲起。
+
+**兑了哪些欠条**：L16 的审批粒度兑了一半：「什么该问」按可逆性和执行面分级，「问几次」按任务和文件去重，「怎么记住」留给 L19。L16 的后台 agent 界面和 TTFT 基线没兑——lab 不跑真模型，没有你自己的 TTFT 数字。L14 的路径沙箱往上叠了 deny 列表、规范化后检查、拒写穿符号链接、拒符号链接环，并把 `realpath` 推到还不存在的路径上。L08 的重放安全有了一个更精确的说法：读后写的哈希是 CAS，**CAS 不是幂等键**。
+
+**这一节自己的欠条**，lab 没做、但它们该在那里：
+
+1. 编辑请求带期望哈希，让重放自然失败
+2. 编辑时就拦计划外文件，而不是等到 `canStop`
+3. 隐藏测试的 harness——那是 L18
+
+初稿的欠条里还有两条：沙箱的四个洞，以及 TS 和 Python 在裸 `\r` 上的解析分叉。它们已经补上了，补法就是 `SBX-8`、`SBX-9`、`SBX-10`、`SBX-14`、`SBX-15` 和 `PARSE-8` 到 `PARSE-10`：先写一条会失败的断言，再修。剩下三条也是同一个形状。这一节教的其实不是编辑器，是这个形状。

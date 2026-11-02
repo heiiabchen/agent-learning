@@ -1,0 +1,38 @@
+{
+  "name": "agent-academy",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "从前端工程师到 Agent 工程师的定制课程",
+  "scripts": {
+    "dev": "vite",
+    "build": "node scripts/check-mdx.mjs && node scripts/check-render.mjs && tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "check:mdx": "node scripts/check-mdx.mjs",
+    "check:render": "node scripts/check-render.mjs"
+  },
+  "dependencies": {
+    "@shikijs/langs": "^4.4.1",
+    "@shikijs/themes": "^4.4.1",
+    "motion": "^12.23.24",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "react-router-dom": "^7.9.4",
+    "shiki": "^4.4.1"
+  },
+  "devDependencies": {
+    "@mdx-js/react": "^3.1.1",
+    "@mdx-js/rollup": "^3.1.1",
+    "@shikijs/rehype": "^3.14.0",
+    "@types/mdx": "^2.0.13",
+    "@types/node": "^22.18.9",
+    "@types/react": "^19.2.2",
+    "@types/react-dom": "^19.2.1",
+    "@vitejs/plugin-react": "^5.1.0",
+    "rehype-slug": "^6.0.0",
+    "remark-gfm": "^4.0.1",
+    "typescript": "^5.9.3",
+    "vite": "^7.1.9"
+  }
+}

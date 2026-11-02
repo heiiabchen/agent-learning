@@ -1,0 +1,841 @@
+L11x 是 Python 为主、TS 对照的那一节：读懂 LangGraph 和 DSPy，判断哪些设计该抄。这一节反过来，TS 是主通道，Python 只观测。问题也换了。前十几节你已经手写过停止原因、错误回填、幂等键、审批记忆、事件日志和 tracing，这一节把它们一件件对到主流 TS 框架里，回答三件事：框架替你写了哪一段，哪些默认值会咬人，你的不变量接在哪个扩展点上。
+
+先看一组数。同一个永远失败的工具，配一个每次都重试的模型，在七个入口的默认值下各跑一遍（`pnpm eco19` 的实验一）：
+
+```text
+入口                      默认上限  模型/工具  证据        结束方式
+ai-sdk/generateText       1         1/1        E1-B 实测   返回：finishReason=tool-calls，text 为空
+ai-sdk/ToolLoopAgent      20        20/20      E1-A 实测   返回：finishReason=tool-calls，text 为空
+ai-sdk/WorkflowAgent      无        50/50      文档        没有上限，第 50 次被外部掐断
+mastra/Agent.generate     5         5/5        E3 实测     返回：finishReason=tool-calls
+openai-agents/run         10        10/10      E6-A 实测   抛：MaxTurnsExceededError（error.state 还在）
+claude-agent-sdk/query    无        50/50      E5-A 实测   没有上限，第 50 次被外部掐断
+langgraph.js              25        25/25      源码常量    抛：GraphRecursionError
+```
+
+**从 1 到无穷大**，撞上限之后有三种结局：正常返回、抛异常、根本不停。「框架会帮我兜住死循环」这个直觉成不成立，取决于你用的是哪一家，以及同一家的哪个入口。
+
+<Key>
+
+这一节的中心论点：**框架真正省下的是四样脏活**，即 provider 适配、流协议编解码、schema 校验、会话序列化。承重的五处（终止、错误回填、幂等、tracing、审批），四家框架没有一家的默认值满足课程的不变量；「L08 幂等键」那一行，四家全空。
+
+所以选型题的答案不是「用哪个框架」，而是拿它的 provider 层，把你在 L05–L19 写过的不变量写成**适配器**，接到它开放的扩展点上。lab 的六个 TODO 就是六个适配器：接在 `stopWhen` 上的停止原因，`execute` 包装和 `errorFunction` 共用的错误出口，只消费一次的审批恢复，MCP 结果到文本的转换，以服务端日志为准的历史重建，以及把一份 Dify DSL 读成代码计划。
+
+</Key>
+
+---
+
+## 开场：这个 lab 一个框架都不装
+
+调研在一个独立工程里把七个包装齐，零网络、零真模型地跑了二十二组实验（编号 E1–E6）：AI SDK 和 Mastra 用 mock 模型；Anthropic provider 用假 `fetch` 截请求体；MCP 用内存 transport；Claude Agent SDK 把真二进制指向 127.0.0.1 上的假 Anthropic 服务器；OpenAI Agents SDK 用自写的 `Model`，并且只导入 `@openai/agents-core`。
+
+lab 没有照搬这个工程。它**一个框架都不装**，框架的行为来自 `labs/l19x/fixtures/ecosystem.json`，也就是调研在锁定版本上录下来的结果。`pnpm eco19` 打印的第一行就是录制口径：
+
+```text
+录制口径：ai@7.0.137  @ai-sdk/anthropic@4.0.78  @ai-sdk/mcp@2.0.73  @mastra/core@1.76.0  @anthropic-ai/claude-agent-sdk@0.3.296  @openai/agents-core@0.20.0  @langchain/langgraph@1.4.21
+```
+
+| | 装框架 | 只读录制结果 |
+|---|---|---|
+| 体积 | 调研工程的 `node_modules` 共 551MB，其中 `@anthropic-ai` 一家 266MB | 0 |
+| 许可 | Claude Agent SDK 是专有许可，按平台分发原生二进制 | 课程仓库里没有它 |
+| Python 通道 | Python 版 Agents SDK、Claude Agent SDK 的默认值和 TS 版是否一致，未核实 | 只读同一份夹具，不会把 TS 包的结论套到 Python 包头上 |
+| 能证明什么 | 框架现在还是这样 | 框架在录制那天是这样 |
+
+最后一行是代价。`shared/tsecosystem.ts` 的头注释写得很直白：「代价是它证明不了『框架现在还是这样』——版本号就是它的有效期，升级之后要重新录。」
+
+你要写的东西也因此换了形状：不是调框架参数，而是六个**适配器**。它们是纯函数，零 I/O、零模型，能离开框架单独测；接到真框架上时，只碰框架开放的那几个口子。
+
+<Pitfall title="版本号就是每一条结论的有效期">
+
+这一节的每个数字都挂在一个版本上。几条从版本号本身就能读出来的事实：
+
+- **两个 0.x**：`@anthropic-ai/claude-agent-sdk@0.3.296` 和 `@openai/agents-core@0.20.0`。按 semver，0.x 的 minor 升级可以破坏 API，安装时锁精确版本，不写 `^`
+- Claude Agent SDK 和 Claude Code CLI 的补丁号锁步（0.3.296 对 2.1.296）。一次 `npm update` 同时换掉了库和 agent 的行为
+- L16 引用的是 `ai@7.0.101`，到调研那天是 7.0.137，中间 36 个补丁
+- Mastra 依赖里锁着自己的一份 `@ai-sdk/anthropic@4.0.22`，不是你项目里装的 4.0.78。第八节的 4096 上限和 thinking 签名行为，要按 Mastra 锁定的那一版再查一遍（推论）
+
+升级之后，第一件事是重新录一遍夹具。verify 的 F 组钉的就是录下来的数：重录之后它红了，说明讲义里对应的那句话过期了。
+
+</Pitfall>
+
+---
+
+## 一、框架替你写了哪一段
+
+### 1.1 四个角色
+
+| 框架 | 它是什么 | 对应课程的哪一段 |
+|---|---|---|
+| AI SDK 7（`ai`） | provider 抽象加 `generateText`、`streamText`。`ToolLoopAgent` 只是在外面包了一层默认值，唯一实质性的一行是 `stopWhen ?? createDefaultStopCondition(20)`；`WorkflowAgent` 是另一个包、另一个运行时 | L05 的循环，L16 的流协议 |
+| Mastra 1.76 | 在 AI SDK 外面再包一层：Agent、workflow、memory、scorers。依赖里同时锁着三代 `@ai-sdk/provider` 和 `@ai-sdk/anthropic` | L08 的存储，L12 的评测 |
+| Claude Agent SDK 0.3.296 | 官方原话 "A library that runs the Claude Code binary"：循环、压缩、权限判定、工具执行都在子进程里 | L17–L19 的整个 coding agent |
+| OpenAI Agents SDK 0.20 | `@openai/agents-core` 是 provider 无关的 runner；伞包 `@openai/agents` 一被 import 就注册 OpenAI provider 和 tracing exporter | L11 的 handoff，L14 的 guardrail |
+
+LangGraph.js 和 Google ADK TS 只做定位。前者是图运行时，语义和 Python 版同构，`interrupt` 重跑节点、reducer 在 L11x 第四到六节讲过，这里只记一个数：`DEFAULT_RECURSION_LIMIT = 25`，超限抛 `GraphRecursionError`。后者偏平台 SDK，`maxLlmCalls` 默认 500，没有实测。
+
+### 1.2 省下的四样，承重的五处
+
+L05 第四节那张表的立场是「agent loop 自己写，周边设施用现成的」。对过四家框架之后，可以说得更细。省下的四样是真脏活：
+
+- **provider 适配**。Anthropic、OpenAI、DeepSeek 的两种兼容端点，请求格式、thinking 块、工具调用的编解码各不相同
+- **流协议编解码**。UI message stream、SSE 分帧，L16 第二节讲过它们有多容易写错
+- **schema 校验**。参数非法时 AI SDK 把 `AI_InvalidToolInputError` 作为 `error-text` 回填、循环继续，调用不存在的工具回填 `NoSuchToolError`（E1-C），和课程的做法一致
+- **会话序列化**。`RunState`、JSONL transcript、workflow snapshot
+
+承重的五处，后面每处一节：
+
+| 部件 | 课程的不变量 | 框架的默认值 | 章节 |
+|---|---|---|---|
+| 终止 | I-STOP：每次运行都有显式的停止原因，撞上限是正常返回 | 默认上限从 1 到无穷大；三种停法是同一个 `finishReason` | 三、九 |
+| 错误回填 | I-ERR：失败以 `is_error` 回填，文本给出下一步，经过脱敏 | 三家把带 key 的原始异常塞进上下文，一家抹掉信息还叫模型再试一次；MCP 路径上 `isError` 丢了 | 四、六 |
+| 幂等 | I-IDEM：有副作用的操作带幂等键，重放到断点不重复执行 | 四家都不生成幂等键；同一份状态恢复两次，副作用执行两次 | 五 |
+| tracing | I-TRACE：span 去哪由你决定，默认不出网 | Agents SDK 一 import 就注册 OpenAI exporter、默认含敏感数据；MCP 的失败被记成成功；分类器的花费不入账 | 六、八、九 |
+| 审批 | I-DENY：先拒后放，审批状态存服务端，客户端不能伪造 | AI SDK 的审批状态在客户端发来的历史里、默认不签名；Claude Agent SDK 默认由模型分类器替你批；Agents SDK 的输入 guardrail 和模型并行 | 七、八、九 |
+
+还有一条横跨好几处的 I-HIST：历史只追加、前缀稳定、中断后已完成的步可见。第七节专门讲它。
+
+---
+
+## 二、你手写过的部件，在框架里叫什么
+
+| 课程部件 | AI SDK 7 | Mastra 1.76 | Claude Agent SDK | OpenAI Agents SDK |
+|---|---|---|---|---|
+| L05 循环与终止 | `stopWhen`，默认 20 步（`generateText` 为 1）；撞上限正常返回，没有停止原因 | `Agent.generate`，默认 5 步 | `maxTurns` 没有默认值；`result.subtype` 给出显式原因 | `run()`，默认 10 轮，超限抛 `MaxTurnsExceededError` |
+| L05 重复调用检测 | 没有 | 没有 | 没有公开选项 | 没有 |
+| L05、L14 工具错误回填 | `error.toString()` 原样，线上带 `is_error` | `error.message` 原样 | `error.message` 原样，带 `is_error` | 固定文案，信息全丢 |
+| L08 断点续跑 | `ToolLoopAgent` 全在内存；`WorkflowAgent` 要另一套运行时 | workflow 从 step 开头重跑 | JSONL 会话：`resume`、`forkSession`、`resumeSessionAt` | `RunState` 序列化，同一份可以被恢复多次 |
+| L08 幂等键 | 没有 | 没有 | 没有 | 没有（只对模型请求做了重放安全分类） |
+| L10 MCP | `@ai-sdk/mcp`，`isError` 在转换中丢失 | `@mastra/mcp`（未深入） | `mcpServers` 加进程内 server | 本地 MCP server 类加托管 MCP |
+| L11 子 agent 与 handoff | 自己把 agent 包成工具 | agent network、agent-as-tool | 子 agent 的模型单独配置 | handoff 默认把整段历史交出去 |
+| L13 tracing | 注册了 telemetry 集成就默认开，默认记录输入 | 自带，导出目标要配置 | 分类器调用不计入 usage | 默认开、默认导出到 OpenAI、默认含敏感数据 |
+| L14 审批 | `toolApproval`；状态在客户端发来的历史里，默认不签名 | `requireApproval`、workflow suspend | 默认 `auto`，模型分类器替你批 | `needsApproval`；拒绝回填不带原因 |
+| L15 成本 | 未知模型 ID 的输出上限默认 4096 | model router | `total_cost_usd` 按 Claude 价目算，fork 继承累计值 | `usage` 按请求累计 |
+| L16 流与撤回 | `reset-step` 协议里有，`streamText` 不发；错误默认遮罩，污染下一轮历史 | 自有流格式加 AI SDK 兼容输出 | `SDKMessage` 流，`interrupt()` | 发出终态事件之后不重试 |
+
+读表的方法：整列看，没有一家在终止、错误回填、幂等、tracing、审批这几行上默认满足课程的不变量；整行看，**L08 幂等键那一行四家全空**。唯一沾边的是 OpenAI Agents SDK 对模型请求做了重放安全分类，"the default retry advice does not automatically repeat the request"，但它不覆盖工具的副作用，第五节的 E6-B 就是证据。
+
+---
+
+## 三、终止：默认步数从 1 到无穷大
+
+### 3.1 三种停法，同一个 finishReason
+
+L05 的不变量是终止时必须返回为什么停（`AgentRun.reason`）。AI SDK 的返回值里只有**最后一步**的 `finishReason`，取值是 `stop`、`length`、`content-filter`、`tool-calls`、`error`、`other`。撞上步数上限时，最后一步是 `tool-calls`；停在审批请求上、调了一个没有 `execute` 的工具，也都是 `tool-calls`（E1-A、E1-E 实测）。撞默认上限时，唯一的信号是一条 warning：
+
+> "The tool loop stopped because it reached the default stopWhen condition, isStepCount(20). To allow more steps, set stopWhen to isStepCount(...) with a higher limit or provide a custom stop condition."
+
+L05 第一节的 Pitfall 说：「撞上步数上限时，你返回的是模型最后一次说的话——那句话看起来像一个答案。」在 AI SDK 里更糟，`text` 直接是空串。而裸 `generateText` 带工具时默认 `isStepCount(1)`，执行完第一次工具调用就返回（E1-B：1 次调用、1 次执行、`text` 为空）。从 `generateText({ tools })` 起步的人，第一天看到的就是「工具执行了，但是没有回答」。
+
+另外三家：
+
+- **Mastra** 的 `Agent.generate` 默认 5 步，正常返回，`finishReason` 同样是 `tool-calls`（E3）
+- **OpenAI Agents SDK** 默认 10 轮（`DEFAULT_MAX_TURNS = 10`），超限抛 `MaxTurnsExceededError`，`error.state` 还在。要正常返回得配 `errorHandlers.maxTurns`，E6-E 加了 handler 之后返回 `finalOutput: '已到步数上限，停止'`
+- **Claude Agent SDK** 是四家里唯一在返回值上直接给出停止原因的：`result.subtype` 区分 `success`、`error_max_turns`、`error_max_budget_usd`、`error_during_execution`、`error_max_structured_output_retries`。但 `maxTurns` 和 `maxBudgetUsd` 的默认值都是 No limit，预算还是事后检查："Spend can therefore pass the cap by up to the cost of that one response, plus anything that subagents still running at that moment spend before they stop."
+
+<Pitfall title="续跑时漏传 maxSteps，会被静默截到小默认值">
+
+Mastra 自己的 harness 控制器把 `maxSteps` 设成了 1000，旁边留了一段注释：
+
+> "Options that every harness-driven agent run must carry — the initial stream AND every `resumeStream`. Centralized so the two paths can't drift: a missing `maxSteps` on resume silently caps the resumed run at the agent's small default and ends it mid-task"
+
+`resumeStream` 不沿用初次运行的配置。L19 说「续的是 checkpoint，不是新作业」，这里是它的反面：checkpoint 续上了，配置没跟着走，续跑在半路按默认的 5 步停下，而且不报错。
+
+</Pitfall>
+
+### 3.2 isStepCount(0) 永远不触发
+
+`isStepCount(n)` 的实现是 `steps.length === stepCount`，严格相等。正常用没问题；但如果配置里有人把 `maxSteps` 写成 0，意思是「不许多步」，传进去之后它**永远不会触发**。实验一的后半段：
+
+```text
+课程的停止条件（maxSteps 8，maxRepeat 3），喂同一段 20 步的历史：第 3 步停，reason=repeat
+每步换一个 path：第 8 步停，reason=max_steps
+isStepCount(0)：20 步里一次都没触发；课程 maxSteps 0：第 1 步停，reason=max_steps
+```
+
+同一个 0，三处三种含义：AI SDK 的 `isStepCount(0)` 永不触发，等于没有上限；Google ADK 的类型注释写明 `maxLlmCalls` "Less than or equal to 0: This allows for unbounded number of llm calls."；课程的 `maxSteps` 用 ≥ 比较，0 在第 1 步就停。
+
+<Drill title="stopWhen 在什么时候求值">
+
+`ai@7.0.137` 的 `src/generate-text/generate-text.ts`，循环的尾部：
+
+```ts
+} while (
+  // Continue only after all client tool calls have been executed or denied,
+  // and if there are client results or pending deferred provider results.
+  clientToolOutputs.length + deniedToolApprovalResponses.length ===
+    clientToolCalls.length &&
+  (clientToolCalls.length > 0 || pendingDeferredToolCalls.size > 0) &&
+  // continue until a stop condition is met:
+  !(await isStopConditionMet({ stopConditions, steps }))
+);
+```
+
+能读出三件事：
+
+1. **停止条件在一步做完之后才求值**，位置是 do…while 的尾部。由此推出：用 `stopWhen` 写预算条件，只能在这一步的钱花完之后才停（推论）。L05 第一节把检查点放在循环顶部、先查后花，预算检查就不能只挂在这里。Claude Agent SDK 的 `maxBudgetUsd` 也是事后检查，它的文档自己承认会超
+2. 多个条件用 `Promise.all(...).some()` 并行求值，任何一个为真就停
+3. 继续的前提是这一步有工具调用、而且全部执行或拒绝了。所以停在审批请求上、调了没有 `execute` 的工具，循环自然结束，`finishReason` 照样是 `tool-calls`
+
+</Drill>
+
+### 3.3 TODO 1：停止原因接在 stopWhen 上
+
+`stopWhen` 只回答停不停，原因得你自己记。shared 里的接法：
+
+```ts
+// shared/tsecosystem.ts
+export function courseStopWhen(o: StopOpts): (steps: Step[]) => boolean {
+  return (steps) => courseStopReason(steps, o) !== 'running'
+}
+// generate 返回之后，用同一个函数对 result.steps 再算一次 reason，记进你的运行记录
+```
+
+`Step` 只取 AI SDK `StepResult` 里和终止有关的三个字段：`toolCalls`、`finishReason`、`approvalRequested`。`myCourseStopReason` 的优先级从上到下：
+
+| 条件 | 原因 |
+|---|---|
+| 没有步 | `running` |
+| 最后一步要审批 | `approval` |
+| `finishReason` 是 `length` | `truncated`：工具参数可能被截断，L16 第 1.2 节那条不带错误信号的路 |
+| `finishReason` 是 `error` | `error` |
+| 最后一步没有工具调用 | `done` |
+| 最近 `maxRepeat` 步的调用签名全部相同（`maxRepeat` 至少为 2） | `repeat` |
+| 步数 ≥ `maxSteps` | `max_steps` |
+| 其余 | `running` |
+
+和 L05 的 `AgentRun.reason` 对一下：`max_steps` 就是 `step_limit`；`approval`、`truncated`、`repeat` 是这一节补上的，因为框架把它们都压进了 `tool-calls` 或 `length`；`budget`、`timeout`、`cancelled` 不是从步里算出来的，它们来自循环外面，在发请求之前查。
+
+| 典型错法 | 后果 | 断言 |
+|---|---|---|
+| 上限照抄 `isStepCount`，用 `===` | `maxSteps` 为 0 时永远不停 | S5 |
+| 调用签名用 `JSON.stringify` | `{a,b}` 和 `{b,a}` 算两个调用，重复检测漏掉。这是 L05 第二节那个 Pitfall 的第三点 | S3 |
+| 数整段历史里出现过几次，而不是看最近 N 步是否全同 | `x,x,x,y` 也被判成 `repeat`。L05 那个计数是用来给模型回填提示的，作为停止原因要看最近 N 步 | S4 |
+| 一步里的调用先排序再比 | `[x,y]` 和 `[y,x]` 被当成同一步 | S4 |
+| 先查 `max_steps` 再查 `repeat` | 第 3 步撞上限时原因写成 `max_steps`，看不出是在打转 | S5 |
+| 先查 `length` 再查审批 | 停在审批上的那一步被报成 `truncated` | S2 |
+
+S6 用你的实现重跑实验一的后半段：同一段 20 步历史第 3 步 `repeat`，每步换参数第 8 步 `max_steps`。
+
+---
+
+## 四、错误回填：三家泄密，一家抹掉
+
+### 4.1 实验二
+
+```text
+工具 read_file 抛出 { name: "Error", message: "ENOENT nope (secret=sk-123)" }
+框架              is_error  证据         回填文本
+ai-sdk            true      E1-A 实测    "Error: ENOENT nope (secret=sk-123)"
+                                         体检：leaks-secret no-tool-name no-next-step
+mastra            未核实    E3 实测      "ENOENT nope (secret=sk-123)"
+                                         体检：leaks-secret no-error-signal no-tool-name no-next-step
+claude-agent-sdk  true      E5-A2 实测   "ENOENT nope (secret=sk-123)"
+                                         体检：leaks-secret no-error-signal no-tool-name no-next-step
+openai-agents     —         E6-A 实测    "An error occurred while running the tool. Please try again."
+                                         体检：no-tool-name no-next-step retry-as-is
+课程适配器        true      —            "[tool error] read_file: ENOENT nope (secret=***) ⏎ 下一步：路径不存在：先列出目录确认文件名，再换路径调用"
+                                         体检：合格
+```
+
+四家的来源各不相同：
+
+- AI SDK 把 `execute` 包在 try/catch 里，异常变成 `error-text`，值是 `error.toString()`，所以带 `Error:` 前缀
+- Mastra 用 `error.message`，没有前缀。is_error 那一格写「未核实」：E3 用的是 mock 模型，截到的是交给模型层的 `error-text`，没有经过 Anthropic provider 发出去
+- Claude Agent SDK 的实测工具抛的是 `EACCES ... (secret=sk-123)`，回填 `error.message` 加 `is_error: true`；表里按同一个异常统一换算
+- OpenAI Agents SDK 的默认 `errorFunction` 原文注释是 "Returns a fixed message without inspecting the exception."，返回固定文案
+
+体检是 `auditBackfill` 拿课程的要求去量：泄密（`leaks-secret`）、看不出是失败（`no-error-signal`）、没有工具名（`no-tool-name`）、没有「下一步：」（`no-next-step`）、叫模型原样重试（`retry-as-is`）、超过 400 个码点（`too-long`）。三家把带 key 的原始异常塞进上下文；一家把信息全抹掉，还叫模型再试一次，叠加 10 轮上限，就是 E6-A 里那 10 次一模一样的失败。L05 第二节死循环的成因二，「工具报错但没给出路」，在这里是框架的默认值。
+
+OpenAI 那一家还有一层：默认 `errorFunction` 下，trace 里的错误详情被替换成 `REDACTED_TOOL_ERROR_MESSAGE`，只有自定义了 `errorFunction` 才会带上详情。**默认配置下，你在 trace 里也看不到工具为什么失败**。
+
+### 4.2 DeepSeek 不看 is_error
+
+课程默认模型走 DeepSeek 的 Anthropic 兼容端点。它的兼容性表里，`tool_result.is_error` 一行标着 Ignored。
+
+所以在课程的默认模型上，「框架有没有设 `is_error`」不改变模型看到的东西，模型只看 `content` 的文本（推论，来自那张兼容性表）。L10 第五节把 `isError: true` 叫作「模型看得到」的那条通道；到了这个端点，「看得到」只剩文本。
+
+<Key>
+
+**失败的信号和下一步，都要住在文本里**。`is_error` 照设，它对别的端点有用；但承重的是 `[tool error]` 这个前缀、工具名，和「下一步：」后面那句话。
+
+</Key>
+
+L15 第 8.3 节讲过同一个端点会把未知模型名静默映射到 `deepseek-flash`。兼容层静默忽略的字段，不止计费那一个。
+
+### 4.3 接在哪
+
+OpenAI Agents SDK 有现成的口子：每个工具的 `errorFunction`，签名是 `(ctx, error) => string`，把 `courseToolError` 的结果返回就行。
+
+AI SDK 没有对应的钩子，口子是 `execute` 本身：在外面包一层 try/catch。两种包法在线上的差别，从这两段源码就能推出来：
+
+```ts
+// ai@7.0.137 src/prompt/create-tool-model-output.ts
+if (errorMode === 'text') {
+  return { type: 'error-text', value: getErrorMessage(output) };
+}
+// @ai-sdk/provider@4.0.26 src/errors/get-error-message.ts
+if (error instanceof Error) { return error.toString(); }
+// @ai-sdk/anthropic@4.0.78 src/convert-to-anthropic-prompt.ts
+is_error: output.type === 'error-text' || output.type === 'error-json' ? true : undefined,
+```
+
+- catch 之后把课程的文本**作为正常结果返回**：线上块没有 `is_error`。在 DeepSeek 上无所谓，在真 Anthropic 端点上丢了一个信号
+- catch 之后 `throw new Error(courseToolError(e, ctx))`：AI SDK 把它变成 `error-text`，带 `is_error`，代价是文本前面多一个 `Error: `
+
+两种都满足体检。选哪种取决于你要不要同时支持不忽略 `is_error` 的端点。
+
+### 4.4 TODO 2：脱敏和错误出口
+
+`myRedactSecrets` 三条规则依次全局替换，结果再跑一遍不变：
+
+| 规则 | 替换成 | 边界 |
+|---|---|---|
+| `sk-` 开头的 key | `sk-***` | 前面不能紧挨字母或数字：`task-queue` 里那个 `sk-queue` 不是 key |
+| `secret=`、`token=`、`password=`、`api_key=` 的值 | `键=***` | 只认小写键名；值到空白或 `,;)]}'"` 之前为止 |
+| `Bearer ` 后面的 token | `Bearer ***` | |
+
+`myCourseToolError` 的格式是两行：`[tool error] 工具名: 消息`，换行，`下一步：提示`。消息先把 `\r`、`\n` 各换成一个空格，再脱敏，再按码点截到 200 加 `…`；`e` 不是带字符串 `message` 的对象时，字符串就用它本身，其余写「（没有错误信息）」；空工具名写 `unknown-tool`；提示按错误码查 `ERROR_HINTS`，错误码先看 `e.code`，再看消息开头的 `E` 加大写字母。
+
+| 典型错法 | 后果 | 断言 |
+|---|---|---|
+| 字符类漏了 `_` 和 `-` | `sk-abc_DEF-123` 只遮掉前半截，后半截照样进上下文 | E1 |
+| 值用 `\S+` 匹配 | `(secret=sk-123)` 的右括号、`,next` 被一起吃掉 | E1、E2、E4 |
+| `sk-` 前面不查边界，或键名不分大小写 | 把不是 key 的东西遮掉；规则不确定，多遮少遮都会让断言变红 | E2 |
+| 非对象直接 `String(e)` | `null` 变成 `"null"`，`{message: 42}` 变成 `"[object Object]"` | E6 |
+| 用 `\s+` 压平换行 | `\r\n` 应该变两个空格；制表符不该动 | E7 |
+| 按 `.length` 和 `slice` 截 | emoji 被切成半个代理对 | E7 |
+| 先截断再脱敏 | 截断点由带 key 的原文决定，结果多出一个 `…` | E7 |
+
+E4 钉的就是实验二最后一行：`[tool error] read_file: ENOENT nope (secret=***)`，并且体检合格。
+
+---
+
+## 五、恢复两次就执行两次
+
+### 5.1 E6-B：同一份 RunState
+
+OpenAI Agents SDK 的审批流程：工具标 `needsApproval`，这次 `run()` 返回 `interruptions`；`result.state.toString()` 得到一份可以存起来的 JSON；之后 `RunState.fromString` 读回来，`approve` 或 `reject`，再 `run` 一次。调研的观测代码就是这一段：
+
+```ts
+const saved = r1.state.toString()               // 审批中断时持久化
+for (const k of [1, 2]) {                        // 模拟：worker 崩溃后重放同一条审批
+  const st = await RunState.fromString(agent, saved)
+  for (const it of st.getInterruptions()) st.approve(it)
+  await run(agent, st)
+}
+// 输出：工具累计执行 [1] → [2]
+```
+
+序列化状态 3529 字节，同一份恢复两次，有副作用的工具执行两次。拒绝时回填 "Tool execution was not approved."，不带原因，模型不知道该改什么（E6-C）。
+
+另外两家是同一类问题：
+
+- **Mastra** 的 workflow 恢复时把整个 step 从头重跑，E3 实测 db 行数从 1 变 2。文档用的词是 restart："When a workflow is suspended, it restarts from the step where it paused."，但全文没有一句提醒 `suspend()` 之前的副作用会再执行一次。这和 L11x 第六节 LangGraph 的 `interrupt` 是同一个机制：恢复不是接着往下走，是重放到断点
+- **AI SDK** 的 `WorkflowAgent` 文档写明 "completed-step replay does not guarantee exactly-once effects for an interrupted attempt"，同时默认 "Failed tool calls are retried automatically (default: 3 attempts)"，而它的示例 `bookFlightStep` 是一个不带任何幂等键的 POST。L19 第 5.1 节「无 key 的不安全写，不自动重试」，这是现成的反例教材
+
+### 5.2 实验五：恢复只消费一次
+
+```text
+RunState.fromString → approve → run，重放两次：工具累计执行 [1,2]（E6-B 实测：[1,2]，状态 3529 字节）
+事件                          审批  结果                        副作用累计  store
+审批通过，worker 恢复         a1    ran:charged#1               1           "done:approve:charged#1"
+worker 崩溃后重放同一条审批   a1    already-consumed:charged#1  1           "done:approve:charged#1"
+另一个人随后点了「拒绝」      a1    conflict:approve            1           "done:approve:charged#1"
+a2 恢复时进程被杀             a2    crashed:worker kil…         2           "in-flight"
+a2 被重新投递                 a2    in-flight                   2           "in-flight"
+```
+
+看后两行。a2 的 worker 是在 `POST /refund` 之后死的，副作用已经发生（累计 2）。重新投递时 `resumeOnce` 返回 `in-flight`，**不再执行**。
+
+原因是 L19 第 5.1 节那句话：超时的意思是「不知道做没做」，不是「没做」。进程死在副作用之前还是之后，从这条记录上分不出来，只有去外部系统对账才知道：按 L19 第 4.1 节第三层的外部副作用 key（作业 id 加调用 id 派生）去支付网关查这笔退款在不在。
+
+<Pitfall title="Map 上的先读后写不是原子的">
+
+lab 的 `Kv` 是一个进程内的 `Map`，`get` 之后再 `set`。两个 worker 同时拿到同一条审批，两边都读到「没有记录」，两边都执行。生产里认领这一步必须是存储层的条件写，「不存在才写入 in-flight」一次完成，L19 第 2.5 节：原子认领归存储层。
+
+</Pitfall>
+
+### 5.3 TODO 3：myResumeOnce
+
+键是 `approval:${approvalId}`，值有两种：`in-flight`，或者 `done:决定:结果`。
+
+| 当前记录 | 动作 | 返回 |
+|---|---|---|
+| 没有 | 先写 `in-flight`，再调 `resume()`；成功写 `done` | `ran` 加结果 |
+| 没有，`resume()` 抛异常 | 记录留在 `in-flight` | `crashed` 加异常信息 |
+| `in-flight` | 不调 `resume()` | `in-flight` |
+| `done`，决定相同 | 不调 `resume()` | `already-consumed` 加缓存的结果 |
+| `done`，决定不同 | 记录不变 | `conflict` 加先前的决定 |
+
+`done` 的值只按前两个冒号切，结果里可以有冒号。形状和 L19 第 4.2 节的四种判定一样：首次执行、同 key 重放、同 key 不同载荷是冲突。
+
+| 典型错法 | 后果 | 断言 |
+|---|---|---|
+| `resume()` 成功之后才写记录 | 执行期间崩溃，记录是空的，重投递再执行一次 | R1、R4 |
+| 崩溃时删掉 `in-flight`，「好让下一次投递能重试」 | 实验五第四行：退款已经发出去，重投递又退一次 | R4 |
+| 按所有冒号切 | 结果里带冒号（时间、URL）就被截断，重放时交出一个错的结果 | R2 |
+| 决定不同就覆盖 | 先批后拒，记录变成「拒」，而钱已经扣了 | R3 |
+
+接到框架上：Agents SDK 包在 `RunState.fromString`、`approve`、`run` 这一串外面，键用中断项的审批 id。AI SDK 的审批不是暂停，是这次 `generate` 结束：返回值里带 `tool-approval-request`，调用方把 `tool-approval-response` 追加进 messages 再调一次（E1-E），包在执行被批准的那次调用外面；这条批准本身来自客户端，第七节会讲它为什么要先验。Mastra 的 workflow 用 L11x 第六节的三种修法之一：副作用拆到前一个 step、带幂等键、或者在状态里放「做过了」的标记。
+
+---
+
+## 六、isError 在路上丢了
+
+`@ai-sdk/mcp@2.0.73` 的 `src/tool/mcp-client.ts:1314`：
+
+```ts
+const result = await self.callTool({ name, arguments: args, options: { signal: options?.abortSignal } });
+if (result.isError) {
+  return result;          // 不抛，原样作为「成功的」返回值
+}
+```
+
+随后 `mcpToModelOutput` 把 `result.content` 转成内容块，没有看 `isError`；Anthropic provider 只对 `error-text`、`error-json` 设 `is_error`（第 4.3 节）。E2 实测的线上块：
+
+```json
+{"type":"tool_result","tool_use_id":"tu1","content":[{"type":"text","text":"EACCES: permission denied"}]}
+```
+
+步骤内容里是 `tool-result`，不是 `tool-error`。于是 `onToolExecutionEnd` 和 tracing 里这次调用也记为成功：按 trace 统计的工具失败率被系统性低估，L13 的复盘从一开始就少了几条失败。
+
+L10 第五节说，`isError: true` 是「模型改一改参数有可能成功」的那条通道，模型读了之后自己改。在 AI SDK 的路径上，标志丢了，模型只能从文本猜；文本是 `EACCES: permission denied` 还好猜，是 `quota exceeded` 或者一段看起来正常的输出，就猜不出来。而在 DeepSeek 上，这个标志本来就不算数（第 4.2 节）。
+
+### 6.1 实验三
+
+```text
+情况                       AI SDK 线上块  模型看到                        课程适配器  模型看到
+isError: true（E2 原样）   无 is_error    "EACCES: permission denied"     is_error    "[tool error] EACCES: permission denied"
+isError: "true"（字符串）  无 is_error    "quota exceeded"                is_error    "[tool error] quota exceeded"
+失败，消息里带 key         无 is_error    "401 token=abc123 rejected"     is_error    "[tool error] 401 token=*** rejected"
+图片 + 资源 + 链接         无 is_error    ""                              无 is_error "[image image/png，未展开]\n[resource file:///r.txt]\nhello\n[link file:///big.log]"
+只有 structuredContent     无 is_error    ""                              无 is_error "{\"rows\":2}"
+什么都没有                 无 is_error    ""                              无 is_error "(empty result)"
+```
+
+证据等级要分开读。第一行是 E2 实测加源码。后三行 AI SDK 那一列的空串，来自 lab 的对照函数 `aiSdkMcpWire`：它只照搬了 `isError` 那一条实测行为，并且只取 text 块。非文本内容在 AI SDK 这条路径上到底变成什么，调研没有实测，这三格读作「lab 的简化」，不要读作「AI SDK 会交出空串」。
+
+### 6.2 TODO 4：myMcpResultToText
+
+- **isError 失败优先**：只有缺省、`null`、`false` 算成功，`"true"`、`1`、`0`、`"false"`、`{}` 一律当失败
+- content 逐项（不是数组就当空）：text 原样；image 写 `[image 类型，未展开]`；resource 写 `[resource uri]`，有 text 再换行接上；resource_link 写 `[link uri]`；不认识的写 `[unsupported content: 类型]`，不吞掉
+- 一项都没有：有 `structuredContent` 这个键就给它的 JSON（`null` 也算），否则 `(empty result)`，不交给模型一个空串
+- 失败：`[tool error] ` 加上用你的 `myRedactSecrets` 脱敏后的正文；成功的正文原样，不加前缀、不脱敏
+
+| 典型错法 | 后果 | 断言 |
+|---|---|---|
+| `if (r.isError)` 按真值判断 | `0` 被当成成功 | M1 |
+| `r.isError === true` | 字符串 `"true"` 被当成成功（实验三第二行） | M1 |
+| 只取 text 块 | 图片、资源、链接从模型眼里消失，`audio` 这种新类型悄无声息地丢了 | M2、M3 |
+| 空结果交空串 | 模型看到一个空的 tool_result，不知道是没有数据还是出了错 | M4 |
+| 成功的结果也脱敏 | 改了工具交出的数据 | M5 |
+
+M5 依赖 TODO 2 的 `myRedactSecrets`，所以先写 TODO 2。接到 AI SDK 上：包住 `@ai-sdk/mcp` 给出的工具的 `execute`，它在 `isError` 时把 `CallToolResult` 原样返回，你拿到之后过一遍 `mcpResultToText`，失败就按第 4.3 节选一种包法交出去。
+
+---
+
+## 七、历史是谁的
+
+### 7.1 UI 遮罩改写下一轮
+
+`ai@7.0.137 src/ui-message-stream/to-ui-message-stream.ts:29`：
+
+```ts
+onError = () => 'An error occurred.', // masks errors except provider-executed tool execution errors
+```
+
+客户端执行的工具报错时，UI 消息里的 `errorText` 是这个函数的返回值。`useChat` 的标准模式下，服务端每一轮都从客户端发来的消息重建历史，文档原话：
+
+> "In the standard `useChat` pattern, the server rebuilds the conversation from the messages the client sends each turn. The server does not persist conversation state between requests. This means the message history is client-controlled input."
+
+实验四：
+
+```text
+第 N 轮模型看到       "Error: ENOENT a.ts; 试试 src/a.ts"
+UI 消息的 errorText   "An error occurred."
+第 N+1 轮模型看到     "An error occurred."   ← 历史被改写了
+传 onError: s => s    第 N+1 轮 "Error: ENOENT a.ts; 试试 src/a.ts"（不变）
+```
+
+同一个工具错误，第 N 轮带着出路（试试 `src/a.ts`），第 N+1 轮只剩一句 `An error occurred.`。**历史不是只追加的**，它在序列化往返中被改写了。这同时打破两条：L04「错误信息要给出路」，出路在下一轮丢了；L15「前缀稳定才能命中缓存」，同一个位置的 tool_result 变了，L15 第三节的失效定位会报在这里，此后的前缀全部失效。DeepSeek 忽略 `cache_control`、做自动前缀缓存，断点放在哪无所谓，但前缀变了照样不命中（推论）。
+
+<Pitfall title="onError: s => s 修好了漂移，也把原始异常送进了浏览器">
+
+`errorText` 是发给客户端的。照抄原始异常，异常里的 key、内部路径、SQL 都进了用户的浏览器，下一轮再原样回到模型的上下文。要传就传第四节那段脱敏过的课程文本。
+
+更根本的修法是不让客户端当历史的真相源：服务端持久化模型消息（`response.messages`），下一轮从服务端日志重建，客户端发来的 UI 消息只用来对账。这就是 TODO 5。
+
+</Pitfall>
+
+### 7.2 审批也走这条路
+
+`useChat` 模式下，审批记录同样在客户端发来的历史里。AI SDK 的安全章节写得很直接：
+
+> "However, without additional protection, a client that crafts a valid-looking approval for a schema-conforming input can bypass the human-in-the-loop step."
+
+办法是 `experimental_toolApprovalSecret`（HMAC 签名），但 "No secret configured: approvals work as before (backward compatible)"，**默认不签名**。L14 第十节和 L19 第七节的立场是审批状态存服务端、deny 优先；AI SDK 的默认是审批状态存在一份客户端可以随便改的消息列表里。
+
+Mastra 的默认方向正相反：
+
+> "When you use memory with a client application, send only the new message instead of the full conversation history. Mastra loads previous messages from storage."
+
+两个框架拼在一起用（Mastra 有官方的 AI SDK 集成指南），谁是历史的真相源必须显式决定。Mastra 的处理是 "When message IDs match, it uses the stored copy as the base"。
+
+同一节还有两条会改写前缀的默认值。Mastra 的 memory 默认保留最近 10 条消息，官方原话承认它 "changes the start of the prompt and invalidates the provider prompt cache"，而且这 10 条连工具调用和工具结果一起数，一个带三次工具调用的回合就占掉 7 条。AI SDK 的 `prepareStep` 返回的 messages "becomes the base for later steps"，是 L06 压缩的挂载点，但返回之后不可逆，原始消息要自己留一份。
+
+### 7.3 TODO 5：myRebuildHistory
+
+实验四的后半段：
+
+```text
+下一轮以服务端日志为准，客户端发来的 UI 消息只用来对账：
+  c1  text        "3 files"
+  c2  error-text  "[tool error] read_file: ENOENT a.ts ⏎ 下一步：路径不存在：先列出目录确认文件名，再换路径调用"
+  c3  text        "ok"
+  drifted=["c2"]  forged=["c9"]  dropped=["c3"]
+```
+
+- `history`：按日志顺序，每条日志一项，内容以日志为准
+- `drifted`：两边都有，但 UI 的种类（`output-error` 对 `error`）或文本和日志不一致。c2 被遮罩了
+- `forged`：UI 里有、日志里没有。c9 是客户端造出来的一条 `approved`，正是上面那种伪造的审批
+- `dropped`：日志里有、UI 里没有。c3 被客户端丢了
+- UI 里同一个 id 出现多次，只看第一次
+
+| 典型错法 | 后果 | 断言 |
+|---|---|---|
+| 以 UI 消息为准，只把遮罩文本换回来 | 伪造的工具结果和审批照样进历史 | H2 |
+| 只比文本，不比种类 | 一条失败被改成「成功」、文本没动，对账看不出来 | H3 |
+| 重复 id 取最后一次 | 客户端在后面追加一条改过的，就能覆盖前面那条 | H4 |
+| `drifted`、`dropped` 按 UI 顺序 | 报告顺序跟着客户端走，不可复现 | H5 |
+
+---
+
+## 八、还有八处会咬人的默认值
+
+实验六：
+
+```text
+INV-14 AI SDK abort: 抛 AbortError，返回值里没有已完成的步 → onStepEnd 里自己落盘 [E1-D 实测]
+INV-17 AI SDK 模型重试: 429 共 3 次调用后 AI_RetryError，不带幂等键 → 幂等键放在工具层 [E1-F 实测]
+INV-24 AI SDK 审批（useChat）: 历史由客户端发来，审批默认不签名 → 签名密钥，或审批存服务端 [文档]
+INV-25 Agents SDK 输入 guardrail: 与模型并行：触发前模型已调用 1 次 → runInParallel:false → 0 次 [E6-D 实测]
+INV-26 Agents SDK handoff: 整段对话历史交给下一个 agent → inputFilter [文档]
+INV-27 Agents SDK tracing: traceIncludeSensitiveData=true；伞包 import 即注册 OpenAI exporter → 只装 agents-core，exporter 自己设 [E6-F 实测 + 源码]
+INV-29 @ai-sdk/anthropic 接 deepseek-v4-pro: max_tokens 被限到 4096，一条 warning → 显式 maxOutputTokens [E1-G 实测]
+INV-32 AI SDK reset-step: 协议里有，streamText / ToolLoopAgent 从不发 → 只有 WorkflowAgent 发 [源码 grep]
+thinking 签名（E4）：非流式无签名 → AI_APICallError: Invalid JSON response；流式无签名 → thinking 被丢弃，只回传 ["tool_use"]，一条 warning ← 静默
+```
+
+INV 编号是调研报告反转清单里的编号。审批那一条第七节讲过，其余按课程部件分四组。
+
+### 8.1 中断和重试：L08 与 L19
+
+E1-D 在第 3 步 `abort()`，`agent.generate()` 直接抛 `AbortError`，前两步的 `steps`、`response.messages` 都不在返回值里，只有 `onStepEnd` 回调里记到了 `[0,1]`。L08 的不变量是中断之后历史里剩什么必须确定、而且能续跑；在 AI SDK 里，这件事要你自己在 `onStepEnd` 里落盘。
+
+模型请求重试默认 `maxRetries: 2`，指数退避从 2000ms 起、每次乘 2，尊重 0 到 60 秒内的 `retry-after`。重试的单位是一次模型调用，不重放工具，所以它本身对工具是安全的；但 SDK 一层幂等键都不生成，L19 第四节的三层 key 全要自己做。
+
+### 8.2 guardrail 和 handoff：L14 与 L11
+
+`defineInputGuardrail` 的签名里写着 `runInParallel = true`。文档原话："Concurrent execution minimizes latency, but the model may already have consumed tokens or run tools if the guardrail later triggers." E6-D 让 guardrail 在 50ms 后触发：默认配置下抛 `InputGuardrailTripwireTriggered` 时模型已经被调用了 1 次；`runInParallel: false` 时是 0 次。那次实测里副作用工具没跑到，但文档明说可能会跑，不要依赖这一次的时序。L14 的原则是先拒后放，这里的默认是**先放后拦**。另外，输入 guardrail "run only for the first agent in the chain"，handoff 之后的 agent 不受它约束。
+
+handoff 原文："By default a handoff receives the entire conversation history." L11 讲 sub-agent 要隔离上下文，这里的默认是整段交出去，要裁剪得配 `inputFilter`。
+
+### 8.3 tracing：L13
+
+伞包 `@openai/agents` 的 `dist/index.mjs` 前五行里有一行 `setDefaultOpenAITracingExporter();`。只要 import 它，进程就注册了 OpenAI 的 tracing exporter，导出端点是 `https://api.openai.com/v1/traces/ingest`。敏感数据默认包含：`traceIncludeSensitiveData ?? true`，E6-F 实测为 `true`。官方文档："Tracing is enabled by default in server runtimes (Node.js, Deno, Bun). It is disabled by default in browsers and when `NODE_ENV=test`."
+
+后一句意味着**测试环境和生产环境行为不同**：测试里看不到的上传，在生产里发生。E6-F 还发现，调用 `setTracingDisabled(true)` 之后，`new Runner().config.tracingDisabled` 仍是 `false`，全局开关和 Runner 级开关是两个东西。L13 的立场是 span 去哪由你决定，这里的默认是 span 已经有去处了。AI SDK 的 telemetry 也是 "Enabled by default when a telemetry integration is registered"，输入记录默认开。
+
+<Pitfall title="环境里恰好有 OPENAI_API_KEY">
+
+没有 key 时 exporter 只打一句 `No API key provided for OpenAI tracing exporter. Exports will be skipped`。反过来，如果别的功能恰好在用 `OPENAI_API_KEY`，而 agent 的模型走的是 DeepSeek，那么 DeepSeek 上的对话内容会作为 trace 上传到 OpenAI。这一条是从上面三条一手事实推出来的，没有实测（推论）。lab 的修法写在实验六里：只装 `@openai/agents-core`，exporter 自己设。
+
+</Pitfall>
+
+### 8.4 输出上限和 reset-step：L15 与 L16
+
+`@ai-sdk/anthropic@4.0.78` 的 `getModelCapabilities` 最后一个分支：
+
+```ts
+} else {
+  // Non-Claude models (e.g. served through Anthropic-compatible APIs)
+  // keep conservative defaults.
+  return {
+    maxOutputTokens: 4096,
+    supportsStructuredOutput: false,
+    ...
+```
+
+E1-G 用 `baseURL` 指向 DeepSeek 的 Anthropic 端点、模型 `deepseek-v4-pro`，每一步都打一条 "The model "deepseek-v4-pro" is unknown. The max output tokens have been limited to 4096. Set maxOutputTokens explicitly to override this limit."。thinking 加上一段长代码编辑很容易超过 4096，`stop_reason` 变成 `max_tokens`，工具参数被截断。这就是第三节的 `truncated`，也是 L16 第 1.2 节那条不带错误信号的撤回路径：**换了 provider 不改 `maxOutputTokens`，capstone 的编辑工具会随机截断**。
+
+L16 第一节引用了 UI message stream 协议里的 `reset-step`。在 `ai@7.0.137` 的 `src/` 里全文搜它，只有两处：schema 定义和客户端的处理函数。`streamText`、`ToolLoopAgent` 的服务端路径从不发它，文档写明发它的是 `WorkflowAgent` 的重试。而 `streamText` 自己的流内重试（`streamRetries`，默认关）注释原文：
+
+> "Partial output from a failed attempt that was already emitted cannot be retracted and remains in consumer-facing streams. It is excluded from the recovered step result, structured output parsing, response messages, and subsequent model steps."
+
+打开 `streamRetries` 而不用 `WorkflowAgent`，得到的正是 L16 实验三那个只会追加的前端：UI 上重复半句话，模型历史里没有。UI 和模型消息又一次分叉。
+
+<Drill title="thinking 签名：同一个问题，两条路径行为相反">
+
+E4 用真 `@ai-sdk/anthropic` 加假 `fetch`，对 thinking 块有没有 `signature` 和流式、非流式各跑一遍：
+
+| 响应形态 | 有签名 | 结果 |
+|---|---|---|
+| 非流式 | 有 | 第二次请求回传 `["thinking","tool_use"]` |
+| 非流式 | 无 | `AI_APICallError: Invalid JSON response` |
+| 流式 | 有 | 回传 `["thinking","tool_use"]` |
+| 流式 | 无 | thinking 块被丢弃，只回传 `["tool_use"]`，一条 warning `unsupported reasoning metadata` |
+
+非流式报错，是因为响应 schema 里 `signature: z.string()` 是必填；流式丢弃，是因为转换函数遇到既没有 `signature`、也没有 `redactedData` 的块就整块扔掉。前者响亮，后者静默。
+
+L16 第 5.4 节说 thinking 块必须原样回传。DeepSeek 的 OpenAI 格式文档写得更硬："If your code does not correctly pass back `reasoning_content`, the API will return a 400 error."。两件事调研没能确认：DeepSeek 的 Anthropic 端点返回的 thinking 块带不带 `signature`（文档没写，零网络验证不了）；Anthropic 格式下漏传是否同样 400（兼容表只写了 Supported）。
+
+`@ai-sdk/deepseek`（OpenAI 格式）显式处理了回传，但判断是不是 V4 靠模型名字符串：`includes('deepseek-v4') || startsWith('deepseek-flash') || startsWith('deepseek-pro')`。经网关改了名（比如 one-api 里叫 `ds-v4`），就会被当成 R1，历史 reasoning 被丢掉。
+
+</Drill>
+
+---
+
+## 九、跑一个 Claude Code 二进制意味着什么
+
+### 9.1 它不是一个纯 TS 库
+
+`@anthropic-ai/claude-agent-sdk@0.3.296` 的 `optionalDependencies` 是 8 个平台包；`darwin-arm64` 那个的二进制叫 `claude`，240664432 字节，约 240MB，`linux-x64` 约 257MB。官方的定位就一句："A library that runs the Claude Code binary, with Claude Code's capabilities, such as built-in tools, permissions, sessions, and hooks."
+
+由此推出几件事（推论）：agent loop 不在你的进程里，你只能通过 options、hooks、`canUseTool` 这些它开放的口子影响循环，L05 那句「自己写你才控制得住」在这里是字面意义上的控制不住；每个会话一个子进程、每个镜像多二百多 MB、要匹配 libc，和 Serverless 天然冲突；版本是两层的。许可不是开源："© Anthropic PBC. All rights reserved."，商用受 Commercial Terms 约束。README 还写着 "we collect feedback, which includes usage data (such as code acceptance or rejections), associated conversation data"。
+
+默认值几乎每一项都是继承你机器上的 Claude Code：
+
+- `settingSources`："When omitted, all sources are loaded (matches CLI defaults)."。服务器上的 `query()` 会读运行用户的 `~/.claude/settings.json`、项目的 `.claude/` 和 CLAUDE.md
+- `env`："this value REPLACES the subprocess environment entirely"。不传，子进程继承服务器进程的全部环境变量，而子进程里跑着 `Bash` 工具；传了，`PATH` 没了，二进制里的 `git`、`rg` 都找不到
+- `persistSession` 默认 `true`，每个会话的完整 transcript 写进运行用户 home 下的 `~/.claude/projects/`
+- 默认 system prompt 不是 Claude Code 的那一大段，只有一句 "You are a Claude agent, built on Anthropic's Claude Agent SDK."，要完整行为得显式传 `systemPrompt: { type: 'preset', preset: 'claude_code' }`
+
+### 9.2 实验七
+
+```text
+不传 permissionMode → auto：每次主循环请求后跟着 10 次分类器请求（max_tokens 64 五次、8192 五次）
+分类器的 model=claude-sonnet-5，不是你设的 deepseek-v4-pro；它的花费不进 total_cost_usd
+分类器的 system 开头："You are a security monitor for autonomous AI coding agents."
+分类器答不上来时回填给主模型：
+  "Auto mode could not evaluate this action and is blocking it for safety — run with --debug for details. This is not a judgment that the action is unsafe. This is usually transient — wait briefly and try this action again as-is; don't rewrite it."
+  体检：no-error-signal no-tool-name no-next-step retry-as-is
+
+运行                        session_id    messages  total_cost_usd
+A2                          e1027878…     5         0.0012
+B：resume A2                e1027878…     8         0.0018
+C：resume A2 + forkSession  9afbad74…     11        0.0024
+fork 的成本从父会话的累计值接着算：0.0024 包含了 0.0018——按会话汇总会重复计算
+成本里不含什么："Internal helper calls outside the query pipeline (e.g. the permission classifier, token-count probes) are excluded"
+```
+
+这一组的证据等级最需要分开读：
+
+| 说法 | 等级 |
+|---|---|
+| 干净环境（没有任何 settings 文件）下 `init.permissionMode` 是 `auto` | E5-A 实测。有 settings 文件时，它会被里面的 `permissions.defaultMode` 改掉 |
+| 每次主循环请求后跟 10 次分类器请求，`model` 写死为 `claude-sonnet-5` | 实测，但对着的是一个本地假服务器，它不按分类器要求的 `<severity>N</severity>` 协议作答。真分类器答得上来时是几次，没有测 |
+| 分类器失败即拒，回填叫模型原样重试；没有轮数上限，于是死循环 | 实测：45 秒后手动 abort；第一次没加保护时跑到 Node 堆溢出 |
+| 接 DeepSeek 时，分类器会落到 `deepseek-flash` | 推论。依据是 DeepSeek 文档的映射规则 "Models starting with claude-haiku or claude-sonnet are mapped to `deepseek-flash`"，没有真网络验证 |
+| `deepseek-flash` 能不能稳定按 `<severity>` 协议作答 | 未知，没有一手来源 |
+| 分类器的花费不进 `total_cost_usd` | 一手：`sdk.d.ts` 的注释原文 |
+| `total_cost_usd` 对 `deepseek-v4-pro` 算出非零值，但用的不是 DeepSeek 的价格 | 非零是实测（每次 100 输入、10 输出 token 记 0.0006 美元）；它用的是哪张价目表，是推论 |
+
+失败即拒这一半本身没错，它符合 L14 第十节第 2 条「任何失败都是拒绝」。出问题的是另外两半：拒绝文案叫模型 "try this action again as-is; don't rewrite it"，而 `maxTurns` 没有默认值。三样叠在一起，**默认配置就是一个死循环**。「能连上 DeepSeek」不等于「行为一致」。
+
+成本账上还有两处和 L15 冲突：分类器的花费不入账，fork 的累计值从父会话接着算。按会话汇总成本，父会话的钱会被算两次。
+
+### 9.3 要显式设的几项
+
+- `permissionMode` 显式传。无人值守的服务用 `dontAsk`，原文 "every call that would otherwise prompt is denied"，最接近 L14 的 deny 优先；或者 `default` 加 `allowedTools`、`canUseTool`，`default` 下没有回调就是拒
+- 被拒不改变 `result.subtype`（E5-A3 里连你自己进程内注册的 MCP 工具也被拒了，`subtype` 仍是 `success`），要看 `result.permission_denials`，注释说它 "is the authoritative record"
+- `maxTurns` 和 `maxBudgetUsd` 都设，并且记住预算是事后检查
+- `settingSources: []` 隔离文件系统上的配置；`env` 显式给，把需要的变量自己展开进去
+- 接 DeepSeek 时，按 DeepSeek 给 Claude Code 的推荐配置覆盖全部四个模型槽位加子 agent 模型，漏一个就落到映射规则上
+- 成本以你自己的账为准，`total_cost_usd` 在 DeepSeek 上不是账单
+
+<CursorHook>
+
+Cursor 和 Claude Code 是同一类东西：harness。循环、工具注册、审批、上下文压缩都是它们自己写的，默认值是为「一个人坐在屏幕前写代码」调的。
+
+Claude Agent SDK 把其中一个 harness 打包成了库。你 import 进来的不是一个通用框架，是别人的产品连同它的默认值：没有轮数上限，分类器替你批工具调用，整段历史回放。这些默认值是一个 coding harness 的默认值，不是你那个没人盯着的后端服务的默认值。
+
+</CursorHook>
+
+---
+
+## 十、平台：Dify、Coze Studio、n8n
+
+这一节的结论都来自三个平台仓库里的原文件，**没有任何平台的运行时实测**。
+
+### 10.1 什么时候该用平台
+
+实验九：
+
+```text
+内部运营：查库存、出日报                平台
+对外客服：按客户计费、能退款            平台做原型，DSL 当需求文档，手写上线（许可：Dify 多租户要书面授权）
+coding agent 进 CI                      手写
+把 n8n 流程打包卖给客户                 手写（许可：n8n 不能嵌进对外收费的产品）
+```
+
+判据是调研的经验法则，`choosePlatform` 的注释也写明它是推论，不是一手结论：**流程固定、工具只读、使用者是内部运营**，用平台；要 eval 门禁、按租户计费、写操作要审批、要进 CI，任一条成立就手写，流程固定时可以拿平台做原型。
+
+| 维度 | 平台给你的 | 手写给你的 | 平台够用的条件 |
+|---|---|---|---|
+| 版本管理 | DSL 导出，夹带 UI 坐标；知识库和凭据不在里面 | 代码加 git 加锁定依赖 | 改动少，改的人不是工程师 |
+| 测试与评测 | 平台内的调试面板；DSL 里没有放测试的位置 | L12 的回归集加 CI | 能接受「人工点一遍」当回归 |
+| 可观测性 | 平台自带日志；n8n 的 Tools Agent 默认不返回中间步骤 | L13，span 去哪你决定 | 不需要和公司现有的 trace 打通 |
+| 权限 | 平台的 workspace 和角色 | L14 的审批门、沙箱、服务端审批状态 | 工具都是只读或低风险 |
+| 失败恢复 | 平台的重试配置，Dify 的 HTTP 节点默认关 | L08、L19 的幂等键与断点续跑 | 节点都是幂等的 |
+
+平台自己也在用框架：Dify 新增的 `dify-agent/` 目录 README 原文 "Dify Agent runs Pydantic AI with native capabilities and toolsets."；Coze Studio 的 agent 和 workflow 运行时基于 CloudWeGo 的 Eino；n8n 的 AI 节点依赖十几个 LangChain JS 包，Tools Agent 默认 `maxIterations` 10、`returnIntermediateSteps` 为 `false`。
+
+### 10.2 许可：三家三样
+
+- **Dify** 是 "a modified version of the Apache License 2.0"。附加条件原文："Unless explicitly authorized by Dify in writing, you may not use the Dify source code to operate a multi-tenant environment."，并且 "one tenant corresponds to one workspace"。给每个客户开一个 workspace 的 SaaS 就需要书面授权。用 Dify 前端时不得去掉或修改 LOGO 和版权信息；贡献者要同意许可可以被收紧。「Dify 是 Apache 2.0」这个说法不准确
+- **Coze Studio** 是 Apache-2.0，没有多租户条款。Go 后端加 React 前端，最近一次 release 是 v0.5.1（2026-02），活跃度没有查
+- **n8n** 是 Sustainable Use License："You may use or modify the software only for your own internal business purposes or for non-commercial or personal use."。内部自用可以，**嵌进对外收费的产品不在许可范围内**；文件名带 `.ee.` 的另需企业许可
+
+### 10.3 把 DSL 当需求文档读
+
+Dify DSL 当前版本 0.7.0，导入时缺 `version` 当 `"0.1.0"`、缺 `kind` 补 `"app"`。导出时默认删掉工具节点的 `credential_id`，知识检索节点的 `dataset_ids` 用原租户 id 加密，webhook URL 清空。同一个节点里还混着 `position`、`width`、`selected` 这类画布字段，拖一下节点，git diff 就出现和语义无关的变化。所以 DSL 导到另一套环境，检索和凭据都是断的；但它是一份很好的需求文档：节点是步骤，边是控制流，`{{#node.field#}}` 是数据流。
+
+实验八：
+
+```text
+version=0.7.0  kind=app  丢掉的画布字段：20 个
+执行顺序：start → kr → route → llm → ticket → notify → answer → fallback
+分支：route:true->llm  route:false->ticket
+节点      类型                  标题      改写成代码时要补的
+kr        knowledge-retrieval   知识检索  rebind-index
+llm       llm                   回答      sliding-window-breaks-cache
+ticket    http-request          建工单    no-retry idempotency-key
+notify    tool                  发通知    reconnect-secret
+数据流：llm<-kr.result  llm<-sys.query  ticket<-sys.query  notify<-ticket.body  answer<-llm.text  fallback<-ticket.body  fallback<-sys.query
+问题：ref-not-upstream:ticket:llm.text
+```
+
+每个「要补的」都是前面某一节：
+
+- `rebind-index`：`dataset_ids` 绑在原租户上，换成你自己的索引（L09）
+- `sliding-window-breaks-cache`：LLM 节点开了 `memory.window`（size 10），和 Mastra 的 `lastMessages` 一样，每一轮滑动都改写前缀（L15）
+- `no-retry`、`idempotency-key`：建工单是 POST，`retry_config.enabled` 是 `false`；改写成代码时要么不自动重试，要么带幂等键（L19 第五节）
+- `reconnect-secret`：发通知的凭据导出时被删了，从你的密钥管理里重新接
+- `agent` 节点（这份样例里没有）是一个 L05 的循环，要补步数上限和停止原因
+
+最后一行的问题是这份 DSL 里真正的 bug。ticket 在拓扑序里排在 llm 后面，但 route 的 true 分支走 llm、false 分支走 ticket：ticket 只在知识库没命中时执行，那时 llm 根本没跑，`{{#llm.text#}}` 在运行时是空值。**拓扑序在前不等于是上游**，判据是沿边反向可达。
+
+### 10.4 TODO 6：myDifyPlan
+
+七步，规则全在 shared 的 `difyPlan` 注释里：校验对象、补默认的 version 和 kind 并比较版本；收节点（坏节点、重复节点报错，画布字段计数）；收边（悬空边报错，`sourceHandle` 不是 `source` 的记为分支）；Kahn 拓扑排序；列 steps 和 needs；扫引用。
+
+| 典型错法 | 后果 | 断言 |
+|---|---|---|
+| 拓扑序在前就当成上游 | ticket 引用 llm 的输出不报 | D3 |
+| 版本按字符串比 | `"0.10.0"` 小于 `"0.7.0"`，更新的格式被当成旧的 | D4 |
+| Kahn 用队列 | 顺序是 a、b、d、c，不是每轮取列表里第一个入度为 0 的 a、b、c、d | D6 |
+| 只扫顶层的字符串 | 嵌在 prompt 数组、对象里的引用漏掉 | D7 |
+| 遇到坏节点就抛 | 一个坏节点让整份计划都读不出来；正确做法是报出来，图照样排 | D5 |
+
+---
+
+## 十一、那篇论文到底说了什么
+
+arXiv [2609.00006](https://arxiv.org/abs/2609.00006)，"Harness Engineering: Anatomy, Architecture, and Evolution of Coding Agents — A Source-Code Study of Eleven Systems"，研究对象是 Claude Code、Codex CLI、Gemini CLI、OpenHands、Aider、OpenCode 等十一个 coding agent 加 Databricks 的 Omnigent，源码锁定在 2026 年 7 月。它经常被引成「生产环境不用框架，所以别用 AI SDK」。原文是这样说的：
+
+> "across roughly four million lines of Python, TypeScript, and Rust, no agent runtime imports a general-purpose agentic framework (LangChain, LangGraph, AutoGen, or a dozen others; Gemini CLI uses neither of Google's own), and none retrieves code with vector embeddings"
+
+检查清单是 "LangChain, LangGraph, LlamaIndex, AutoGen, CrewAI, Pydantic AI, Genkit, Haystack agents, Semantic Kernel, Google's ADK, and several smaller libraries (Smolagents, Swarm, Agno)"。**清单里没有 AI SDK、Mastra、Claude Agent SDK、OpenAI Agents SDK**。而且论文专门写了 AI SDK：
+
+> "And OpenCode delegates its inner LLM/tool plumbing to Vercel's AI SDK—a provider-abstraction layer, not an agent-orchestration framework, but the first corpus system whose inner loop plumbing is a third-party SDK at all"
+
+所以它能证明的是：生产 coding harness 的循环都是手写的（"Every loop is hand-rolled in the host language's native primitives"），工具注册都围绕 Pydantic、Zod、TypeBox 这些 schema 库自建。它证明不了「别用 AI SDK」，反而把 AI SDK 归进了 provider 抽象层，正好对上这一节的结论：**拿 provider 层，编排层的默认值不要照单全收**。
+
+论文的局限写得很老实："A company could in principle use LangChain inside a production SWE agent through a code path we did not inspect. We would be surprised, but not shocked." 它还有一个合流论点：一个 meta-harness 把 `claude-agent-sdk` 和 `openai-agents` 列为生产依赖，"harnesses did not adopt the frameworks; they replaced them, became importable themselves"。由此推出（推论）：harness SDK 正在成为新的框架，而它们的默认值是一个 coding harness 的默认值，第九节已经看过那是什么样子。
+
+论文里转述 Gemini CLI 循环检测阈值的那几个数，是论文对别人源码的描述，这一节不拿来当依据。
+
+---
+
+## 十二、动手
+
+<Lab title="l19x/ecosystem：六个适配器，每一个接在一个框架扩展点上">
+
+<Steps>
+<li>`cd labs && pnpm eco19`。先跑九个观察实验，什么都不写。重点看实验一（默认上限）、实验二（四家的回填）和实验五（in-flight 不重跑）。</li>
+<li>`ECO19_IMPL=shared pnpm verify:l19x`，先确认测试本身是对的：42 条全绿。</li>
+<li>实现 `l19x/ecosystem.ts` 下半部分的六个 TODO。建议顺序：TODO 1、2、4、3、5、6。TODO 4 要用 TODO 2 的 `myRedactSecrets`，Dify 那个最长，留到最后。</li>
+<li>`pnpm verify:l19x`。红的那条会打印实际值，对照下表找是哪种错法。</li>
+<li>Python 侧：`uv run python -m l19x.ecosystem` 跑观察实验，`uv run python -m l19x.verify` 跑断言。</li>
+</Steps>
+
+| TODO | 接在哪 | 典型的「看起来对」 | 主要被谁抓 |
+|---|---|---|---|
+| 1 ★ `myCourseStopReason` | AI SDK 的 `stopWhen`；返回之后自己算原因 | 上限用 `===`；签名用 `JSON.stringify`；先查上限再查重复 | S3、S4、S5 |
+| 2 ★★ `myRedactSecrets`、`myCourseToolError` | AI SDK 的 `execute` 包装，Agents SDK 的 `errorFunction` | 值用 `\S+`；先截断再脱敏；按 UTF-16 截 | E1、E2、E4、E7 |
+| 3 ★ `myResumeOnce` | `RunState.fromString`、`approve`、`run` 外面 | 执行完才写记录；崩溃时删掉 in-flight | R1、R4 |
+| 4 ★ `myMcpResultToText` | `@ai-sdk/mcp` 工具的 `execute` 返回值 | 按真值判断 `isError`；只取 text 块 | M1、M3、M4 |
+| 5 ★ `myRebuildHistory` | 服务端，下一轮请求之前 | 以 UI 消息为准；重复 id 取最后一次 | H2、H3、H4 |
+| 6 ★★ `myDifyPlan` | 读 DSL，产出代码计划 | 拓扑序在前当上游；版本按字符串比；Kahn 用队列 | D3、D4、D6 |
+
+42 条断言：S 停止原因 6 · E 错误出口 7 · R 审批恢复 5 · M MCP 结果 6 · H 重建历史 5 · D Dify DSL 7 · F 框架模型 6。F 组测的是参考实现和夹具本身：七个入口的默认上限、`isStepCount` 的严格相等、四家回填的体检结果、MCP 线上块、UI 遮罩和 RunState 重放、Claude Agent SDK 的默认值和 fork 成本、平台的选法。它是这一节所有数字的锚：重录夹具之后 F 组红了，讲义就要跟着改。S6 和 D1–D3 用你的实现重跑实验一和实验八，要求和上面的输出一致。
+
+全绿之后，verify 最后打印「最该记住的六条」：
+
+```text
+STOP   原因要显式：approval / truncated / error / done / repeat / max_steps 各是各的；上限用 ≥，0 也要停
+ERROR  失败写在文本里：前缀 + 工具名 + 下一步；先脱敏再截断；不叫模型原样重试
+ONCE   恢复只消费一次：先认领再执行；in-flight 不重跑、要对账；决定冲突要报
+MCP    isError 只有缺省 / null / false 算成功；不认识的 content 写出来，不要吞
+HIST   下一轮的历史以服务端日志为准；UI 消息只用来对账：drifted / forged / dropped
+DSL    拓扑序在前不等于是上游；凭据、知识库、画布字段都不跟着 DSL 走
+```
+
+</Lab>
+
+<PyMirror>
+
+Python 通道照 L11x 的形状反过来：只观测，不装任何框架，读同一份 `fixtures/ecosystem.json`，测的是六个适配器的纯函数版本。原因写在开场那张表里：这一节的框架都是 TS 原生，Python 版 OpenAI Agents SDK 和 Claude Agent SDK 的默认值是否和 TS 版一致，没有核实，不能拿 TS 的结论去断言 Python 包。
+
+```bash
+cd labs
+uv run python -m l19x.ecosystem
+uv run python -m l19x.verify
+```
+
+两条通道要对上，有几处容易错：
+
+| 地方 | TS | Python |
+|---|---|---|
+| 截到 200 个码点 | `.length` 和 `slice` 按 UTF-16 码元，要用 `[...s]` | `len()` 和切片本来就按码点 |
+| 键排序（调用签名的规范化） | 默认 `sort` 按 UTF-16 码元比，shared 里专门写了 `cmpCodePoint` | 字符串比较按码点 |
+| JSON 输出（M4 的 `{"rows":2}`） | `JSON.stringify` 没有空格，汉字原样 | `json.dumps` 默认带空格、默认把汉字转义，要传 `separators=(',', ':')` 和 `ensure_ascii=False` |
+| 成本 | shared 一律用整数微美元，`fmtUsd` 截断到四位小数 | 同样用整数，避免两种语言打印浮点数不一致 |
+
+`(?<![A-Za-z0-9])` 这种定长的后行断言两边的正则都支持，`redactSecrets` 的三条规则可以原样搬过去。
+
+</PyMirror>
+
+---
+
+## 十三、收尾
+
+面试里被问「你们用什么框架」，可以这样答：
+
+1. **先分层**。provider 层用 AI SDK 的 `streamText` 和 provider 包，这是真脏活；接 DeepSeek 的 Anthropic 端点时显式设 `maxOutputTokens`，否则被限到 4096。编排层的默认值不照单全收
+2. **说出四家的默认值差多少**。同一个永远失败的工具，默认上限 1、20、5、10、无上限；撞上限时有的正常返回、有的抛、有的不停。停止原因我们自己算，approval、truncated、repeat 各是各的
+3. **错误只信文本**。三家把带 key 的原始异常塞进上下文，一家抹掉还叫模型再试一次；DeepSeek 忽略 `is_error`。我们的错误出口是前缀加工具名加下一步，先脱敏再截断，接在 `execute` 包装和 `errorFunction` 上
+4. **恢复只消费一次**。同一份 RunState 恢复两次执行两次，四家都不生成幂等键。先认领再执行，in-flight 不重跑、去外部系统对账
+5. **历史以服务端为准**。`useChat` 的历史是客户端输入，审批默认不签名，UI 遮罩会改写下一轮。服务端持久化模型消息，客户端的只用来对账
+6. **Claude Agent SDK 和平台各有位置**。要的就是一个 coding agent 时用 Claude Agent SDK，但显式关掉默认值：权限模式、轮数、预算、配置来源、环境变量；平台做原型，DSL 当需求文档。那篇 harness 论文证明的是生产 coding harness 的循环都是手写的，不是别用 AI SDK
+
+<Note title="这一节刻意没有当事实讲的说法">
+
+调研查不到一手来源的：DeepSeek 的 Anthropic 端点对 thinking `signature` 的要求，缺签名会不会 400，以及它对 `thinking: {type:'adaptive'}`、messages 里 `role: "system"` 的处理；`deepseek-flash` 能否稳定按 `<severity>N</severity>` 协议回答 Claude Code 的权限分类器；Claude Agent SDK 自动压缩的阈值和 `total_cost_usd` 用的价目表；Mastra 线上的 `is_error`、它的 `ee/LICENSE` 条款；Python 版 Agents SDK、Claude Agent SDK 的默认值；Dify 许可是否被 OSI 认定为开源；三个平台的运行时行为（都没有部署）。Mastra 文档没有提醒 `suspend()` 之前的副作用会重跑，这是调研对文档的解读；论文里关于 Gemini CLI 阈值的数字是二手转述。
+
+</Note>
+
+回头看前置课：L05 第四节「框架到底包装了什么」那张表，在这里展开成了第二节的对照表；L05 的 `AgentRun.reason` 变成了 `stopWhen` 上的适配器；L08 和 L19 的幂等键，是四家框架那一行全空的地方；L10 的 `isError`、L13 的 trace、L14 的审批、L15 的兼容层、L16 的 `reset-step` 和 `truncated`，每一处都在某个默认值上被反转了一次。L11x 教你读 Python 生态的代码，这一节教你读 TS 框架的默认值，方法相同：先找到它替你写了哪一段，再看那一段的默认值和你的不变量差在哪。
+
+给 L21：这一节的每条结论都挂在一个版本号上，过期是常态。录制口径、重录、看 F 组红不红，就是 L21 那套持续跟踪方法的一个最小样例。

@@ -1,0 +1,166 @@
+{
+  "users": {
+    "alice": { "userId": "alice", "tenant": "acme", "principals": ["user:alice@qinghe.com", "group:hr", "group:all"] },
+    "bob": { "userId": "bob", "tenant": "acme", "principals": ["user:bob@qinghe.com", "group:rd", "group:managers", "group:all"] },
+    "dave": { "userId": "dave", "tenant": "acme", "principals": ["user:dave@qinghe.com", "group:all"] },
+    "carol": { "userId": "carol", "tenant": "globex", "principals": ["user:carol@globex.com", "group:all"] }
+  },
+  "docs": [
+    {
+      "docId": "travel-2023",
+      "tenant": "acme",
+      "title": "差旅报销办法（2023）",
+      "acl": ["group:all"],
+      "version": { "family": "travel", "level": 2, "special": false, "issued": "2023-01-01", "effectiveFrom": "2023-01-01", "repealedAt": "2025-07-01", "mtime": "2023-01-05" },
+      "parser": "mineru-2.1",
+      "pages": [
+        { "index0": 0, "label": "i", "blocks": [
+          { "id": "p0b0", "kind": "text", "text": "青禾科技 内部资料", "y": 30 },
+          { "id": "p0b1", "kind": "text", "text": "差旅报销办法（2023）", "y": 300 },
+          { "id": "p0b2", "kind": "text", "text": "— i —", "y": 960 }
+        ] },
+        { "index0": 1, "label": "ii", "blocks": [
+          { "id": "p1b0", "kind": "text", "text": "青禾科技 内部资料", "y": 30 },
+          { "id": "p1b1", "kind": "text", "text": "第一章 总则", "y": 150 },
+          { "id": "p1b2", "kind": "text", "text": "第一条 为规范公司差旅报销，制定本办法。", "y": 250 },
+          { "id": "p1b3", "kind": "text", "text": "第二条 本办法适用于公司全体员工。", "y": 320 },
+          { "id": "p1b4", "kind": "text", "text": "— ii —", "y": 960 }
+        ] },
+        { "index0": 2, "label": "1", "blocks": [
+          { "id": "p2b0", "kind": "text", "text": "青禾科技 内部资料", "y": 30 },
+          { "id": "p2b1", "kind": "text", "text": "第二章 住宿标准", "y": 150 },
+          { "id": "p2b2", "kind": "text", "text": "第十二条 出差住宿按城市等级执行。", "y": 250 },
+          { "id": "p2b3", "kind": "text", "text": "第十三条 一线城市住宿上限为每晚 300 元，其他城市为每晚 240 元。", "y": 330 },
+          { "id": "p2b4", "kind": "text", "text": "— 1 —", "y": 960 }
+        ] },
+        { "index0": 3, "label": "2", "blocks": [
+          { "id": "p3b0", "kind": "text", "text": "青禾科技 内部资料", "y": 30 },
+          { "id": "p3b1", "kind": "text", "text": "第三章 报销流程", "y": 150 },
+          { "id": "p3b2", "kind": "text", "text": "第二十条 报销应在返回后三十日内提交，逾期", "y": 850 },
+          { "id": "p3b3", "kind": "text", "text": "— 2 —", "y": 960 }
+        ] },
+        { "index0": 4, "label": "3", "blocks": [
+          { "id": "p4b0", "kind": "text", "text": "青禾科技 内部资料", "y": 30 },
+          { "id": "p4b1", "kind": "text", "text": "不予受理。", "y": 120, "continuesPrev": true },
+          { "id": "p4b2", "kind": "text", "text": "第二十一条 本办法自 2023 年 1 月 1 日起施行。", "y": 300 },
+          { "id": "p4b3", "kind": "text", "text": "— 3 —", "y": 960 }
+        ] }
+      ]
+    },
+    {
+      "docId": "travel-2025",
+      "tenant": "acme",
+      "title": "差旅报销办法（2025）",
+      "acl": ["group:all"],
+      "version": { "family": "travel", "level": 2, "special": false, "issued": "2025-06-01", "effectiveFrom": "2025-07-01", "mtime": "2025-06-03" },
+      "parser": "mineru-2.1",
+      "pages": [
+        { "index0": 0, "blocks": [
+          { "id": "p0b0", "kind": "text", "text": "第一章 总则", "y": 150 },
+          { "id": "p0b1", "kind": "text", "text": "第一条 为规范公司差旅报销，制定本办法。", "y": 220 },
+          { "id": "p0b2", "kind": "text", "text": "第二章 住宿标准", "y": 400 },
+          { "id": "p0b3", "kind": "text", "text": "第十三条 一线城市住宿上限为每晚 500 元，其他城市为每晚 380 元。", "y": 480 }
+        ] },
+        { "index0": 1, "blocks": [
+          { "id": "p1b0", "kind": "text", "text": "第二十一条 本办法自 2025 年 7 月 1 日起施行，《差旅报销办法（2023）》同时废止。", "y": 200 }
+        ] }
+      ]
+    },
+    {
+      "docId": "travel-2026",
+      "tenant": "acme",
+      "title": "差旅报销办法（2026）",
+      "acl": ["group:all"],
+      "version": { "family": "travel", "level": 2, "special": false, "issued": "2026-09-20", "effectiveFrom": "2027-01-01", "mtime": "2026-09-20" },
+      "parser": "mineru-2.1",
+      "pages": [
+        { "index0": 0, "blocks": [
+          { "id": "p0b0", "kind": "text", "text": "第十三条 一线城市住宿上限为每晚 600 元，其他城市为每晚 450 元。", "y": 200 },
+          { "id": "p0b1", "kind": "text", "text": "第二十一条 本办法自 2027 年 1 月 1 日起施行。", "y": 300 }
+        ] }
+      ]
+    },
+    {
+      "docId": "rd-travel-supp",
+      "tenant": "acme",
+      "title": "研发部差旅补充规定",
+      "acl": ["group:rd"],
+      "version": { "family": "travel", "level": 2, "special": true, "issued": "2024-05-01", "effectiveFrom": "2024-05-01", "mtime": "2024-05-01" },
+      "parser": "mineru-2.1",
+      "pages": [
+        { "index0": 0, "blocks": [
+          { "id": "p0b0", "kind": "text", "text": "一、研发人员赴外地联调期间，一线城市住宿上限为每晚 450 元。", "y": 200 }
+        ] }
+      ]
+    },
+    {
+      "docId": "budget-2025",
+      "tenant": "acme",
+      "title": "2025 年部门预算表",
+      "acl": ["group:managers", "group:finance"],
+      "version": { "family": "budget", "level": 2, "special": false, "issued": "2025-01-10", "effectiveFrom": "2025-01-10", "mtime": "2025-01-10" },
+      "parser": "mineru-2.1",
+      "pages": [
+        { "index0": 0, "blocks": [
+          { "id": "p0b0", "kind": "text", "text": "一、预算编制说明", "y": 150 },
+          { "id": "p0b1", "kind": "text", "text": "（一）编制依据", "y": 220 },
+          { "id": "p0b2", "kind": "text", "text": "1. 本表依据各部门 2025 年工作计划编制。", "y": 300 },
+          { "id": "p0b3", "kind": "text", "text": "（1）人员费用按编制数测算。", "y": 360 }
+        ] },
+        { "index0": 1, "blocks": [
+          { "id": "p1b0", "kind": "text", "text": "二、预算明细", "y": 150 },
+          { "id": "p1b1", "kind": "table", "text": "", "y": 300, "table": {
+            "caption": "表3 各部门预算（万元）①",
+            "headerRows": [["部门", "2025年", "", "2024年", ""], ["", "金额", "占比", "金额", "占比"]],
+            "rows": [["市场部", "910", "19.7%", "860", "20.0%"], ["研发部", "1200", "25.9%", "1100", "25.6%"], ["财务部", "320", "6.9%", "300", "7.0%"]]
+          } },
+          { "id": "p1b2", "kind": "footnote", "text": "① 不含外包人员费用。", "y": 880 }
+        ] },
+        { "index0": 2, "blocks": [
+          { "id": "p2b0", "kind": "table", "text": "", "y": 100, "continuesPrev": true, "table": {
+            "caption": "",
+            "headerRows": [],
+            "rows": [["行政部", "400", "8.6%", "410", "9.6%"], ["销售部", "1650", "35.6%", "1500", "35.0%"], ["法务部", "150", "3.2%", "120", "2.8%"], ["合计", "4630", "100%", "4290", "100%"]]
+          } },
+          { "id": "p2b1", "kind": "text", "text": "三、执行要求", "y": 700 },
+          { "id": "p2b2", "kind": "text", "text": "各部门应按季度报送预算执行情况，超支部分须", "y": 820 }
+        ] },
+        { "index0": 3, "blocks": [
+          { "id": "p3b0", "kind": "text", "text": "经财务部审批后方可列支。", "y": 120, "continuesPrev": true }
+        ] }
+      ]
+    },
+    {
+      "docId": "hr-salary",
+      "tenant": "acme",
+      "title": "2025 年薪酬调整通知",
+      "acl": ["group:hr", "group:managers"],
+      "fieldAcl": [{ "column": "月薪", "principals": ["group:hr"] }],
+      "version": { "family": "salary", "level": 2, "special": false, "issued": "2025-03-01", "effectiveFrom": "2025-04-01", "mtime": "2025-03-01" },
+      "parser": "mineru-2.1",
+      "pages": [
+        { "index0": 0, "blocks": [
+          { "id": "p0b0", "kind": "text", "text": "一、调整范围", "y": 150 },
+          { "id": "p0b1", "kind": "text", "text": "本次调整覆盖研发部全体员工，自 2025 年 4 月起执行。", "y": 220 },
+          { "id": "p0b2", "kind": "table", "text": "", "y": 400, "table": {
+            "caption": "附表 研发部薪酬调整明细",
+            "headerRows": [["姓名", "职级", "月薪"]],
+            "rows": [["张三", "P6", "23000"], ["李四", "P7", "31000"]]
+          } }
+        ] }
+      ]
+    },
+    {
+      "docId": "legacy-notice",
+      "tenant": "acme",
+      "title": "关于启用新报销系统的通知",
+      "version": { "family": "notice", "level": 2, "special": false, "issued": "2019-03-01", "mtime": "2019-03-01" },
+      "parser": "pdfminer-2019",
+      "pages": [
+        { "index0": 0, "blocks": [
+          { "id": "p0b0", "kind": "text", "text": "自 2019 年 4 月起，差旅报销统一通过新报销系统提交。", "y": 200 }
+        ] }
+      ]
+    }
+  ]
+}

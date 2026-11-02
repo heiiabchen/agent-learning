@@ -1,0 +1,424 @@
+/*
+ * L16 演示台的样式。
+ *
+ * 刻意朴素：这一节的内容是协议和状态机，界面的作用是把状态**看清楚**，
+ * 不是好看。所以配色只做一件事——让"错的那一半"在视觉上跳出来。
+ */
+
+:root {
+  --bg: #0f1115;
+  --panel: #161a21;
+  --line: #262b34;
+  --fg: #d8dee9;
+  --dim: #8b95a5;
+  --accent: #7aa2f7;
+  --good: #7fd68a;
+  --bad: #f07178;
+  --warn: #e0af68;
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font:
+    14px/1.7 -apple-system,
+    BlinkMacSystemFont,
+    'SF Pro SC',
+    'PingFang SC',
+    sans-serif;
+}
+
+code,
+pre {
+  font:
+    12px/1.6 'SF Mono',
+    ui-monospace,
+    monospace;
+}
+
+.app {
+  max-width: 1180px;
+  margin: 0 auto;
+  padding: 28px 24px 64px;
+}
+
+header h1 {
+  font-size: 19px;
+  font-weight: 600;
+  margin: 0 0 22px;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+header small {
+  font-size: 12.5px;
+  font-weight: 400;
+  color: var(--dim);
+}
+
+/* ── 控件 ───────────────────────────────────────────── */
+
+.controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  align-items: flex-start;
+}
+
+fieldset {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px 14px 12px;
+  margin: 0;
+  background: var(--panel);
+}
+
+legend {
+  font-size: 11px;
+  color: var(--dim);
+  padding: 0 5px;
+  letter-spacing: 0.04em;
+}
+
+.radio,
+.check {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  cursor: pointer;
+  padding: 1px 0;
+}
+
+.radio input,
+.check input {
+  accent-color: var(--accent);
+  margin: 0;
+}
+
+.actions {
+  display: flex;
+  gap: 8px;
+  padding-top: 20px;
+}
+
+button {
+  background: var(--panel);
+  color: var(--fg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 6px 13px;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+button:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+
+button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.teaches {
+  margin: 18px 0 22px;
+  padding: 12px 15px;
+  border-left: 2px solid var(--accent);
+  background: #161a2180;
+  font-size: 13px;
+  color: #b9c2d0;
+  border-radius: 0 6px 6px 0;
+}
+
+/* ── 主体 ───────────────────────────────────────────── */
+
+.split {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 340px;
+  gap: 20px;
+  align-items: start;
+}
+
+@media (max-width: 900px) {
+  .split {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+h2 {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--dim);
+  letter-spacing: 0.06em;
+  margin: 0 0 10px;
+}
+
+h3 {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--dim);
+  letter-spacing: 0.05em;
+  margin: 22px 0 8px;
+}
+
+.bubble {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 18px 20px;
+  min-height: 260px;
+}
+
+.hint {
+  color: var(--dim);
+}
+
+.body {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* ── 工具卡片 ────────────────────────────────────────── */
+
+.tool {
+  margin: 14px 0 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #12151b;
+  overflow: hidden;
+}
+
+.tool summary {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 13px;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.tool .state {
+  margin-left: auto;
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 20px;
+  border: 1px solid var(--line);
+  color: var(--dim);
+}
+
+.tool.streaming .state {
+  color: var(--accent);
+  border-color: #2a3d63;
+}
+
+.tool.ready .state {
+  color: var(--good);
+  border-color: #2b4a32;
+}
+
+.tool.invalid .state,
+.tool.truncated .state {
+  color: var(--bad);
+  border-color: #4d2a2e;
+}
+
+.tool pre {
+  margin: 0;
+  padding: 0 13px 10px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: #b9c2d0;
+}
+
+.tool-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 13px;
+  border-top: 1px solid var(--line);
+}
+
+.tool-actions small {
+  font-size: 11.5px;
+  color: var(--dim);
+  line-height: 1.55;
+}
+
+/* ── 标记 ───────────────────────────────────────────── */
+
+.boundary {
+  margin: 14px 0 0;
+  padding: 10px 13px;
+  border: 1px dashed #3a4457;
+  border-radius: 8px;
+  font-size: 12.5px;
+  color: #a9b4c4;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.boundary small {
+  font-size: 11.5px;
+  color: var(--dim);
+}
+
+.badge {
+  margin: 14px 0 0;
+  padding: 9px 13px;
+  border-radius: 7px;
+  font-size: 12.5px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.badge small {
+  font-size: 11.5px;
+  opacity: 0.8;
+}
+
+.badge.aborted {
+  background: #2a2417;
+  color: var(--warn);
+}
+
+.badge.failed,
+.badge.trunc {
+  background: #2a1a1d;
+  color: var(--bad);
+}
+
+.blocked-img {
+  display: inline-block;
+  padding: 1px 7px;
+  margin: 0 2px;
+  border: 1px dashed #4d2a2e;
+  border-radius: 5px;
+  font-size: 11.5px;
+  color: var(--bad);
+  cursor: help;
+}
+
+.loaded-img {
+  max-width: 100%;
+  outline: 1px solid var(--bad);
+}
+
+/* ── 状态面板 ───────────────────────────────────────── */
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 16px 18px 20px;
+}
+
+.panel dl {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 5px 10px;
+  margin: 0;
+  font-size: 12.5px;
+}
+
+.panel dt {
+  color: var(--dim);
+}
+
+.panel dd {
+  margin: 0;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  font-family: 'SF Mono', ui-monospace, monospace;
+}
+
+.good {
+  color: var(--good);
+}
+
+.bad {
+  color: var(--bad);
+}
+
+.lag {
+  color: var(--warn);
+}
+
+.sub,
+.ok,
+.warn {
+  font-size: 11.5px;
+  line-height: 1.6;
+  margin: 6px 0 0;
+}
+
+.sub {
+  color: var(--dim);
+}
+
+.ok {
+  color: var(--good);
+}
+
+.warn {
+  color: var(--warn);
+}
+
+.links {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.links li {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px 9px;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  font-size: 11px;
+}
+
+.links li span {
+  font-size: 10.5px;
+  color: var(--dim);
+}
+
+.links li.blocked {
+  border-color: #4d2a2e;
+}
+
+.links li.blocked code {
+  color: var(--bad);
+}
+
+.links li.allowed {
+  border-color: #2b4a32;
+}
+
+/* ★ 「审计抓到」和「这个渲染器真的会请求」分开标。两者的差集是有意的，见 App.tsx 里 IMG 的注释。 */
+.links li small {
+  font-size: 10px;
+  font-style: normal;
+}
+
+.links li small.fires {
+  color: var(--bad);
+}
+
+.links li small.inert {
+  color: var(--dim);
+}
